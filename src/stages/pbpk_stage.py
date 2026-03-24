@@ -8,13 +8,13 @@ Core responsibilities
 ---------------------
 - Validate PBPK configuration inputs (VOIs, frame start times, CT input path).
 - Optionally randomize kidney/salivary-gland parameters (lognormal sampling).
-- Optionally extract patient height/weight from a DICOM directory (if CT input is DICOM).
+- Optionally extract patient height/weight from a DICOM directory.
 - Run the PyCNO PSMA model to obtain TACs (time, tacs).
 - For each ROI present in the unified segmentation, map ROI -> VOI and:
     - Interpolate TAC values at configured frame start times.
     - Build a per-frame activity map (MBq/mL) distributed uniformly within the ROI mask.
     - Save first-frame per-organ activity map for debugging / provenance as NIfTI.
-    - Save TAC time series + sampled values to .bin files for provenance/analysis.
+    - Save TAC time series + sampled values to .bin files.
     - Apply TAC-derived activity to the phase-2 SIMIND projection totals to create
       PBPK-weighted frame-wise projections for reconstruction.
 
@@ -22,24 +22,23 @@ Expected Context interface
 --------------------------
 Incoming `context` is expected to provide:
 - context.subdir_paths["phase_3"] : str
-- context.ct_input_path : str (file path to NIfTI OR directory path to DICOM series)
+- context.ct_input_path : str  (NIfTI path or DICOM directory for height/weight extraction)
 - context.config["phase_3"]["pbpk_stage"] with keys:
-    - "file_prefix" or "name" : str (prefix for outputs)
-    - "VOIs" : list[str] (PyCNO observables, e.g., ["Kidney","Liver","Rest",...])
-    - "FrameStartTimes" : list[float] (sampling times for frame-wise activity maps)
-    - "FrameDurations" : list[float] (frame durations in seconds)
+    - "file_prefix" or "name" : str
+    - "VOIs" : list[str]  (PyCNO observables, e.g. ["Kidney","Liver","Rest",...])
+    - "FrameStartTimes" : list[float]  (minutes)
+    - "FrameDurations" : list[float]  (seconds)
     - "Randomization_Kidney_SG_Para" : bool
-- From preprocessing / SIMIND stages:
-    - context.roi_body_seg_arr : np.ndarray (z,y,x int labels)
-    - context.mask_roi_body : dict[int, np.ndarray[bool]] (label_id -> mask)
-    - context.class_seg : dict[str, int] (roi_name -> label_id)
-    - context.arr_px_spacing_cm : tuple[float,float,float] (z,y,x spacing in cm)
-    - context.simind_projection_paths : dict[str, dict[str, str]]
+- context.roi_body_seg_arr : np.ndarray  (z, y, x int labels)
+- context.mask_roi_body : dict[int, np.ndarray[bool]]  (label_id -> mask)
+- context.class_seg : dict[str, int]  (roi_name -> label_id)
+- context.arr_px_spacing_cm : tuple[float, float, float]  (z, y, x) in cm
+- context.simind_projection_paths : dict[str, dict[str, str]]
 
 On success, this stage sets:
-- context.activity_map_sum : np.ndarray (n_frames,) total activity per frame [MBq]
-- context.activity_organ_sum : dict[str, np.ndarray] per-ROI activity per frame [MBq]
-- context.activity_map_paths_by_organ : list[str] paths to first-frame per-organ maps
+- context.activity_map_sum : np.ndarray  (n_frames,) total activity [MBq]
+- context.activity_organ_sum : dict[str, np.ndarray]  per-ROI activity per frame [MBq]
+- context.activity_map_paths_by_organ : list[str]
 - context.pbpk_tacs_by_organ : dict[str, dict[str, str]]
 - context.pbpk_frame_start_times_min : np.ndarray
 - context.pbpk_frame_durations_s : np.ndarray
@@ -66,19 +65,11 @@ from pytomography.io.shared import get_header_value
 
 class PbpkStage:
     """
-    Run PBPK (PyCNO PSMA) and generate Activity Maps for SIMIND.
+    Run PBPK (PyCNO PSMA) and generate activity maps for SIMIND projection weighting.
 
-    Parameters
-    ----------
-    context : Context-like
-        Pipeline context object that carries config, paths, and preprocessed arrays.
-
-    Notes
-    -----
-    - Activity maps are constructed as uniform concentration within each ROI mask:
+    Activity maps are uniform-concentration within each ROI mask:
         concentration(t) = TAC_interp(t) / (n_voxels * voxel_volume_ml)
-      This yields per-voxel activity concentration with units matching your chosen convention
-      (commonly MBq/mL if TAC is MBq and voxel_volume_ml is mL).
+    Units: MBq/mL if TAC is in MBq and voxel_volume_ml in mL.
     """
 
     def __init__(self, context: Any) -> None:
@@ -91,7 +82,6 @@ class PbpkStage:
             self.stage_cfg.get("sub_dir_name", "pbpk_stage"),
         )
         os.makedirs(self.output_dir, exist_ok=True)
-
         self.work_dir: str = os.path.join(self.output_dir, "work_dir")
         os.makedirs(self.work_dir, exist_ok=True)
         self.metadata_path: str = os.path.join(self.work_dir, "pbpk_metadata.json")
@@ -116,61 +106,24 @@ class PbpkStage:
         self.proj_dim2: Optional[int] = None
         self.num_proj: Optional[int] = None
 
-        # Arrays produced by preprocessing stage
         self.roi_body_seg_arr: np.ndarray = self.context.roi_body_seg_arr
         self.mask_roi_body: Dict[int, np.ndarray] = self.context.mask_roi_body
 
-        # Optional metadata extracted from DICOM
         self.height: Optional[float] = None
         self.weight: Optional[float] = None
-
-        # Parameters passed to PyCNO model
         self.parameters: Dict[str, float] = {}
         self.roi_to_voi_used: Dict[str, str] = {}
 
     # -----------------------------
     # helpers
     # -----------------------------
-    def _remove_background(self, class_seg: Dict[str, int]) -> Dict[str, int]:
-        """
-        Remove a "background" entry from a class map if present.
-
-        Parameters
-        ----------
-        class_seg : dict[str, int]
-            ROI name -> label ID mapping.
-
-        Returns
-        -------
-        dict[str, int]
-            The mapping with "background" removed (if it existed).
-        """
-        if "background" in class_seg:
-            class_seg = dict(class_seg)
-            del class_seg["background"]
-        return class_seg
 
     def _voxel_volume_ml(self, arr_px_spacing_cm: Sequence[float]) -> float:
-        """
-        Compute voxel volume in mL from pixel spacing in cm.
-
-        Parameters
-        ----------
-        arr_px_spacing_cm : Sequence[float]
-            Spacing in cm in (z, y, x) order.
-
-        Returns
-        -------
-        float
-            Voxel volume in mL (since cm^3 == mL).
-        """
-        arr_px_spacing_cm = np.asarray(arr_px_spacing_cm, dtype=float)
-        return float(np.prod(arr_px_spacing_cm))  # cm^3 == mL
+        """Compute voxel volume in mL from (z, y, x) spacing in cm. (cm^3 == mL)"""
+        return float(np.prod(np.asarray(arr_px_spacing_cm, dtype=float)))
 
     def _write_activity_map_nifti(self, arr_zyx: np.ndarray, out_path: str) -> None:
-        """
-        Save a SIMIND-grid activity map as NIfTI using SimpleITK.
-        """
+        """Save a SIMIND-grid activity map as NIfTI using SimpleITK."""
         img = sitk.GetImageFromArray(np.asarray(arr_zyx, dtype=np.float32))
         spacing_mm = tuple(float(x) * 10.0 for x in self.context.arr_px_spacing_cm[::-1])
         img.SetSpacing(spacing_mm)
@@ -179,23 +132,21 @@ class PbpkStage:
     def _get_metadata_from_header(
         self, photopeak_path: str, lower_path: str, upper_path: str
     ) -> Tuple[int, int, int]:
-        """
-        Parse SIMIND header information required to reshape projections.
-        """
+        """Parse SIMIND header files and return (proj_dim1, proj_dim2, num_proj)."""
         for p in (photopeak_path, lower_path, upper_path):
             if not os.path.exists(p):
                 raise FileNotFoundError(f"Missing SIMIND header file: {p}")
         with open(photopeak_path, "r", encoding="utf-8") as f:
             headerdata = np.array(f.readlines())
-        proj_dim1 = get_header_value(headerdata, "matrix size [1]", int)
-        proj_dim2 = get_header_value(headerdata, "matrix size [2]", int)
-        num_proj = get_header_value(headerdata, "total number of images", int)
-        return int(proj_dim1), int(proj_dim2), int(num_proj)
+        return (
+            int(get_header_value(headerdata, "matrix size [1]", int)),
+            int(get_header_value(headerdata, "matrix size [2]", int)),
+            int(get_header_value(headerdata, "total number of images", int)),
+        )
 
     def _read_projection_bin(self, proj_path: str) -> np.ndarray:
         """
-        Read a SIMIND projection .a00 file and convert it to PyTomography/SIMIND
-        projection convention: (n_proj, x, y).  
+        Read a SIMIND .a00 projection binary and convert to PyTomography convention (n_proj, x, y).
         """
         if self.proj_dim1 is None or self.proj_dim2 is None or self.num_proj is None:
             raise AttributeError("Projection metadata has not been initialized from SIMIND headers.")
@@ -204,90 +155,52 @@ class PbpkStage:
         expected_size = int(self.num_proj * self.proj_dim1 * self.proj_dim2)
         if proj_arr.size != expected_size:
             raise ValueError(
-                f"Projection file has unexpected size for {proj_path}. "
-                f"Got {proj_arr.size}, expected {expected_size} for shape ({self.num_proj}, {self.proj_dim1}, {self.proj_dim2})."
+                f"Unexpected projection file size for {proj_path}. "
+                f"Got {proj_arr.size}, expected {expected_size} "
+                f"for shape ({self.num_proj}, {self.proj_dim1}, {self.proj_dim2})."
             )
-
-        proj_arr = proj_arr.reshape((self.num_proj, self.proj_dim2, self.proj_dim1))  
-        proj_arr = np.transpose(proj_arr[:, ::-1, :], (0, 2, 1))  # need in this form for pytomography convention
-        return np.asarray(proj_arr, dtype=np.float32)  
+        proj_arr = proj_arr.reshape((self.num_proj, self.proj_dim2, self.proj_dim1))
+        return np.asarray(np.transpose(proj_arr[:, ::-1, :], (0, 2, 1)), dtype=np.float32)
 
     def _write_projection_nifti(self, arr_zyx: np.ndarray, out_path: str) -> None:
-        """
-        Save a PBPK-weighted projection volume as NIfTI using SimpleITK.
-
-        Expects `arr_zyx` in PyTomography/SIMIND convention: (n_proj, x, y).  
-        """
+        """Save a PBPK-weighted projection volume as NIfTI (PyTomography convention: n_proj, x, y)."""
         img = sitk.GetImageFromArray(np.asarray(arr_zyx, dtype=np.float32))
-        spacing_mm = (
+        img.SetSpacing((
             float(self.simind_output_pixel_width_cm) * 10.0,
             float(self.simind_output_pixel_width_cm) * 10.0,
             1.0,
-        )
-        img.SetSpacing(spacing_mm)
+        ))
         sitk.WriteImage(img, out_path, True)
 
     def _sample_lognormal_from_mean_sd(self, mean: float, sd: float) -> float:
         """
-        Sample LogNormal so that the resulting distribution has the requested mean and sd.
+        Sample from a lognormal distribution parameterized by desired mean and SD.
 
-        If X ~ LogNormal(mu, sigma^2), then:
-          E[X] = exp(mu + sigma^2/2)
-          Var[X] = (exp(sigma^2)-1) * exp(2mu + sigma^2)
-
-        Solve:
-          sigma^2 = ln(1 + (sd^2 / mean^2))
+        If X ~ LogNormal(mu, sigma^2):
+          sigma^2 = ln(1 + (sd/mean)^2)
           mu      = ln(mean) - sigma^2/2
 
         Parameters
         ----------
-        mean : float
-            Desired mean of the lognormal distribution (must be > 0).
-        sd : float
-            Desired standard deviation of the lognormal distribution (must be > 0).
-
-        Returns
-        -------
-        float
-            A single sample from the constructed lognormal distribution.
-
-        Raises
-        ------
-        ValueError
-            If mean <= 0 or sd <= 0.
+        mean, sd : float  (both must be > 0)
         """
-        mean = float(mean)
-        sd = float(sd)
+        mean, sd = float(mean), float(sd)
         if mean <= 0 or sd <= 0:
-            raise ValueError(f"mean and sd must be > 0 for lognormal (got mean={mean}, sd={sd})")
-
+            raise ValueError(f"mean and sd must be > 0 (got mean={mean}, sd={sd})")
         sigma2 = np.log(1.0 + (sd * sd) / (mean * mean))
-        sigma = np.sqrt(sigma2)
         mu = np.log(mean) - 0.5 * sigma2
-        return float(np.random.lognormal(mean=mu, sigma=sigma))
+        return float(np.random.lognormal(mean=mu, sigma=np.sqrt(sigma2)))
 
     def _extract_height_weight_from_dicom_dir(self, dicom_dir: str) -> Tuple[Optional[float], Optional[float]]:
         """
-        Try to extract patient height and weight from a DICOM directory.
+        Try to extract patient height (m) and weight (kg) from DICOM tags.
 
-        DICOM tags:
-          - PatientSize   (0010,1020) -> meters
-          - PatientWeight (0010,1030) -> kg
-
-        Parameters
-        ----------
-        dicom_dir : str
-            Path to a directory containing DICOM files.
-
-        Returns
-        -------
-        tuple[Optional[float], Optional[float]]
-            (height_m, weight_kg), where either may be None if missing/unreadable.
+        Tags: PatientSize (0010,1020) -> meters; PatientWeight (0010,1030) -> kg.
+        Scans up to 50 files; returns (None, None) if not found or unreadable.
         """
         if not os.path.isdir(dicom_dir):
             return None, None
 
-        # Attempts a handful of files; many DICOMs have no extension
         candidates: List[str] = []
         for name in sorted(os.listdir(dicom_dir)):
             path = os.path.join(dicom_dir, name)
@@ -299,10 +212,9 @@ class PbpkStage:
         for path in candidates:
             try:
                 ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
-                height = getattr(ds, "PatientSize", None)   # meters
-                weight = getattr(ds, "PatientWeight", None) # kg
+                height = getattr(ds, "PatientSize", None)
+                weight = getattr(ds, "PatientWeight", None)
 
-                # sanitize
                 height = float(height) if height not in (None, "", " ") else None
                 weight = float(weight) if weight not in (None, "", " ") else None
 
@@ -311,7 +223,6 @@ class PbpkStage:
                 if weight is not None and weight <= 0:
                     weight = None
 
-                # If we found at least one, return (even if the other is None)
                 if height is not None or weight is not None:
                     return height, weight
             except Exception:
@@ -321,73 +232,56 @@ class PbpkStage:
 
     def _parameter_check(self) -> Dict[str, float]:
         """
-        Validate PBPK inputs and build the parameters dict passed into PyCNO.
+        Validate PBPK config inputs and build the PyCNO parameter override dict.
 
         Returns
         -------
-        dict[str, float]
-            PBPK parameter overrides (may be empty).
+        dict[str, float]  (may be empty if no overrides)
 
         Raises
         ------
-        AttributeError
-            If required members are missing.
-        ValueError
-            If config values are invalid (e.g., empty VOIs or frame times).
+        AttributeError, ValueError
         """
-        # ---- basic validation ----
-        if not hasattr(self, "ct_input_path"):
-            raise AttributeError("PbpkStage is missing self.ct_input_path")
         if not os.path.exists(self.ct_input_path):
             raise ValueError(f"CT input path does not exist: {self.ct_input_path}")
-
         if not isinstance(self.vois_pbpk, (list, tuple)) or len(self.vois_pbpk) == 0:
             raise ValueError("PBPK VOIs must be a non-empty list/tuple")
 
-        if not isinstance(self.frame_start, (list, tuple, np.ndarray)) or len(self.frame_start) == 0:
-            raise ValueError("Frame start times must be a non-empty list/tuple/array")
-
         frame_start = np.asarray(self.frame_start, dtype=float)
+        if not isinstance(self.frame_start, (list, tuple, np.ndarray)) or len(self.frame_start) == 0:
+            raise ValueError("FrameStartTimes must be a non-empty list/tuple/array")
         if not np.all(np.isfinite(frame_start)):
-            raise ValueError("Frame start times contain non-finite values")
+            raise ValueError("FrameStartTimes contain non-finite values")
         if np.any(frame_start < 0):
-            raise ValueError("Frame start times must be >= 0")
-
-        if not isinstance(self.frame_durations_s, (list, tuple, np.ndarray)) or len(self.frame_durations_s) == 0:
-            raise ValueError("Frame durations must be a non-empty list/tuple/array")
+            raise ValueError("FrameStartTimes must be >= 0")
 
         frame_durations_s = np.asarray(self.frame_durations_s, dtype=float)
+        if not isinstance(self.frame_durations_s, (list, tuple, np.ndarray)) or len(self.frame_durations_s) == 0:
+            raise ValueError("FrameDurations must be a non-empty list/tuple/array")
         if not np.all(np.isfinite(frame_durations_s)):
-            raise ValueError("Frame durations contain non-finite values")
+            raise ValueError("FrameDurations contain non-finite values")
         if np.any(frame_durations_s <= 0):
-            raise ValueError("Frame durations must be > 0")
+            raise ValueError("FrameDurations must be > 0")
         if len(frame_durations_s) != len(frame_start):
             raise ValueError("FrameStartTimes and FrameDurations must have the same length")
 
+        if not isinstance(self.randomize_kidney_sg_para, bool):
+            raise ValueError("Randomization_Kidney_SG_Para must be True or False")
+
         parameters: Dict[str, float] = {}
 
-        # ---- Kidney and SG RDen and LamdaRel ----
-        if not isinstance(self.randomize_kidney_sg_para, bool):
-            raise ValueError("Randomize Parameter must be only True or False in Config")
-
         vois_set = {str(v).strip().lower() for v in (self.vois_pbpk or [])}
-        has_kidney = ("kidney" in vois_set)
-        has_sg = ("sg" in vois_set) or any("salivary" in v for v in vois_set)
+        has_kidney = "kidney" in vois_set
+        has_sg = "sg" in vois_set or any("salivary" in v for v in vois_set)
 
         if self.randomize_kidney_sg_para:
             if has_sg:
-                recep_dens_sg = self._sample_lognormal_from_mean_sd(60.0, 20.0)     # nmol/L
-                lambda_rel_sg = self._sample_lognormal_from_mean_sd(3.9e-4, 0.63e-4)
-                parameters["Rden_SG"] = recep_dens_sg
-                parameters["lambdaRel_SG"] = lambda_rel_sg
-
+                parameters["Rden_SG"] = self._sample_lognormal_from_mean_sd(60.0, 20.0)
+                parameters["lambdaRel_SG"] = self._sample_lognormal_from_mean_sd(3.9e-4, 0.63e-4)
             if has_kidney:
-                recep_dens_kidney = self._sample_lognormal_from_mean_sd(30.0, 10.0)  # nmol/L
-                lambda_rel_kidney = self._sample_lognormal_from_mean_sd(2.88e-4, 0.55e-4)
-                parameters["Rden_Kidney"] = recep_dens_kidney
-                parameters["lambdaRel_Kidney"] = lambda_rel_kidney
+                parameters["Rden_Kidney"] = self._sample_lognormal_from_mean_sd(30.0, 10.0)
+                parameters["lambdaRel_Kidney"] = self._sample_lognormal_from_mean_sd(2.88e-4, 0.55e-4)
 
-        # ---- Height and Weight (DICOM only) ----
         self.height = None
         self.weight = None
         if os.path.isdir(self.ct_input_path):
@@ -402,21 +296,19 @@ class PbpkStage:
 
     def _run_psma_model(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Generate parameters and run the PyCNO PSMA PBPK model.
+        Validate parameters, run PyCNO PSMA PBPK model, and return (time, tacs).
 
         Returns
         -------
-        tuple[np.ndarray, np.ndarray]
-            (time, tacs) where:
-            - time is shape (T,)
-            - tacs is typically shape (1, T, n_vois) in PyCNO
+        time : np.ndarray  shape (T,)
+        tacs : np.ndarray  typically shape (1, T, n_vois) from PyCNO
         """
         self.parameters = self._parameter_check()
 
-        # save provenance early
-        self.context.pbpk_height_m = getattr(self, "height", None)
-        self.context.pbpk_weight_kg = getattr(self, "weight", None)
-        self.context.pbpk_parameters = dict(self.parameters) if self.parameters is not None else None
+        # Store provenance on context early in case of later failure.
+        self.context.pbpk_height_m = self.height
+        self.context.pbpk_weight_kg = self.weight
+        self.context.pbpk_parameters = dict(self.parameters) if self.parameters else None
 
         model = pycno.Model(
             model_name="PSMA",
@@ -425,47 +317,31 @@ class PbpkStage:
             parameters=self.parameters,
         )
 
-        # PyCNO expects numeric stop/steps; keep your behavior but ensure int steps
         stop = int(self.frame_stop)
         steps = int(np.ceil(stop)) if stop > 0 else 1
-
-        time, tacs = model.simulate(
-            stop=stop,
-            steps=steps,
-            observables=self.vois_pbpk,
-        )
+        time, tacs = model.simulate(stop=stop, steps=steps, observables=self.vois_pbpk)
         return np.asarray(time, dtype=float), np.asarray(tacs, dtype=float)
 
     def _roi_to_voi(self, roi_name: str) -> Optional[str]:
         """
-        Map a TDT ROI name (segmentation space) to a PBPK VOI observable name (PyCNO).
+        Map a TDT ROI name to its PyCNO VOI observable name.
 
-        Parameters
-        ----------
-        roi_name : str
-            ROI name from `context.class_seg` (e.g., "kidney", "salivary_glands").
-
-        Returns
-        -------
-        Optional[str]
-            Mapped VOI name, or None if there is no explicit mapping.
+        Returns None if there is no explicit mapping (caller falls back to "Rest").
         """
         roi_to_voi = {
-            "kidney": "Kidney",
-            "body": "Rest",
-            "liver": "Liver",
-            "prostate": "Prostate",
-            "heart": "Heart",
-            "spleen": "Spleen",
+            "kidney":          "Kidney",
+            "body":            "Rest",
+            "liver":           "Liver",
+            "prostate":        "Prostate",
+            "heart":           "Heart",
+            "spleen":          "Spleen",
             "salivary_glands": "SG",
-            "synthetic_lesion": "Tumor1",
+            "synthetic_lesion":"Tumor1",
         }
         return roi_to_voi.get(roi_name, None)
 
     def _extract_tac_for_voi(self, tacs: np.ndarray, voi_index: int) -> np.ndarray:
-        """
-        Extract one VOI TAC robustly from PyCNO output.
-        """
+        """Extract one VOI TAC from PyCNO output (handles 2D and 3D array shapes)."""
         if tacs.ndim == 3:
             return np.asarray(tacs[0, :, voi_index], dtype=float)
         if tacs.ndim == 2:
@@ -480,37 +356,26 @@ class PbpkStage:
         tac_interp: np.ndarray,
     ) -> Dict[str, str]:
         """
-        Save TAC full-resolution and sampled-at-frame-start arrays to binary files.
+        Save TAC full-resolution and frame-sampled arrays to binary files.
 
-        Files written (all float32):
+        Files written (float32):
         - <prefix>_<roi>_TAC_time.bin
         - <prefix>_<roi>_TAC_values.bin
         - <prefix>_<roi>_sample_times.bin
         - <prefix>_<roi>_sample_values.bin
-
-        Returns
-        -------
-        dict[str, str]
-            Paths to each saved file.
         """
         roi_tag = roi_name.lower()
-
-        tac_time_f = os.path.join(self.work_dir, f"{self.prefix}_{roi_tag}_TAC_time.bin")
-        tac_vals_f = os.path.join(self.work_dir, f"{self.prefix}_{roi_tag}_TAC_values.bin")
-        samp_time_f = os.path.join(self.work_dir, f"{self.prefix}_{roi_tag}_sample_times.bin")
-        samp_vals_f = os.path.join(self.work_dir, f"{self.prefix}_{roi_tag}_sample_values.bin")
-
-        np.asarray(time, dtype=np.float32).tofile(tac_time_f)
-        np.asarray(tac_voi, dtype=np.float32).tofile(tac_vals_f)
-        np.asarray(self.frame_start, dtype=np.float32).tofile(samp_time_f)
-        np.asarray(tac_interp, dtype=np.float32).tofile(samp_vals_f)
-
-        return {
-            "tac_time": tac_time_f,
-            "tac_values": tac_vals_f,
-            "sample_time": samp_time_f,
-            "sample_values": samp_vals_f,
+        paths = {
+            "tac_time":     os.path.join(self.work_dir, f"{self.prefix}_{roi_tag}_TAC_time.bin"),
+            "tac_values":   os.path.join(self.work_dir, f"{self.prefix}_{roi_tag}_TAC_values.bin"),
+            "sample_time":  os.path.join(self.work_dir, f"{self.prefix}_{roi_tag}_sample_times.bin"),
+            "sample_values":os.path.join(self.work_dir, f"{self.prefix}_{roi_tag}_sample_values.bin"),
         }
+        np.asarray(time, dtype=np.float32).tofile(paths["tac_time"])
+        np.asarray(tac_voi, dtype=np.float32).tofile(paths["tac_values"])
+        np.asarray(self.frame_start, dtype=np.float32).tofile(paths["sample_time"])
+        np.asarray(tac_interp, dtype=np.float32).tofile(paths["sample_values"])
+        return paths
 
     def _generate_time_activity_arr_roi(
         self,
@@ -524,53 +389,35 @@ class PbpkStage:
         saved_tacs: Dict[str, Dict[str, str]],
     ) -> Tuple[np.ndarray, np.ndarray, str]:
         """
-        Build per-frame activity map for a single ROI and save first frame for SIMIND.
+        Build per-frame activity map for a single ROI and save the first frame for provenance.
 
         Parameters
         ----------
         roi_name : str
-            ROI name (from context.class_seg).
-        label_value : int
-            Integer label ID in `roi_body_seg_arr`.
+        label_value : int  label ID in roi_body_seg_arr
         mask_roi_body : dict[int, np.ndarray]
-            Mapping label_id -> boolean mask.
-        roi_body_seg_arr : np.ndarray
-            Multilabel segmentation array (z,y,x).
+        roi_body_seg_arr : np.ndarray  (z, y, x)
         voxel_vol_ml : float
-            Voxel volume in mL.
-        time : np.ndarray
-            Model simulation times (T,).
-        tacs : np.ndarray
-            Model TAC array (typically shape (1, T, n_vois)).
-        saved_tacs : dict
-            Cache dict used to avoid re-writing TAC files for the same ROI.
+        time : np.ndarray  (T,)
+        tacs : np.ndarray  PyCNO output
+        saved_tacs : dict  cache to avoid duplicate file writes for shared VOIs
 
         Returns
         -------
-        tuple[np.ndarray, np.ndarray, str]
-            (activity_map_organ, organ_sum, organ_map_path) where:
-            - activity_map_organ: shape (n_frames, z, y, x), float32
-            - organ_sum: shape (n_frames,), float64/float32 (MBq)
-            - organ_map_path: path to the first-frame organ map binary
+        activity_map_organ : np.ndarray  (n_frames, z, y, x) float32
+        organ_sum : np.ndarray  (n_frames,) [MBq]
+        organ_map_path : str  path to the first-frame NIfTI
         """
         voi_name = self._roi_to_voi(roi_name)
 
-        if voi_name is None:
+        # Fall back to "Rest" if no direct mapping or VOI not present in the model.
+        if voi_name is None or voi_name not in self.vois_pbpk:
             if "Rest" in self.vois_pbpk:
                 voi_name = "Rest"
             else:
                 raise ValueError(
-                    f"No VOI mapping for ROI '{roi_name}', and no 'Rest' VOI exists in the PBPK model "
-                    f"(supported: {sorted(self.vois_pbpk)})."
-                )
-
-        if voi_name not in self.vois_pbpk:
-            if "Rest" in self.vois_pbpk:
-                voi_name = "Rest"  # use 'Rest' VOI for unmapped ROIs
-            else:
-                raise ValueError(
-                    f"ROI '{roi_name}' maps to VOI '{voi_name}', but that VOI is not in the PBPK model "
-                    f"(supported: {sorted(self.vois_pbpk)}), and no 'Rest' VOI exists."
+                    f"No VOI mapping for ROI '{roi_name}' and no 'Rest' VOI in PBPK model "
+                    f"(available: {sorted(self.vois_pbpk)})."
                 )
 
         self.roi_to_voi_used[roi_name] = voi_name
@@ -579,20 +426,17 @@ class PbpkStage:
         mask = mask_roi_body[label_value]
         n_vox = int(np.sum(mask))
         if n_vox == 0:
-            raise AssertionError(f"Mask corresponding to {voi_name} is empty")
+            raise AssertionError(f"Mask for '{voi_name}' (roi='{roi_name}') is empty.")
 
         tac_voi = self._extract_tac_for_voi(tacs, voi_index)
         tac_interp = np.interp(np.asarray(self.frame_start, dtype=float), time, tac_voi)
 
-        # [frame, z, y, x]
         activity_map_organ = np.zeros((len(self.frame_start), *roi_body_seg_arr.shape), dtype=np.float32)
         activity_map_organ[:, mask] = tac_interp[:, None] / (n_vox * voxel_vol_ml)
 
-        # Save FIRST frame organ map for debugging / provenance
         organ_map_path = os.path.join(self.work_dir, f"{self.prefix}_{roi_name}_act_av.nii.gz")
         self._write_activity_map_nifti(activity_map_organ[0], organ_map_path)
 
-        # Organ sum per frame [MBq]
         organ_sum = np.sum(activity_map_organ, axis=(1, 2, 3)) * voxel_vol_ml
 
         if roi_name not in saved_tacs:
@@ -601,78 +445,82 @@ class PbpkStage:
         return activity_map_organ, organ_sum, organ_map_path
 
     def _build_pbpk_projection_paths(self) -> Dict[str, Dict[str, str]]:
-        """
-        Build frame-wise PBPK-weighted projection output paths.
-        """
+        """Build the expected output paths for PBPK-weighted frame projections."""
         projection_paths: Dict[str, Dict[str, str]] = {}
         for frame in self.frame_start:
-            frame_label = f"{float(frame)/60.0:.6f}".rstrip("0").rstrip(".")  # convert to hours for labeling
+            # Label in hours (max 6 decimal places, trailing zeros stripped)
+            frame_label = f"{float(frame)/60.0:.6f}".rstrip("0").rstrip(".")
             projection_paths[frame_label] = {
                 "w1": os.path.join(self.output_dir, f"{self.prefix}_{frame_label}_tot_w1.nii.gz"),
                 "w2": os.path.join(self.output_dir, f"{self.prefix}_{frame_label}_tot_w2.nii.gz"),
                 "w3": os.path.join(self.output_dir, f"{self.prefix}_{frame_label}_tot_w3.nii.gz"),
             }
         return projection_paths
-    def _save_stage_metadata(  
-        self,  
-        saved_tacs: Dict[str, Dict[str, str]],  
-        organ_paths: List[str],  
-        pbpk_projection_paths: Dict[str, Dict[str, str]],  
-        activity_organ_sum: Dict[str, np.ndarray],  
-        activity_map_sum: np.ndarray,  
-    ) -> None:  
-        """
-        Save PBPK stage metadata for debugging / provenance.  
-        """  
-        metadata: Dict[str, Any] = {  
-            "stage": "pbpk_stage",  
-            "phase_output_dir": self.phase_output_dir,  
-            "output_dir": self.output_dir,  
-            "work_dir": self.work_dir,  
-            "file_prefix": self.prefix,  
-            "ct_input_path": self.ct_input_path,  
-            "vois_pbpk": list(self.vois_pbpk),  
-            "frame_start_times_min": np.asarray(self.frame_start, dtype=float).tolist(),  
-            "frame_durations_s": np.asarray(self.frame_durations_s, dtype=float).tolist(),  
-            "frame_labels_hours": [f"{float(t)/60.0:.6f}".rstrip("0").rstrip(".") for t in self.frame_start],  
-            "randomize_kidney_sg_para": bool(self.randomize_kidney_sg_para),  
-            "pbpk_height_m": None if self.height is None else float(self.height),  
-            "pbpk_weight_kg": None if self.weight is None else float(self.weight),  
-            "pbpk_parameters": {k: float(v) for k, v in self.parameters.items()},  
-            "roi_to_voi_used": dict(self.roi_to_voi_used),  
-            "saved_tacs": saved_tacs,  
-            "activity_map_paths_by_organ": organ_paths,  
-            "activity_organ_sum_mbq": {k: np.asarray(v, dtype=float).tolist() for k, v in activity_organ_sum.items()},  
-            "activity_map_sum_mbq": np.asarray(activity_map_sum, dtype=float).tolist(),  
-            "simind_projection_paths": self.context.simind_projection_paths,  
-            "pbpk_projection_paths": pbpk_projection_paths,  
-        }  
-        with open(self.metadata_path, "w", encoding="utf-8") as f:  
-            json.dump(metadata, f, indent=4)  
+
+    def _save_stage_metadata(
+        self,
+        saved_tacs: Dict[str, Dict[str, str]],
+        organ_paths: List[str],
+        pbpk_projection_paths: Dict[str, Dict[str, str]],
+        activity_organ_sum: Dict[str, np.ndarray],
+        activity_map_sum: np.ndarray,
+    ) -> None:
+        """Save PBPK stage metadata for debugging / provenance."""
+        metadata: Dict[str, Any] = {
+            "stage": "pbpk_stage",
+            "phase_output_dir": self.phase_output_dir,
+            "output_dir": self.output_dir,
+            "work_dir": self.work_dir,
+            "file_prefix": self.prefix,
+            "ct_input_path": self.ct_input_path,
+            "vois_pbpk": list(self.vois_pbpk),
+            "frame_start_times_min": np.asarray(self.frame_start, dtype=float).tolist(),
+            "frame_durations_s": np.asarray(self.frame_durations_s, dtype=float).tolist(),
+            "frame_labels_hours": [
+                f"{float(t)/60.0:.6f}".rstrip("0").rstrip(".") for t in self.frame_start
+            ],
+            "randomize_kidney_sg_para": bool(self.randomize_kidney_sg_para),
+            "pbpk_height_m": None if self.height is None else float(self.height),
+            "pbpk_weight_kg": None if self.weight is None else float(self.weight),
+            "pbpk_parameters": {k: float(v) for k, v in self.parameters.items()},
+            "roi_to_voi_used": dict(self.roi_to_voi_used),
+            "saved_tacs": saved_tacs,
+            "activity_map_paths_by_organ": organ_paths,
+            "activity_organ_sum_mbq": {
+                k: np.asarray(v, dtype=float).tolist() for k, v in activity_organ_sum.items()
+            },
+            "activity_map_sum_mbq": np.asarray(activity_map_sum, dtype=float).tolist(),
+            "simind_projection_paths": self.context.simind_projection_paths,
+            "pbpk_projection_paths": pbpk_projection_paths,
+        }
+        with open(self.metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=4)
 
     # -----------------------------
     # main
     # -----------------------------
     def run(self) -> Any:
         """
-        Execute PBPK simulation and write activity maps.
+        Execute PBPK simulation and write PBPK-weighted projections.
 
         Returns
         -------
         context : Context-like
-            Updated context with activity summaries and output paths populated.
         """
-        for k in ("roi_body_seg_arr", "mask_roi_body", "class_seg", "arr_px_spacing_cm", "simind_projection_paths", "simind_work_dir"):
+        for k in ("roi_body_seg_arr", "mask_roi_body", "class_seg", "arr_px_spacing_cm",
+                  "simind_projection_paths", "simind_work_dir"):
             if getattr(self.context, k, None) is None:
                 raise AttributeError(f"Context missing required field: {k}")
 
-        class_seg = self._remove_background(self.context.class_seg)
+        # Remove "background" label if present (not a real ROI).  
+        class_seg = {k: v for k, v in self.context.class_seg.items() if k != "background"}
         voxel_vol_ml = self._voxel_volume_ml(self.context.arr_px_spacing_cm)
 
         roi_list = list(self.context.simind_projection_paths.keys())
         if not roi_list:
-            raise ValueError("No phase-2 SIMIND projection paths found in context.simind_projection_paths")
+            raise ValueError("No phase-2 SIMIND projection paths found in context.")
 
+        # Locate SIMIND headers from work_dir (phase 2) to get projection dimensions.
         photopeak_h = os.path.join(self.simind_work_dir, f"{self.simind_prefix}_{roi_list[0]}_0_tot_w2.h00")
         lower_h = os.path.join(self.simind_work_dir, f"{self.simind_prefix}_{roi_list[0]}_0_tot_w1.h00")
         upper_h = os.path.join(self.simind_work_dir, f"{self.simind_prefix}_{roi_list[0]}_0_tot_w3.h00")
@@ -690,7 +538,7 @@ class PbpkStage:
         saved_tacs: Dict[str, Dict[str, str]] = {}
         pbpk_projection_paths = self._build_pbpk_projection_paths()
         frame_projection_sums: Dict[str, Dict[str, Optional[np.ndarray]]] = {
-            frame_label: {"w1": None, "w2": None, "w3": None} for frame_label in pbpk_projection_paths.keys()
+            label: {"w1": None, "w2": None, "w3": None} for label in pbpk_projection_paths
         }
 
         for roi_name, label_value in class_seg.items():
@@ -716,32 +564,36 @@ class PbpkStage:
 
             roi_projection_paths = self.context.simind_projection_paths[roi_name]
             for i in range(n_frames):
-                frame_label = f"{float(self.frame_start[i])/60.0:.6f}".rstrip("0").rstrip(".")  # convert to hours for labeling
+                frame_label = f"{float(self.frame_start[i])/60.0:.6f}".rstrip("0").rstrip(".")
+                # frame_scale: counts = (counts/MBq/s) * MBq * s
                 frame_scale = float(organ_sum[i] * float(self.frame_durations_s[i]))
-                # counts/MBq/s * MBq * s = counts
                 for window_key in ("w1", "w2", "w3"):
                     proj_path = roi_projection_paths[window_key]
                     if not os.path.exists(proj_path):
                         raise FileNotFoundError(f"SIMIND projection not found: {proj_path}")
                     proj_arr = self._read_projection_bin(proj_path)
-                    weighted_proj = np.asarray(proj_arr * frame_scale, dtype=np.float32)
+                    weighted = np.asarray(proj_arr * frame_scale, dtype=np.float32)
                     if frame_projection_sums[frame_label][window_key] is None:
-                        frame_projection_sums[frame_label][window_key] = weighted_proj
+                        frame_projection_sums[frame_label][window_key] = weighted
                     else:
-                        frame_projection_sums[frame_label][window_key] += weighted_proj
+                        frame_projection_sums[frame_label][window_key] += weighted
 
         activity_map_sum = np.sum(activity_map, axis=(1, 2, 3)) * voxel_vol_ml
 
-        # Save full maps per frame (optional, but kept)
+        # Save full activity maps per frame to work_dir for provenance.
         for i, frame in enumerate(activity_map):
             frame_label = f"{float(self.frame_start[i])/60.0:.6f}".rstrip("0").rstrip(".")
-            p = os.path.join(self.work_dir, f"{self.prefix}_{frame_label}_act_map.nii.gz")
-            self._write_activity_map_nifti(frame, p)
+            self._write_activity_map_nifti(
+                frame, os.path.join(self.work_dir, f"{self.prefix}_{frame_label}_act_map.nii.gz")
+            )
 
+        # Write PBPK-weighted projection NIfTIs for reconstruction.
         for frame_label, window_dict in frame_projection_sums.items():
             for window_key, proj_arr in window_dict.items():
                 if proj_arr is None:
-                    raise ValueError(f"No PBPK-weighted projection data was generated for {frame_label} {window_key}")
+                    raise ValueError(
+                        f"No PBPK-weighted projection generated for {frame_label} {window_key}"
+                    )
                 self._write_projection_nifti(proj_arr, pbpk_projection_paths[frame_label][window_key])
 
         self._save_stage_metadata(
@@ -752,7 +604,6 @@ class PbpkStage:
             activity_map_sum=activity_map_sum,
         )
 
-        # Update context
         self.context.activity_map_sum = activity_map_sum
         self.context.activity_organ_sum = activity_organ_sum
         self.context.activity_map_paths_by_organ = organ_paths

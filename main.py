@@ -5,18 +5,17 @@ This module provides:
 - `TdtPipeline`: an orchestrator that runs all pipeline stages for a single CT input.
 - A CLI entrypoint that iterates through a directory of CT inputs and runs the pipeline.
 
-Notes:
+Notes
+-----
 - A CT input may be either a NIfTI file (.nii / .nii.gz) or a DICOM directory.
 - The pipeline writes outputs into an output folder derived from the config and CT index.
+- Phases run sequentially; all stage-to-stage communication goes through the `Context` object.
 
 For any questions or issues, please contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
 
-# -----------------------------
-# Standard library imports
-# -----------------------------
 import os
 import json
 from json_minify import json_minify
@@ -27,9 +26,6 @@ import argparse
 import copy
 from typing import Any, Dict, Literal
 
-# -----------------------------
-# Local imports
-# -----------------------------
 from src.io.context import Context
 
 from src.stages.segmentation_ts_stage import TotalSegmentationStage
@@ -39,7 +35,7 @@ from src.stages.synthetic_lesions_stage import SyntheticLesionsStage
 from src.stages.simind_simulation_stage import SimindSimulationStage
 from src.stages.pbpk_stage import PbpkStage
 from src.stages.reconstruction_stage import SpectReconstructionStage
-from src.stages.opengate_simulation_stage import DosimetryStage
+from src.stages.opengate_simulation_stage import OpenGateSimulationStage
 
 
 CTInputType = Literal["nii", "dicom"]
@@ -59,25 +55,14 @@ class TdtPipeline:
         Index used for naming (e.g., output folder suffix "_CT_{ct_indx}").
     logging_on : bool, default=True
         If True, writes a per-CT log file into the CT output folder.
+    save_ct_scan : bool, default=False  
+        If True, copies the CT input into the CT output folder for provenance/debugging.
     save_config : bool, default=False
-        If True, saves a copy of the config JSON into the output folder.  
+        If True, saves a copy of the config JSON into the output folder.
     mode : {"DEBUG", "PRODUCTION"}, default="PRODUCTION"
-        Affects logging verbosity.
+        Controls verbosity and whether intermediate files are cleaned up.
     synthetic_lesions : bool, default=False
-        If True, runs the synthetic lesions stage to generate lesions in the CT scan.
-
-    Attributes
-    ----------
-    config : dict[str, Any]
-        Parsed configuration loaded from `config_path`.
-    output_folder_path : str
-        Absolute path to the CT-specific output folder.
-    ct_input_type : {"nii", "dicom"}
-        Determined input type for `ct_input`.
-    context : Context
-        Runtime context object passed through pipeline stages.
-    logger : logging.Logger
-        Per-CT logger, optionally writing to a file handler.
+        If True, runs the synthetic lesions stage to add simulated lesions to the CT.
     """
 
     def __init__(
@@ -86,7 +71,8 @@ class TdtPipeline:
         ct_input: str,
         ct_indx: int,
         logging_on: bool = True,
-        save_config: bool = False,  
+        save_ct_scan: bool = False, 
+        save_config: bool = False,
         mode: Literal["DEBUG", "PRODUCTION"] = "PRODUCTION",
         synthetic_lesions: bool = False,
     ) -> None:
@@ -95,17 +81,18 @@ class TdtPipeline:
         self.ct_indx: int = ct_indx
         self.current_dir_path: str = os.path.abspath(os.path.dirname(__file__))
 
-        self.logging_on: bool = logging_on  # if True, enables file logging in the output folder
-        self.save_config: bool = save_config  # if True, saves config json into the CT output folder  
+        self.logging_on: bool = logging_on
+        self.save_ct_scan: bool = save_ct_scan  
+        self.save_config: bool = save_config
         self.mode: Literal["DEBUG", "PRODUCTION"] = mode
-        self.synthetic_lesions: bool = synthetic_lesions  # if True, runs the synthetic lesions stage to generate lesions in the CT scan
+        self.synthetic_lesions: bool = synthetic_lesions
 
-        self.config: Dict[str, Any] = {}  # will be populated in _config_setup()
-        self.output_folder_path: str = ""  # will be set in _config_setup()
-        self.ct_input_type: CTInputType = "dicom"  # default, will be set properly in _config_setup() after validation
+        self.config: Dict[str, Any] = {}
+        self.output_folder_path: str = ""
+        self.ct_input_type: CTInputType = "dicom"
         self.run_synthetic_lesions: bool = False
         self.synthetic_lesions_disabled_reason: str | None = None
-        self.sub_dir_names: Dict[str, str] = {}  
+        self.sub_dir_names: Dict[str, str] = {}
 
         self.logger: logging.Logger = logging.getLogger(f"TDT_CONFIG_LOGGER_CT_{self.ct_indx}")
         self.logger.setLevel(logging.DEBUG if self.mode == "DEBUG" else logging.INFO)
@@ -128,29 +115,30 @@ class TdtPipeline:
             self.context._log_enabled = False
 
     def _save_config_copy(self, config_path: str) -> None:
-        """
-        Save a copy of the config JSON into the output folder.
-
-        Writes:
-            <output_folder_path>/config.json
-        """
+        """Copy the config JSON into the output folder for provenance."""
         dst = os.path.join(self.output_folder_path, "config.json")
         shutil.copy2(config_path, dst)
 
+    def _save_ct_scan_copy(self) -> None: 
+        """Copy the CT input into the output folder for provenance/debugging."""
+        dst_name = os.path.basename(self.ct_input)
+        dst = os.path.join(self.output_folder_path, dst_name)
+        if os.path.isdir(self.ct_input):
+            if not os.path.exists(dst):
+                shutil.copytree(self.ct_input, dst)
+        else:
+            shutil.copy2(self.ct_input, dst)
+
     def _log_setup(self) -> logging.Logger:
         """
-        Configure a per-CT log file handler writing to:
-            <output_folder_path>/logging_file_CT_<ct_indx>.log
+        Configure a per-CT log file handler.
 
-        Returns
-        -------
-        logging.Logger
-            The configured per-CT logger.
+        Writes to: <output_folder_path>/logging_file_CT_<ct_indx>.log
+        Avoids adding duplicate handlers if the pipeline is constructed multiple times.
         """
         log_path = os.path.join(self.output_folder_path, f"logging_file_CT_{self.ct_indx}.log")
         logger = self.logger
 
-        # Avoid adding multiple handlers if pipeline is constructed multiple times
         if not any(
             isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == log_path
             for h in logger.handlers
@@ -170,19 +158,19 @@ class TdtPipeline:
 
     def _config_setup(self, config_path: str) -> None:
         """
-        Load config from disk and prepare output folder + create sub_dir paths
+        Load config from disk and prepare output folder + phase subdirectory paths.
 
         Parameters
         ----------
         config_path : str
-            Path to JSON config. (May include // comments, stripped via json_minify.)
+            Path to JSON config (may include // comments, stripped via json_minify).
 
         Raises
         ------
         FileNotFoundError
-            If the config file does not exist or the CT input path is invalid.
+            If the config file or CT input path does not exist.
         ValueError
-            If a file input is provided but is not a supported NIfTI extension.
+            If the CT input file is not a supported NIfTI extension.
         """
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Configuration file not found: {config_path}")
@@ -194,7 +182,6 @@ class TdtPipeline:
         self.output_folder_path = os.path.join(self.current_dir_path, output_folder_title)
         os.makedirs(self.output_folder_path, exist_ok=True)
 
-        # Validate + tag ct input (file must be nifti; dir assumed dicom)
         if os.path.isfile(self.ct_input):
             ct_lower = self.ct_input.lower()
             if not (ct_lower.endswith(".nii") or ct_lower.endswith(".nii.gz")):
@@ -205,11 +192,13 @@ class TdtPipeline:
         else:
             raise FileNotFoundError(f"CT input not found: {self.ct_input}")
 
-        # Optionally save a copy of the config
         if self.save_config:
             self._save_config_copy(config_path)
 
-        # Optionally enable synthetic lesions stage based on flag and config specs
+        if self.save_ct_scan: 
+            self._save_ct_scan_copy()
+
+        # Enable synthetic lesions only if the flag is set AND lesion specs are defined in config.
         lesion_specs = self.config["phase_1"]["synthetic_lesions_stage"].get("specs")
         self.run_synthetic_lesions = bool(self.synthetic_lesions and lesion_specs)
         if self.synthetic_lesions and not lesion_specs:
@@ -219,32 +208,29 @@ class TdtPipeline:
             )
 
         # Create phase subdirs
-        phases = ["phase_1", "phase_2", "phase_3", "phase_4"]  
-        self.sub_dir_paths = {}
-        self.sub_dir_names = {}  
+        phases = ["phase_1", "phase_2", "phase_3", "phase_4"]
+        self.sub_dir_paths: Dict[str, str] = {}
+        self.sub_dir_names: Dict[str, str] = {}
         for phase in phases:
             sub_dir_path = os.path.join(self.output_folder_path, self.config[phase]["sub_dir_name"])
             os.makedirs(sub_dir_path, exist_ok=True)
             self.sub_dir_paths[phase] = sub_dir_path
-            self.sub_dir_names[phase] = self.config[phase]["sub_dir_name"]  
+            self.sub_dir_names[phase] = self.config[phase]["sub_dir_name"]
 
     def _context_setup(self) -> None:
         """
-        Create and populate the Context object.
+        Create and populate the shared Context object.
 
-        The Context stores:
-        - A deep-copied snapshot of relevant config sections
-        - Runtime metadata (mode, CT path/type/index, output folder)
-        - Computed subdir paths used across stages
+        Sets runtime metadata, config snapshot, subdir paths, and the
+        downstream_roi_subset that flows through all phases.
         """
         context = Context(logger=self.logger)
         self.context = context
 
         context.config = copy.deepcopy(self.config)
         context.subdir_paths = copy.deepcopy(self.sub_dir_paths)
-        context.subdir_names = copy.deepcopy(self.sub_dir_names)  
+        context.subdir_names = copy.deepcopy(self.sub_dir_names)
 
-        # Initial setup for Context (runtime)
         context.mode = self.mode
         context.ct_input_path = self.ct_input
         context.ct_input_type = self.ct_input_type
@@ -252,39 +238,37 @@ class TdtPipeline:
         context.output_folder_path = self.output_folder_path
         context.synthetic_lesions_enabled = self.run_synthetic_lesions
 
-        roi_subset = self.config["phase_1"]["segmentation_stage"]["roi_subset"]  
-        if isinstance(roi_subset, str):  
-            roi_subset = [roi_subset]  
-        context.downstream_roi_subset = [str(r).strip() for r in roi_subset if str(r).strip()]  
+        # downstream_roi_subset flows from phase-1 config into all downstream stages.
+        roi_subset = self.config["phase_1"]["segmentation_stage"]["roi_subset"]
+        if isinstance(roi_subset, str):
+            roi_subset = [roi_subset]
+        context.downstream_roi_subset = [str(r).strip() for r in roi_subset if str(r).strip()]
 
         self.logger.debug("Context initialized for CT_%s", self.ct_indx)
 
     def run(self) -> Context:
         """
-        Execute the pipeline stages sequentially for this CT.
+        Execute all pipeline stages sequentially for this CT input.
 
-        Phases:
-        1. Creating Digital Twin:
-            1.1  Segmentation of CT stage via total segmentator
-            1.2. Unification of segmentation outputs and map labels to TDT specifc labels
-            1.3. Generate synthetic lesions (if enabled) stage
-        2. SPECT simulation:
-            2.1 Preprocess for SIMIND (generate SIMIND input files) stage
-            2.2 Run Monte-Carlos simulation (via SIMIND) stage
-        3. SPECT post-processing:
-            3.1 PBPK TACs created and applied to projections stage
-            3.2 SPECT Reconstruction (ie. OSEM + TEW scatter) stage
+        Phases
+        ------
+        1. Digital Twin:
+            1.1  TotalSegmentator segmentation
+            1.2  ROI unification to TDT label space
+            1.3  Synthetic lesion generation (optional)
+        2. SPECT Simulation:
+            2.1  SIMIND preprocessing (CT + seg -> SIMIND binaries)
+            2.2  SIMIND Monte Carlo projection simulation
+        3. SPECT Post-Processing:
+            3.1  PBPK TAC generation and projection weighting
+            3.2  OSEM + TEW reconstruction
         4. Dosimetry:
-            4.1 OpenGATE voxel-source dosimetry stage
+            4.1  OpenGATE voxel-source Monte Carlo dose calculation
 
         Returns
         -------
         Context
             The updated context after all stages complete.
-
-        Notes
-        -----
-        Each stage is expected to implement `.run()` and return an updated Context.
         """
         logger = self.logger
         t_pipeline = time.perf_counter()
@@ -296,192 +280,120 @@ class TdtPipeline:
         logger.info("Pipeline start | mode=%s", self.mode)
         logger.info("CT input | path=%s | type=%s", self.ct_input, self.ct_input_type)
 
-        # -----------------------------  Creating Digital Twin -----------------------------
+        # ----------------------------- Phase 1: Digital Twin -----------------------------
         print("-----------------------------Phase 1: Creating Digital Twin-----------------------------")
-        # -----------------------------
-        # Stage 1.1: Segmentation of CT stage via total segmentator
-        # -----------------------------
+
         logger.info("Stage start: TotalSegmentator")
         t_stage = time.perf_counter()
         print("Running TotalSegmentator Stage...")
-
-        # expects raw CT input path (DICOM directory or NIfTI file)  
         context = TotalSegmentationStage(context).run()
-        # outputs:  
-        # <output_dir>/digital_twin/ct.nii.gz  <- clean CT handoff for later phases  
-        # <output_dir>/digital_twin/segmentation_stage/<file_prefix>_body_ml.nii.gz  
-        # <output_dir>/digital_twin/segmentation_stage/<file_prefix>_total_ml.nii.gz  
-        # <output_dir>/digital_twin/segmentation_stage/<file_prefix>_head_glands_cavities_ml.nii.gz  
-        # <output_dir>/digital_twin/segmentation_stage/work_dir/*stage metadata / debug stuff*  
-
         print("TotalSegmentator Stage completed.")
         logger.info("Stage end: TotalSegmentator | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # -----------------------------
-        # Stage 1.2: Unification of segmentation outputs and map labels to TDT specifc labels
-        # -----------------------------
         logger.info("Stage start: TDT ROI Unification")
         t_stage = time.perf_counter()
         print("Running TDT ROI Unification Stage...")
-
-        # expects segmented TotalSegmentator outputs from segmentation_stage  
         context = TdtRoiUnifyStage(context).run()
-        # outputs:  
-        # <output_dir>/digital_twin/unification_stage/<file_prefix>.nii.gz  <- stage-local unified seg  
-        # <output_dir>/digital_twin/unification_stage/work_dir/*stage metadata / debug stuff*  
-        # <output_dir>/digital_twin/digital_twin.nii.gz  <- clean phase-1 handoff file  
-
         print("TDT ROI Unification Stage completed.")
         logger.info("Stage end: TDT ROI Unification | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # -----------------------------
-        # Stage 1.3: Generate synthetic lesions (if enabled)
-        # -----------------------------
         if self.run_synthetic_lesions:
             logger.info("Stage start: Synthetic Lesions Generation")
             t_stage = time.perf_counter()
             print("Running Synthetic Lesions Generation Stage...")
-
-            # expects unified segmentation handoff file: <output_dir>/digital_twin/digital_twin.nii.gz  
             context = SyntheticLesionsStage(context).run()
-            # outputs:  
-            # <output_dir>/digital_twin/synthetic_lesions_stage/*ROI QC + lesion masks*  
-            # <output_dir>/digital_twin/synthetic_lesions_stage/work_dir/*stage metadata / debug stuff*  
-            # <output_dir>/digital_twin/digital_twin.nii.gz  <- overwritten in place with lesion label voxels  
-            # NOTE: a pre-lesion backup is saved in the synthetic_lesions_stage folder for reference  
-
             print("Synthetic Lesions Generation Stage completed.")
             logger.info("Stage end: Synthetic Lesions Generation | elapsed=%.2fs", time.perf_counter() - t_stage)
-        
 
-        # -----------------------------  SPECT simulation (via SIMIND) -----------------------------  
+        # ----------------------------- Phase 2: SPECT Simulation -----------------------------
         print("-----------------------------Phase 2: SPECT Simulation-----------------------------")
-        # -----------------------------
-        # Stage 2.1: Preprocess for SIMIND (generate SIMIND input files)
-        # -----------------------------
+
         logger.info("Stage start: SIMIND Preprocessing")
         t_stage = time.perf_counter()
         print("Running SIMIND Preprocessing Stage...")
-
-        # expects clean phase-1 handoff files:  
-        # <output_dir>/digital_twin/ct.nii.gz  
-        # <output_dir>/digital_twin/digital_twin.nii.gz  
         context = SimindPreprocessStage(context).run()
-        # outputs:
-        # <output_dir>/spect_simulation/preprocess_simind/<file_prefix>_atn_av.bin <- atn map
-        # <output_dir>/spect_simulation/preprocess_simind/<file_prefix>_<roi>_act_av.bin <- binary ROI map for SIMIND source input  
-        # <output_dir>/spect_simulation/preprocess_simind/work_dir/*context stuff*
-
         print("SIMIND Preprocessing Stage completed.")
         logger.info("Stage end: SIMIND Preprocessing | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # -----------------------------
-        # Stage 2.2: Run SIMIND simulation
-        # -----------------------------
         logger.info("Stage start: SIMIND Simulation")
         t_stage = time.perf_counter()
         print("Running SIMIND Simulation Stage...")
-
-        # expects stage-2 preprocessing outputs:  
-        # <output_dir>/spect_simulation/preprocess_simind/<file_prefix>_atn_av.bin
-        # <output_dir>/spect_simulation/preprocess_simind/<file_prefix>_<roi>_act_av.bin
         context = SimindSimulationStage(context).run()
-        # outputs:
-        # <output_dir>/spect_simulation/simind_stage/<file_prefix>_<roi>_proj_total_<window>.a00
-        # <output_dir>/spect_simulation/simind_stage/<file_prefix>_*calib stuff*
-        # <output_dir>/spect_simulation/simind_stage/work_dir/*context stuff* + projection per core
-
         print("SIMIND Simulation Stage completed.")
         logger.info("Stage end: SIMIND Simulation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # -----------------------------  SPECT post-processing -----------------------------
+        # ----------------------------- Phase 3: SPECT Post-Processing -----------------------------
         print("-----------------------------Phase 3: SPECT Post-Processing-----------------------------")
-        # -----------------------------
-        # Stage 3.1: PBPK TACs created and applied to projections
-        # -----------------------------
+
         logger.info("Stage start: PBPK")
         t_stage = time.perf_counter()
         print("Running PBPK Stage...")
-
-        # expects ROI-specific SIMIND projection outputs plus digital twin metadata  
         context = PbpkStage(context).run()
-        # outputs:
-        # <output_dir>/spect_post_process/pbpk_stage/<file_prefix>_*tac/projection outputs*
-
         print("PBPK Stage completed.")
         logger.info("Stage end: PBPK | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # -----------------------------
-        # Stage 3.2: SPECT Reconstruction (ie. OSEM + TEW scatter)
-        # -----------------------------
         logger.info("Stage start: SPECT Reconstruction")
         t_stage = time.perf_counter()
-
         print("Running SPECT Reconstruction Stage...")
-        # expects PBPK-weighted projection data
         context = SpectReconstructionStage(context).run()
         print("SPECT Reconstruction Stage completed.")
-
         logger.info("Stage end: SPECT Reconstruction | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # -----------------------------  Dosimetry -----------------------------
+        # ----------------------------- Phase 4: Dosimetry -----------------------------
         print("-----------------------------Phase 4: Dosimetry-----------------------------")
-        logger.info("Stage start: Dosimetry")
+
+        logger.info("Stage start: OpenGATE Simulation")
         t_stage = time.perf_counter()
+        print("Running OpenGATE Simulation Stage...")
+        context = OpenGateSimulationStage(context).run()
+        print("OpenGATE Simulation Stage completed.")
+        logger.info("Stage end: OpenGATE Simulation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        print("Running Dosimetry Stage...")
-        context = DosimetryStage(context).run()
-        print("Dosimetry Stage completed.")
-
-        logger.info("Stage end: Dosimetry | elapsed=%.2fs", time.perf_counter() - t_stage)
         logger.info("Pipeline end | total_elapsed=%.2fs", time.perf_counter() - t_pipeline)
-
         print("TDT Pipeline completed successfully.")
         return context
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """
-    Build the CLI argument parser.
-
-    Returns
-    -------
-    argparse.ArgumentParser
-        Configured argument parser for the pipeline CLI.
-    """
+    """Build the CLI argument parser for the TDT pipeline."""
     parser = argparse.ArgumentParser(
         description="Theranostic Digital Twin (TDT) Pipeline Runner"
     )
 
-    # Required arguments
-    parser.add_argument("--config_file", required=True, type=str)
-    parser.add_argument("--input_ct_dir", required=True, type=str)
-
-    # Optional flags
-    parser.add_argument(
-        "--logging_on",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable file logging. Use --logging_on / --no-logging_on. Default: enabled",
-    )
-    parser.add_argument(
-        "--save_config",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Copy the config JSON into each CT output folder. Use --save_config / --no-save_config. Default: disabled",
-    )  
+    parser.add_argument("--config_file", required=True, type=str,
+                        help="Path to JSON config file.")
+    parser.add_argument("--input_ct_dir", required=True, type=str,
+                        help="Directory containing CT inputs (NIfTI files or DICOM folders).")
 
     parser.add_argument(
         "--mode",
         default="PRODUCTION",
         choices=["DEBUG", "PRODUCTION"],
+        help="Pipeline mode. DEBUG keeps more intermediate files. Default: PRODUCTION.",
     )
-
+    parser.add_argument(
+        "--logging_on",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable per-CT log file writing. Default: enabled.",
+    )
+    parser.add_argument(
+        "--save_ct_scan",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Copy the CT input into the CT output folder for provenance. Default: disabled.",
+    )
+    parser.add_argument(
+        "--save_config",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Copy the config JSON into each CT output folder. Default: disabled.",
+    )
     parser.add_argument(
         "--synthetic_lesions",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Generate synthetic lesions. Use --synthetic_lesions / --no-synthetic_lesions. Default: disabled",
+        help="Run synthetic lesion generation. Requires specs in config. Default: disabled.",
     )
 
     return parser
@@ -489,22 +401,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     """
-    CLI entrypoint.
+    CLI entrypoint. Iterates through all CT inputs in `input_ct_dir` and runs the pipeline.
 
     Returns
     -------
     int
-        Process exit code (0 = success).
+        Process exit code (0 = all CTs processed; individual failures are logged but don't stop the batch).
     """
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    # Require a directory and iterate directly
     ct_inputs_dir = os.path.abspath(args.input_ct_dir)
     if not os.path.isdir(ct_inputs_dir):
         raise NotADirectoryError(f"input_ct_dir must be a directory: {ct_inputs_dir}")
 
-    # Filter hidden files/directories and keep deterministic ordering for repeatability
+    # Filter hidden files/dirs; sort for deterministic ordering.
     items = [n for n in sorted(os.listdir(ct_inputs_dir)) if not n.startswith(".")]
     print("----------------------------- Starting TDT Pipeline -----------------------------")
     print("")
@@ -516,21 +427,24 @@ def main() -> int:
 
         try:
             pipeline = TdtPipeline(
-                config_path=args.config_file,  # required by user
+                config_path=args.config_file,
                 ct_input=ct_path,
                 ct_indx=idx,
                 logging_on=args.logging_on,
-                save_config=args.save_config,  
+                save_ct_scan=args.save_ct_scan,  
+                save_config=args.save_config,
                 mode=args.mode,
                 synthetic_lesions=args.synthetic_lesions,
             )
             pipeline.run()
         except Exception as e:
-            # Keep console-friendly failure reporting per CT input
             print(f"[ERROR] CT index {idx} failed for input: {ct_path}\n{e}")
 
-    return 0  # 0 indicates successful completion of the CLI process
+    return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# quick run: python main.py --config_file inputs/config.json --input_ct_dir inputs/ct_testing --mode DEBUG --logging_on --save_config --synthetic_lesions
