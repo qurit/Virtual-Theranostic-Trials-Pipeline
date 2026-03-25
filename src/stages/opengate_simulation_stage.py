@@ -14,6 +14,8 @@ Core responsibilities
 - Convert simulation inputs to OpenGATE's centered identity-direction convention.
 - Build one binary voxel-source mask per requested ROI.
 - Run one OpenGATE simulation per ROI using Lu-177 decay physics.
+- Skip simulation for any ROI whose final dose NIfTI output already exists on disk
+  (allows resuming a crashed run without re-simulating completed ROIs).
 - Save per-ROI dose maps, optional uncertainty maps, and an optional summed dose map.
 - Save stage metadata and optional OpenGATE material-label / MHD outputs.
 
@@ -84,6 +86,8 @@ class OpenGateSimulationStage:
     - Simulation may run on the native CT grid or on an optional downsampled grid.
     - Source masks are binary voxel maps derived from the unified TDT segmentation.
     - ROI dose outputs are accumulated into a summed dose map in native CT space.
+    - If a per-ROI dose NIfTI already exists on disk the simulation for that ROI is
+      skipped, allowing a crashed run to be resumed from where it left off.
     """
 
     def __init__(self, context: Any) -> None:
@@ -209,6 +213,10 @@ class OpenGateSimulationStage:
         """Print a stage-local debug message only in DEBUG mode."""
         if self.debug:
             print(f"[OpenGateSimulationStage] {msg}")
+
+    def _roi_dose_nii_path(self, roi_name: str) -> Path:
+        """Return the expected final NIfTI output path for a given ROI dose map."""
+        return Path(self.work_dir) / f"{self.prefix}_dose_{roi_name}.nii.gz"
 
     @staticmethod
     def _load_tdt_label_map(path: Path) -> Dict[str, int]:
@@ -690,6 +698,10 @@ class OpenGateSimulationStage:
         """
         Execute OpenGATE dosimetry for all requested ROIs.
 
+        If the expected per-ROI dose NIfTI already exists on disk the simulation for
+        that ROI is skipped and the file is loaded directly. This lets a crashed run
+        resume from where it left off without re-simulating completed ROIs.
+
         Returns
         -------
         context : Context-like
@@ -710,7 +722,32 @@ class OpenGateSimulationStage:
         sum_arr: Optional[np.ndarray] = None
         mat_label_path: Optional[str] = None
 
+        needs_upsample = (
+            was_resampled
+            or self.output_dose_spacing_mm is not None
+            or self._original_sim_ct_img.GetSize() != native_ct.GetSize()
+        )
+
         for idx, roi_name in enumerate(roi_names):
+            expected_nii = self._roi_dose_nii_path(roi_name)
+
+            # ----------------------------------------------------------
+            # Resume logic: skip simulation if output already exists.
+            # ----------------------------------------------------------
+            if expected_nii.exists():
+                print(f"[OpenGateSimulationStage] '{roi_name}': output exists, skipping simulation.")
+                dose_native = sitk.GetArrayFromImage(sitk.ReadImage(str(expected_nii))).astype(np.float64)
+                dose_paths[roi_name] = str(expected_nii)
+                unc_nii = Path(self.work_dir) / f"{self.prefix}_unc_{roi_name}.nii.gz"
+                if unc_nii.exists():
+                    unc_paths[roi_name] = str(unc_nii)
+                roi_meta[roi_name] = {"skipped": True, "loaded_from": str(expected_nii)}
+                sum_arr = dose_native.copy() if sum_arr is None else sum_arr + dose_native
+                continue
+
+            # ----------------------------------------------------------
+            # Normal path: run the simulation for this ROI.
+            # ----------------------------------------------------------
             res = self._run_single_roi(
                 roi_name,
                 mask_paths[roi_name],
@@ -720,12 +757,6 @@ class OpenGateSimulationStage:
 
             # Convert Gy/primary -> Gy/decay using the actual simulated history count.
             dose_sim = np.asarray(res["dose_arr"], dtype=np.float64) * self.actual_total_histories
-
-            needs_upsample = (
-                was_resampled
-                or self.output_dose_spacing_mm is not None
-                or self._original_sim_ct_img.GetSize() != native_ct.GetSize()
-            )
 
             dose_native = (
                 self._upsample_to_native(
@@ -743,7 +774,7 @@ class OpenGateSimulationStage:
                 dose_paths[roi_name] = self._save_nii(
                     native_ct,
                     dose_native.astype(np.float32),
-                    Path(self.work_dir) / f"{self.prefix}_dose_{roi_name}.nii.gz",
+                    expected_nii,
                 )
 
             if self.save_uncertainty_map and res["unc_arr"] is not None:
