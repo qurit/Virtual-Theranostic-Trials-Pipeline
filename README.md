@@ -1,4 +1,4 @@
-# Theranostic Digital Twins (TDT) Pipeline
+# Virtual Theranostic Trails (VTT) Pipeline
 
 This pipeline creates patient-specific **theranostic digital twins** by combining CT-based anatomy/segmentation with PBPK kinetics and physics-based SPECT simulation/reconstruction, supporting research in diagnosis and therapy planning.
 
