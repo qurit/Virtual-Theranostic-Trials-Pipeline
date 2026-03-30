@@ -72,7 +72,9 @@ class Context:
         self.pbpk_height_m: Optional[float] = None                      # patient height extracted from DICOM (m)
         self.pbpk_weight_kg: Optional[float] = None                     # patient weight extracted from DICOM (kg)
         self.pbpk_parameters: Optional[Dict[str, Any]] = None           # PyCNO parameter overrides used
-        self.pbpk_vois: Optional[list[str]] = None                      
+        self.pbpk_vois: Optional[list[str]] = None         
+        self.pbpk_isotope: Optional[str] = None
+        self.pbpk_stop_time_min: Optional[float] = None             
 
         # ----------------------------- Phase 2: Simulations ----------------------------- 
         # Stage 2.1: SIMIND Preprocessing + Simulation (merged) 
