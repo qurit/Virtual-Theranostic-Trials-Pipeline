@@ -13,10 +13,10 @@
   //   by later stages (SIMIND, PBPK, OpenGATE, etc.).
   // - Contact: pyazdi@bccrc.ca
 
-  "output_folder_title": "tdt_test_run",
+  "output_folder_title": "test_run",
 
   // ==========================================================================
-  // PHASE 1 - Digital Twin generation
+  // PHASE 1 - Digital Twin & Ground Truth
   // ==========================================================================
   "phase_1": {
     // Folder created inside the CT output folder for phase 1 products.
@@ -30,17 +30,17 @@
       // These also flow into downstream stages through context.downstream_roi_subset.
       // Allowed ROI names in your current stage:
       // ["body", "kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"]
-      "roi_subset": ["liver", "kidney", "spleen"]
-    },
+      "roi_subset": ["body", "kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"],
 
-    "unification_stage": {
       // Prefix used when writing unified TDT label outputs / metadata.
-      "file_prefix": "unified_labels",
+      "unification_prefix": "unified_labels",                                          //changed
 
       // Absolute path to your TDT label-map JSON.
       // This is used by unification, preprocessing, synthetic lesions, and OpenGATE.
-      "label_map_path": "/home/jhubadmin/Theranostic-Virtual-Patient-Pipeline/src/data/tdt_map.json"
+      "label_map_path": "/home/jhubadmin/Theranostic-Virtual-Patient-Pipeline/src/data/tdt_map.json"   //changed
     },
+
+    // --- Removed: unification_stage section (merged into segmentation_stage) --- //changed
 
     "synthetic_lesions_stage": {
       // This stage only runs if:
@@ -59,86 +59,22 @@
 
       // Set to null to disable lesion insertion by config.
       // Fill this block only for organs where you want lesions.
-      "specs": null
-
-      // Example lesion specification:
-      // "specs": {
-      //   "liver": {
-      //     "n_lesions": 5,
-      //     "prob": "gaussian",     // "uniform", "gaussian", or "user_defined"
-      //     "sigma_mm": 60.0,         // needed for gaussian placement
-      //     "margin_mm": 1.0,         // minimum distance from organ boundary / other lesions
-      //     "seed": 0
-      //   }
-      // }
-    }
-  },
-
-  // ==========================================================================
-  // PHASE 2 - SIMIND projection simulation
-  // ==========================================================================
-  "phase_2": {
-    "sub_dir_name": "spect_simulation",
-
-    "preprocess_simind_stage": {
-      "file_prefix": "preprocess_simind",
-
-      // Optional target in-plane size for SIMIND preprocessing.
-      // If null, the current CT in-plane grid is kept.
-      // If set (e.g. 128 or 256), an isotropic resize factor is applied.
-      "xy_dim": 128
+      "specs": {
+                "liver": {
+                          "n_lesions": 5,
+                          "prob": "gaussian",     // "uniform", "gaussian", or "user_defined"
+                          "sigma_mm": 60.0,         // needed for gaussian placement
+                          "margin_mm": 1.0,         // minimum distance from organ boundary / other lesions
+                          "seed": 0
+      }
+      }
     },
 
-    "simind_stage": {
-      "file_prefix": "simind",
-
-      // Absolute path to the SIMIND executable directory.
-      "SIMINDDirectory": "/home/jhubadmin/simind/simind",
-
-      // SIMIND acquisition / camera settings.
-      "Collimator": "si-me",
-      "Isotope": "lu177",
-      "NumProjections": 64,
-      "NumPhotons": 5e8,
-      "EnergyWindowWidth": 20,
-
-      // DetectorDistance < 0 lets SIMIND contour to the patient.
-      "DetectorDistance": -10,
-
-      // Detector dimensions in cm.
-      // DetectorLength = 0 means "let SIMIND infer from CT length" in your workflow.
-      "DetectorWidth": 53.3,
-      "DetectorLength": 0,
-
-      // Output projection geometry.
-      "OutputImgSize": 128,
-      "OutputPixelWidth": 0.5,
-      "OutputSliceWidth": 0.5,
-
-      // Number of parallel SIMIND cores.
-      // Use 0 to auto-select all available CPU cores.
-      "NumCores": 10
-    }
-  },
-
-  // ==========================================================================
-  // PHASE 3 - PBPK weighting + SPECT reconstruction
-  // ==========================================================================
-  "phase_3": {
-    "sub_dir_name": "spect_post_process",
-
-    "pbpk_stage": {
+    "pbpk_tac_stage": {                                                                //changed
       "file_prefix": "pbpk",
 
       // Current supported model in your code.
       "model_type": "PSMA",
-
-      // Frame start times in minutes.
-      // These are the times at which TACs are sampled and applied to projections.
-      "FrameStartTimes": [120, 1440, 2880],
-
-      // Frame durations in seconds, one per frame above.
-      "FrameDurations": [10, 10, 10],
 
       // PyCNO observable names you want available.
       "VOIs": [
@@ -164,26 +100,65 @@
 
       // If true, kidney and salivary-gland parameters can be randomized.
       "Randomization_Kidney_SG_Para": true
-    },
-
-    "reconstruction_stage": {
-      "file_prefix": "spect_reconstruction",
-      "ReconstructionAlgorithm": "OSEM",
-      "Iterations": 4,
-      "Subsets": 8
     }
   },
 
   // ==========================================================================
-  // PHASE 4 - OpenGATE voxel-source dosimetry
+  // PHASE 2 - Simulations (SIMIND and/or OpenGATE)
   // ==========================================================================
-  "phase_4": {
-    "sub_dir_name": "dosimetry",
+  "phase_2": {                                                                         //changed
+    "sub_dir_name": "simulations",                                                     //changed
 
-    "opengate_simulation_stage": {
+    "simind_stage": {                                                                  //changed
+      "file_prefix": "simind",
+
+      // ROI subset for SIMIND simulation.
+      // These must be a subset of phase_1.segmentation_stage.roi_subset.
+      // The stage validates that these ROIs were successfully segmented.
+      "roi_subset": ["liver", "kidney","salivary_glands"],                                     //changed
+
+      // Optional target in-plane size for SIMIND preprocessing.
+      // If null, the current CT in-plane grid is kept.
+      // If set (e.g. 128 or 256), an isotropic resize factor is applied.
+      "xy_dim": 128,                                                                   //changed
+
+      // Absolute path to the SIMIND executable directory.
+      "SIMINDDirectory": "/home/jhubadmin/simind/simind",
+
+      // SIMIND acquisition / camera settings.
+      "Collimator": "si-me",
+      "Isotope": "lu177",
+      "NumProjections": 64,
+      "NumPhotons": 1e8,
+      "EnergyWindowWidth": 20,
+
+      // DetectorDistance < 0 lets SIMIND contour to the patient.
+      "DetectorDistance": -10,
+
+      // Detector dimensions in cm.
+      // DetectorLength = 0 means "let SIMIND infer from CT length" in your workflow.
+      "DetectorWidth": 53.3,
+      "DetectorLength": 0,
+
+      // Output projection geometry.
+      "OutputImgSize": 128,
+      "OutputPixelWidth": 0.5,
+      "OutputSliceWidth": 0.5,
+
+      // Number of parallel SIMIND cores.
+      // Use 0 to auto-select all available CPU cores.
+      "NumCores": 0
+    },
+
+    "opengate_stage": {                                                                //changed
       "file_prefix": "opengate_simulation",
 
-      // Optional stage-local output folder name inside phase_4.
+      // ROI subset for OpenGATE dosimetry simulation.
+      // These must be a subset of phase_1.segmentation_stage.roi_subset.
+      // The stage validates that these ROIs were successfully segmented.
+      "roi_subset": ["liver", "kidney","salivary_glands"],                                     //changed
+
+      // Optional stage-local output folder name inside phase_2.
       // If omitted, the stage defaults to "opengate_simulation".
       "sub_dir_name": "opengate_simulation",
 
@@ -208,15 +183,15 @@
       // Leave this false for validation / physically faithful beta-dose runs.
       // A production cut that is too aggressive can stop electrons before they
       // deposit dose, which can under-estimate or blank the beta contribution.
-      "variance_reduction": false,
+      "variance_reduction": true,
 
       "gate": {
         // Requested TOTAL histories across all threads.
         // The stage converts this to a per-thread count internally.
-        "total_histories": 2e7,
+        "total_histories": 1e7,
 
         // Requested number of OpenGATE threads.
-        "num_threads": 40,
+        "num_threads": 100,
 
         // "auto" or an integer seed.
         "random_seed": "auto",
@@ -243,6 +218,51 @@
         // A conservative starting point is 0.5 mm or larger.
         "electron_production_cut_mm": 0.5
       }
+    }
+  },
+
+  // ==========================================================================
+  // PHASE 3 - Post-Processing
+  // ==========================================================================
+  "phase_3": {                                                                         //changed
+    "sub_dir_name": "post_processing",                                                 //changed
+
+    "spect_postprocess_stage": {                                                       //changed
+      "file_prefix": "spect_postprocess",                                              //changed
+
+      // Whether to apply PBPK TAC weighting to SIMIND projections.
+      "apply_tac": true,                                                               //changed
+
+      // Whether to apply Poisson noise to projections before reconstruction.
+      "apply_poisson_noise": true,                                                     //changed
+
+      // Whether to run PyTomography OSEM+TEW reconstruction.
+      "apply_reconstruction": true,                                                    //changed
+
+      // Whether to apply frame durations to projections.
+      "apply_frame_duration": true,                                                    //changed
+
+      // Frame start times in minutes.
+      // These are the times at which TACs are sampled and applied to projections.
+      "FrameStartTimes": [120, 1440, 2880],                                            //changed
+
+      // Frame durations in seconds, one per frame above.
+      "FrameDurations": [10, 10, 10],                                                  //changed
+
+      // OSEM reconstruction settings.
+      "ReconstructionAlgorithm": "OSEM",
+      "Iterations": 4,
+      "Subsets": 8
+    },
+
+    "dosemap_postprocess_stage": {                                                     //changed
+      "file_prefix": "dosemap_postprocess",                                            //changed
+
+      // Whether to apply PBPK TAC weighting to dose maps (cumulated activity).
+      "apply_tac": true,                                                               //changed
+
+      // Frame start times in minutes for dose map time-activity sampling.
+      "CumulativeTimepoints": [120, 1440, 2880]                                            //changed
     }
   }
 }

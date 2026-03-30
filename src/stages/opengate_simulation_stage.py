@@ -6,6 +6,8 @@ This stage runs voxel-source Monte Carlo dose calculations on the phase-1 CT gri
 Each requested ROI is simulated independently as a binary voxel source, then the
 resulting dose maps are optionally resampled back to the native CT space and summed.
 
+Now part of Phase 2 (Simulations) with its own independent ROI subset.
+
 Core responsibilities
 ---------------------
 - Validate required context fields and stage configuration.
@@ -39,12 +41,12 @@ before saving.
 Expected Context interface
 --------------------------
 Incoming `context` is expected to provide:
-- context.subdir_paths["phase_4"] : str
-- context.config["phase_4"]["opengate_simulation_stage"] : dict
+- context.subdir_paths["phase_2"] : str
+- context.config["phase_2"]["opengate_stage"] : dict (including roi_subset)
 - context.ct_nii_path : str
 - context.tdt_roi_seg_path : str
 - context.downstream_roi_subset : list[str] | str
-- context.config["phase_1"]["unification_stage"]["label_map_path"] : str
+- context.config["phase_1"]["segmentation_stage"]["label_map_path"] : str
 
 On success, this stage sets:
 - context.dosimetry_output_dir : str
@@ -101,8 +103,8 @@ class OpenGateSimulationStage:
         self.context = context
         self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"
 
-        self.phase_output_dir: str = context.subdir_paths["phase_4"]
-        self.stage_cfg: Dict[str, Any] = context.config["phase_4"]["opengate_simulation_stage"]
+        self.phase_output_dir: str = context.subdir_paths["phase_2"]                   
+        self.stage_cfg: Dict[str, Any] = context.config["phase_2"]["opengate_stage"]   
         self.stage_output_dir: str = os.path.join(
             self.phase_output_dir,
             self.stage_cfg.get("sub_dir_name", "opengate_simulation"),
@@ -180,21 +182,31 @@ class OpenGateSimulationStage:
         # Input paths
         self.ct_nii_path: Path = Path(context.ct_nii_path)
         self.tdt_roi_seg_path: Path = Path(context.tdt_roi_seg_path)
-        self.label_map_path: Path = Path(context.config["phase_1"]["unification_stage"]["label_map_path"])
+        self.label_map_path: Path = Path(context.config["phase_1"]["segmentation_stage"]["label_map_path"]) 
         self.tdt_name2id: Dict[str, int] = self._load_tdt_label_map(self.label_map_path)
 
-        # Build final ROI list. Keep body first if available because it is often useful
-        # for provenance/debugging and matches the style of the rest of the pipeline.
-        roi_subset = getattr(context, "downstream_roi_subset", None)
-        if isinstance(roi_subset, str):
-            roi_subset = [roi_subset]
-        if roi_subset is None:
-            raise ValueError("context.downstream_roi_subset must be provided")
+        # Build final ROI list from opengate_stage config (independent from phase_1) 
+        opengate_roi_subset = self.stage_cfg.get("roi_subset")                         
+        if opengate_roi_subset is None:                                                
+            opengate_roi_subset = getattr(context, "downstream_roi_subset", None)      
+        if isinstance(opengate_roi_subset, str):                                       
+            opengate_roi_subset = [opengate_roi_subset]                                
+        if opengate_roi_subset is None:                                                
+            raise ValueError("OpenGATE roi_subset must be provided (in config or context)") 
+
+        # Validate OpenGATE ROI subset against phase_1 segmented ROIs 
+        phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])         
+        invalid_rois = [r for r in opengate_roi_subset if r not in phase1_rois and r != "body"] 
+        if invalid_rois:                                                               
+            raise ValueError(                                                          
+                f"OpenGATE roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. " 
+                f"Available: {sorted(phase1_rois)}"                                    
+            )                                                                          
 
         roi_list: List[str] = []
         if "body" in self.tdt_name2id:
             roi_list.append("body")
-        for roi_name in roi_subset:
+        for roi_name in opengate_roi_subset:                                           
             if roi_name not in roi_list:
                 roi_list.append(roi_name)
         if not roi_list:
@@ -756,7 +768,7 @@ class OpenGateSimulationStage:
             )
 
             # Convert Gy/primary -> Gy/decay using the actual simulated history count.
-            dose_sim = np.asarray(res["dose_arr"], dtype=np.float64) * self.actual_total_histories
+            dose_sim = np.asarray(res["dose_arr"], dtype=np.float64) / self.actual_total_histories
 
             dose_native = (
                 self._upsample_to_native(
