@@ -28,17 +28,31 @@ from typing import Any, Dict, Literal
 
 from src.io.context import Context
 
-from src.stages.segmentation_ts_stage import TotalSegmentationStage
-from src.stages.unify_seg_tdt_outputs import TdtRoiUnifyStage
-from src.stages.preprocessing_simind_stage import SimindPreprocessStage
+from src.stages.segmentation_stage import SegmentationStage                    
 from src.stages.synthetic_lesions_stage import SyntheticLesionsStage
+from src.stages.pbpk_tac_stage import PbpkTacStage                            
 from src.stages.simind_simulation_stage import SimindSimulationStage
-from src.stages.pbpk_stage import PbpkStage
-from src.stages.reconstruction_stage import SpectReconstructionStage
+from src.stages.spect_postprocess_stage import SpectPostprocessStage           
 from src.stages.opengate_simulation_stage import OpenGateSimulationStage
+from src.stages.dosemap_postprocess_stage import DosemapPostprocessStage       
 
 
 CTInputType = Literal["nii", "dicom"]
+
+# ANSI color codes for DEBUG terminal output 
+_GREEN = "\033[92m"  
+_CYAN = "\033[96m"   
+_YELLOW = "\033[93m" 
+_RESET = "\033[0m"   
+_BOLD = "\033[1m"    
+
+
+def _debug_print(msg: str, phase: str = "", logger: logging.Logger = None) -> None: 
+    """Print a colored debug message to terminal and optionally log it.""" 
+    colored = f"{_GREEN}[DEBUG]{_RESET} {_CYAN}[{phase}]{_RESET} {msg}" if phase else f"{_GREEN}[DEBUG]{_RESET} {msg}" 
+    print(colored) 
+    if logger: 
+        logger.debug(f"[{phase}] {msg}" if phase else msg) 
 
 
 class TdtPipeline:
@@ -63,6 +77,12 @@ class TdtPipeline:
         Controls verbosity and whether intermediate files are cleaned up.
     synthetic_lesions : bool, default=False
         If True, runs the synthetic lesions stage to add simulated lesions to the CT.
+    run_spect : bool, default=False
+        If True, runs SIMIND SPECT simulation in Phase 2.
+    run_dosimetry : bool, default=False
+        If True, runs OpenGATE dosimetry simulation in Phase 2.
+    run_postprocess : bool, default=False
+        If True, runs post-processing in Phase 3 for whichever simulations ran.
     """
 
     def __init__(
@@ -75,6 +95,9 @@ class TdtPipeline:
         save_config: bool = False,
         mode: Literal["DEBUG", "PRODUCTION"] = "PRODUCTION",
         synthetic_lesions: bool = False,
+        run_spect: bool = False,      
+        run_dosimetry: bool = False,   
+        run_postprocess: bool = False, 
     ) -> None:
         self.config_path: str = config_path
         self.ct_input: str = ct_input
@@ -86,6 +109,9 @@ class TdtPipeline:
         self.save_config: bool = save_config
         self.mode: Literal["DEBUG", "PRODUCTION"] = mode
         self.synthetic_lesions: bool = synthetic_lesions
+        self.run_spect: bool = run_spect       
+        self.run_dosimetry: bool = run_dosimetry 
+        self.run_postprocess: bool = run_postprocess 
 
         self.config: Dict[str, Any] = {}
         self.output_folder_path: str = ""
@@ -208,7 +234,7 @@ class TdtPipeline:
             )
 
         # Create phase subdirs
-        phases = ["phase_1", "phase_2", "phase_3", "phase_4"]
+        phases = ["phase_1", "phase_2", "phase_3"]                                     
         self.sub_dir_paths: Dict[str, str] = {}
         self.sub_dir_names: Dict[str, str] = {}
         for phase in phases:
@@ -237,6 +263,9 @@ class TdtPipeline:
         context.ct_indx = self.ct_indx
         context.output_folder_path = self.output_folder_path
         context.synthetic_lesions_enabled = self.run_synthetic_lesions
+        context.run_spect = self.run_spect           
+        context.run_dosimetry = self.run_dosimetry   
+        context.run_postprocess = self.run_postprocess 
 
         # downstream_roi_subset flows from phase-1 config into all downstream stages.
         roi_subset = self.config["phase_1"]["segmentation_stage"]["roi_subset"]
@@ -246,24 +275,38 @@ class TdtPipeline:
 
         self.logger.debug("Context initialized for CT_%s", self.ct_indx)
 
+    def _phase_banner(self, phase_num: int, phase_name: str) -> None: 
+        """Print a phase banner with optional color in DEBUG mode.""" 
+        banner = f"-----------------------------Phase {phase_num}: {phase_name}-----------------------------" 
+        if self.mode == "DEBUG": 
+            print(f"{_BOLD}{_YELLOW}{banner}{_RESET}") 
+        else: 
+            print(banner) 
+
+    def _cleanup_work_dir(self, work_dir: str) -> None: 
+        """Remove a work directory in PRODUCTION mode to save disk space.""" 
+        if self.mode == "PRODUCTION" and work_dir and os.path.exists(work_dir): 
+            work_dir_abs = os.path.abspath(work_dir) 
+            shutil.rmtree(work_dir_abs, ignore_errors=True) 
+            if self.mode == "DEBUG": 
+                _debug_print(f"Cleaned up work_dir: {work_dir_abs}", "CLEANUP", self.logger) 
+
     def run(self) -> Context:
         """
         Execute all pipeline stages sequentially for this CT input.
 
         Phases
         ------
-        1. Digital Twin:
-            1.1  TotalSegmentator segmentation
-            1.2  ROI unification to TDT label space
-            1.3  Synthetic lesion generation (optional)
-        2. SPECT Simulation:
-            2.1  SIMIND preprocessing (CT + seg -> SIMIND binaries)
-            2.2  SIMIND Monte Carlo projection simulation
-        3. SPECT Post-Processing:
-            3.1  PBPK TAC generation and projection weighting
-            3.2  OSEM + TEW reconstruction
-        4. Dosimetry:
-            4.1  OpenGATE voxel-source Monte Carlo dose calculation
+        1. Digital Twin & Ground Truth:
+            1.1  TotalSegmentator segmentation + ROI unification to TDT label space
+            1.2  Synthetic lesion generation (optional)
+            1.3  PBPK TAC generation
+        2. Simulations:
+            2.1  SIMIND preprocessing + Monte Carlo projection simulation (optional, --spect)
+            2.2  OpenGATE Monte Carlo dosimetry simulation (optional, --dosimetry)
+        3. Post-Processing:
+            3.1  SPECT post-processing (optional, --postprocess with --spect)
+            3.2  Dosimetry post-processing (optional, --postprocess with --dosimetry)
 
         Returns
         -------
@@ -274,80 +317,114 @@ class TdtPipeline:
         t_pipeline = time.perf_counter()
 
         print(f"Starting TDT Pipeline (CT_{self.ct_indx}) | mode={self.mode} | input={self.ct_input}")
+        if self.mode == "DEBUG": 
+            _debug_print(f"run_spect={self.run_spect} | run_dosimetry={self.run_dosimetry} | run_postprocess={self.run_postprocess}", "INIT", logger) 
+            _debug_print(f"synthetic_lesions={self.run_synthetic_lesions}", "INIT", logger) 
 
         context = self.context
 
         logger.info("Pipeline start | mode=%s", self.mode)
         logger.info("CT input | path=%s | type=%s", self.ct_input, self.ct_input_type)
 
-        # ----------------------------- Phase 1: Digital Twin -----------------------------
-        print("-----------------------------Phase 1: Creating Digital Twin-----------------------------")
+        # ----------------------------- Phase 1: Digital Twin & Ground Truth ----------------------------- 
+        self._phase_banner(1, "Digital Twin & Ground Truth") 
 
-        logger.info("Stage start: TotalSegmentator")
+        logger.info("Stage start: Segmentation + ROI Unification") 
         t_stage = time.perf_counter()
-        print("Running TotalSegmentator Stage...")
-        context = TotalSegmentationStage(context).run()
-        print("TotalSegmentator Stage completed.")
-        logger.info("Stage end: TotalSegmentator | elapsed=%.2fs", time.perf_counter() - t_stage)
-
-        logger.info("Stage start: TDT ROI Unification")
-        t_stage = time.perf_counter()
-        print("Running TDT ROI Unification Stage...")
-        context = TdtRoiUnifyStage(context).run()
-        print("TDT ROI Unification Stage completed.")
-        logger.info("Stage end: TDT ROI Unification | elapsed=%.2fs", time.perf_counter() - t_stage)
+        print("Running Segmentation + ROI Unification Stage...") 
+        if self.mode == "DEBUG": 
+            _debug_print("Segmentation will run TotalSegmentator tasks then unify to TDT label space", "Phase 1", logger) 
+        context = SegmentationStage(context).run() 
+        print("Segmentation + ROI Unification Stage completed.") 
+        logger.info("Stage end: Segmentation + ROI Unification | elapsed=%.2fs", time.perf_counter() - t_stage) 
 
         if self.run_synthetic_lesions:
             logger.info("Stage start: Synthetic Lesions Generation")
             t_stage = time.perf_counter()
             print("Running Synthetic Lesions Generation Stage...")
+            if self.mode == "DEBUG": 
+                _debug_print("Inserting synthetic lesions into unified segmentation", "Phase 1", logger) 
             context = SyntheticLesionsStage(context).run()
             print("Synthetic Lesions Generation Stage completed.")
             logger.info("Stage end: Synthetic Lesions Generation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # ----------------------------- Phase 2: SPECT Simulation -----------------------------
-        print("-----------------------------Phase 2: SPECT Simulation-----------------------------")
+        logger.info("Stage start: PBPK TAC Generation") 
+        t_stage = time.perf_counter() 
+        print("Running PBPK TAC Generation Stage...") 
+        if self.mode == "DEBUG": 
+            _debug_print("Generating TACs for all segmented ROIs via PyCNO PSMA model", "Phase 1", logger) 
+        context = PbpkTacStage(context).run() 
+        print("PBPK TAC Generation Stage completed.") 
+        logger.info("Stage end: PBPK TAC Generation | elapsed=%.2fs", time.perf_counter() - t_stage) 
 
-        logger.info("Stage start: SIMIND Preprocessing")
-        t_stage = time.perf_counter()
-        print("Running SIMIND Preprocessing Stage...")
-        context = SimindPreprocessStage(context).run()
-        print("SIMIND Preprocessing Stage completed.")
-        logger.info("Stage end: SIMIND Preprocessing | elapsed=%.2fs", time.perf_counter() - t_stage)
+        # ----------------------------- Phase 2: Simulations ----------------------------- 
+        if self.run_spect or self.run_dosimetry: 
+            self._phase_banner(2, "Simulations") 
+        else: 
+            print("-----------------------------Phase 2: Simulations (skipped - no --spect or --dosimetry)-----------------------------") 
+            logger.info("Phase 2 skipped: no --spect or --dosimetry flags") 
 
-        logger.info("Stage start: SIMIND Simulation")
-        t_stage = time.perf_counter()
-        print("Running SIMIND Simulation Stage...")
-        context = SimindSimulationStage(context).run()
-        print("SIMIND Simulation Stage completed.")
-        logger.info("Stage end: SIMIND Simulation | elapsed=%.2fs", time.perf_counter() - t_stage)
+        if self.run_spect: 
+            logger.info("Stage start: SIMIND Simulation") 
+            t_stage = time.perf_counter()
+            print("Running SIMIND Simulation Stage (includes preprocessing)...") 
+            if self.mode == "DEBUG": 
+                _debug_print("SIMIND: preprocessing CT/seg -> binaries, then running Monte Carlo projections", "Phase 2", logger) 
+            context = SimindSimulationStage(context).run() 
+            print("SIMIND Simulation Stage completed.") 
+            logger.info("Stage end: SIMIND Simulation | elapsed=%.2fs", time.perf_counter() - t_stage) 
 
-        # ----------------------------- Phase 3: SPECT Post-Processing -----------------------------
-        print("-----------------------------Phase 3: SPECT Post-Processing-----------------------------")
+        if self.run_dosimetry: 
+            logger.info("Stage start: OpenGATE Simulation") 
+            t_stage = time.perf_counter()
+            print("Running OpenGATE Simulation Stage...") 
+            if self.mode == "DEBUG": 
+                _debug_print("OpenGATE: running voxel-source Monte Carlo dosimetry per ROI", "Phase 2", logger) 
+            context = OpenGateSimulationStage(context).run()
+            print("OpenGATE Simulation Stage completed.") 
+            logger.info("Stage end: OpenGATE Simulation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        logger.info("Stage start: PBPK")
-        t_stage = time.perf_counter()
-        print("Running PBPK Stage...")
-        context = PbpkStage(context).run()
-        print("PBPK Stage completed.")
-        logger.info("Stage end: PBPK | elapsed=%.2fs", time.perf_counter() - t_stage)
+        # ----------------------------- Phase 3: Post-Processing ----------------------------- 
+        if self.run_postprocess and (self.run_spect or self.run_dosimetry): 
+            self._phase_banner(3, "Post-Processing") 
+        elif self.run_postprocess: 
+            print("-----------------------------Phase 3: Post-Processing (skipped - no simulations ran)-----------------------------") 
+            logger.info("Phase 3 skipped: --postprocess set but no simulations ran") 
+        else: 
+            print("-----------------------------Phase 3: Post-Processing (skipped - no --postprocess)-----------------------------") 
+            logger.info("Phase 3 skipped: no --postprocess flag") 
 
-        logger.info("Stage start: SPECT Reconstruction")
-        t_stage = time.perf_counter()
-        print("Running SPECT Reconstruction Stage...")
-        context = SpectReconstructionStage(context).run()
-        print("SPECT Reconstruction Stage completed.")
-        logger.info("Stage end: SPECT Reconstruction | elapsed=%.2fs", time.perf_counter() - t_stage)
+        if self.run_postprocess and self.run_spect: 
+            logger.info("Stage start: SPECT Post-Processing") 
+            t_stage = time.perf_counter() 
+            print("Running SPECT Post-Processing Stage...") 
+            if self.mode == "DEBUG": 
+                _debug_print("Applying TAC weighting, Poisson noise, and OSEM+TEW reconstruction", "Phase 3", logger) 
+            context = SpectPostprocessStage(context).run() 
+            print("SPECT Post-Processing Stage completed.") 
+            logger.info("Stage end: SPECT Post-Processing | elapsed=%.2fs", time.perf_counter() - t_stage) 
 
-        # ----------------------------- Phase 4: Dosimetry -----------------------------
-        print("-----------------------------Phase 4: Dosimetry-----------------------------")
+        if self.run_postprocess and self.run_dosimetry: 
+            logger.info("Stage start: Dosimetry Post-Processing") 
+            t_stage = time.perf_counter() 
+            print("Running Dosimetry Post-Processing Stage...") 
+            if self.mode == "DEBUG": 
+                _debug_print("Applying TAC-weighted cumulated activity to dose maps", "Phase 3", logger) 
+            context = DosemapPostprocessStage(context).run() 
+            print("Dosimetry Post-Processing Stage completed.") 
+            logger.info("Stage end: Dosimetry Post-Processing | elapsed=%.2fs", time.perf_counter() - t_stage) 
 
-        logger.info("Stage start: OpenGATE Simulation")
-        t_stage = time.perf_counter()
-        print("Running OpenGATE Simulation Stage...")
-        context = OpenGateSimulationStage(context).run()
-        print("OpenGATE Simulation Stage completed.")
-        logger.info("Stage end: OpenGATE Simulation | elapsed=%.2fs", time.perf_counter() - t_stage)
+        # ----------------------------- PRODUCTION cleanup ----------------------------- 
+        if self.mode == "PRODUCTION": 
+            # Clean up SIMIND work_dir after post-processing is done 
+            simind_work = getattr(context, "simind_work_dir", None) 
+            if simind_work and os.path.exists(simind_work): 
+                # Only clean if postprocess is done or not requested 
+                if not self.run_postprocess or not self.run_spect: 
+                    self._cleanup_work_dir(simind_work) 
+                elif self.run_postprocess and self.run_spect: 
+                    # Post-process already ran, safe to clean 
+                    self._cleanup_work_dir(simind_work) 
 
         logger.info("Pipeline end | total_elapsed=%.2fs", time.perf_counter() - t_pipeline)
         print("TDT Pipeline completed successfully.")
@@ -395,6 +472,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="Run synthetic lesion generation. Requires specs in config. Default: disabled.",
     )
+    parser.add_argument( 
+        "--spect", 
+        action=argparse.BooleanOptionalAction, 
+        default=False, 
+        help="Run SIMIND SPECT projection simulation in Phase 2. Default: disabled.", 
+    ) 
+    parser.add_argument( 
+        "--dosimetry", 
+        action=argparse.BooleanOptionalAction, 
+        default=False, 
+        help="Run OpenGATE dosimetry simulation in Phase 2. Default: disabled.", 
+    ) 
+    parser.add_argument( 
+        "--postprocess", 
+        action=argparse.BooleanOptionalAction, 
+        default=False, 
+        help="Run post-processing in Phase 3 for whichever simulations ran. Default: disabled.", 
+    ) 
 
     return parser
 
@@ -420,6 +515,7 @@ def main() -> int:
     print("----------------------------- Starting TDT Pipeline -----------------------------")
     print("")
     print(f"Discovered {len(items)} CT item(s) in: {ct_inputs_dir}")
+    print(f"Flags: --spect={args.spect} --dosimetry={args.dosimetry} --postprocess={args.postprocess}") 
     print("")
 
     for idx, name in enumerate(items):
@@ -435,6 +531,9 @@ def main() -> int:
                 save_config=args.save_config,
                 mode=args.mode,
                 synthetic_lesions=args.synthetic_lesions,
+                run_spect=args.spect,       
+                run_dosimetry=args.dosimetry, 
+                run_postprocess=args.postprocess, 
             )
             pipeline.run()
         except Exception as e:
@@ -447,4 +546,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-# quick run: python main.py --config_file inputs/config.json --input_ct_dir inputs/ct_testing --mode DEBUG --logging_on --save_config --synthetic_lesions
+# quick run: python main.py --config_file inputs/config.json --input_ct_dir inputs/ct_testing --mode DEBUG --logging_on --save_config --synthetic_lesions --spect --dosimetry --postprocess 

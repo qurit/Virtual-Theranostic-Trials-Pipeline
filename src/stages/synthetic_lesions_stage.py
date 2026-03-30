@@ -50,7 +50,7 @@ Incoming `context` must provide:
     - "file_prefix": str
     - "specs": dict | None
 - context.config["phase_1"]["segmentation_stage"]["roi_subset"]
-- context.config["phase_1"]["unification_stage"]["label_map_path"]
+- context.config["phase_1"]["segmentation_stage"]["label_map_path"]                  
 - context.tdt_roi_seg_path: str (unified multilabel seg produced by TdtRoiUnifyStage)
 
 Maintainer / contact: pyazdi@bccrc.ca
@@ -184,7 +184,7 @@ class SyntheticLesionsStage:
 
     def _load_tdt_label_map(self) -> Dict[str, int]:
         """Load TDT_Pipeline label map (name -> id) from configured label_map_path."""
-        ts_map_path = self.context.config["phase_1"]["unification_stage"]["label_map_path"]
+        ts_map_path = self.context.config["phase_1"]["segmentation_stage"]["label_map_path"] 
         if not os.path.exists(ts_map_path):
             raise FileNotFoundError(f"Class map json not found: {ts_map_path}")
 
