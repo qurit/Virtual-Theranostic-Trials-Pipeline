@@ -28,19 +28,17 @@
 
       // User-facing ROI names requested for this CT.
       // These also flow into downstream stages through context.downstream_roi_subset.
-      // Allowed ROI names in your current stage:
+      // Allowed ROI names:
       // ["body", "kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"]
       "roi_subset": ["body", "kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"],
 
       // Prefix used when writing unified TDT label outputs / metadata.
-      "unification_prefix": "unified_labels",                                          //changed
+      "unification_prefix": "unified_labels",
 
       // Absolute path to your TDT label-map JSON.
       // This is used by unification, preprocessing, synthetic lesions, and OpenGATE.
-      "label_map_path": "/home/jhubadmin/Theranostic-Virtual-Patient-Pipeline/src/data/tdt_map.json"   //changed
+      "label_map_path": "/home/jhubadmin/Theranostic-Virtual-Patient-Pipeline/src/data/tdt_map.json"
     },
-
-    // --- Removed: unification_stage section (merged into segmentation_stage) --- //changed
 
     "synthetic_lesions_stage": {
       // This stage only runs if:
@@ -60,21 +58,28 @@
       // Set to null to disable lesion insertion by config.
       // Fill this block only for organs where you want lesions.
       "specs": {
-                "liver": {
-                          "n_lesions": 5,
-                          "prob": "gaussian",     // "uniform", "gaussian", or "user_defined"
-                          "sigma_mm": 60.0,         // needed for gaussian placement
-                          "margin_mm": 1.0,         // minimum distance from organ boundary / other lesions
-                          "seed": 0
-      }
+        "liver": {
+          "n_lesions": 5,
+          "prob": "gaussian",     // "uniform", "gaussian", or "user_defined"
+          "sigma_mm": 60.0,       // needed for gaussian placement
+          "margin_mm": 1.0,       // minimum distance from organ boundary / other lesions
+          "seed": 0
+        }
       }
     },
 
-    "pbpk_tac_stage": {                                                                //changed
+    "pbpk_tac_stage": {
       "file_prefix": "pbpk",
 
-      // Current supported model in your code.
+      // PBPK pharmacokinetic model to use. Currently supported: "PSMA".
       "model_type": "PSMA",
+
+      // Isotope for TAC simulation. Determines the PBPK simulation stop time
+      // (10x the isotope half-life, capturing >99.9% of all decays).
+      // Currently supported: "lu177".
+      // The half-life lookup table is in pbpk_tac_stage.py (ISOTOPE_HALF_LIVES_MIN)
+      // and can be extended when new isotopes/models are added.
+      "isotope": "lu177",
 
       // PyCNO observable names you want available.
       "VOIs": [
@@ -98,7 +103,8 @@
         "Adipose"
       ],
 
-      // If true, kidney and salivary-gland parameters can be randomized.
+      // If true, kidney and salivary-gland parameters can be randomized
+      // via lognormal sampling of Rden and lambdaRel parameters.
       "Randomization_Kidney_SG_Para": true
     }
   },
@@ -106,21 +112,21 @@
   // ==========================================================================
   // PHASE 2 - Simulations (SIMIND and/or OpenGATE)
   // ==========================================================================
-  "phase_2": {                                                                         //changed
-    "sub_dir_name": "simulations",                                                     //changed
+  "phase_2": {
+    "sub_dir_name": "simulations",
 
-    "simind_stage": {                                                                  //changed
+    "simind_stage": {
       "file_prefix": "simind",
 
       // ROI subset for SIMIND simulation.
       // These must be a subset of phase_1.segmentation_stage.roi_subset.
       // The stage validates that these ROIs were successfully segmented.
-      "roi_subset": ["liver", "kidney","salivary_glands"],                                     //changed
+      "roi_subset": ["liver", "kidney", "salivary_glands"],
 
       // Optional target in-plane size for SIMIND preprocessing.
       // If null, the current CT in-plane grid is kept.
       // If set (e.g. 128 or 256), an isotropic resize factor is applied.
-      "xy_dim": 128,                                                                   //changed
+      "xy_dim": 128,
 
       // Absolute path to the SIMIND executable directory.
       "SIMINDDirectory": "/home/jhubadmin/simind/simind",
@@ -150,19 +156,19 @@
       "NumCores": 0
     },
 
-    "opengate_stage": {                                                                //changed
+    "opengate_stage": {
       "file_prefix": "opengate_simulation",
 
       // ROI subset for OpenGATE dosimetry simulation.
       // These must be a subset of phase_1.segmentation_stage.roi_subset.
       // The stage validates that these ROIs were successfully segmented.
-      "roi_subset": ["liver", "kidney","salivary_glands"],                                     //changed
+      "roi_subset": ["liver", "kidney", "salivary_glands"],
 
       // Optional stage-local output folder name inside phase_2.
       // If omitted, the stage defaults to "opengate_simulation".
       "sub_dir_name": "opengate_simulation",
 
-      // Save options
+      // Save options.
       "save_per_roi_dose_maps": true,
       "save_summed_dose_map": true,
       "save_uncertainty_map": true,
@@ -174,7 +180,7 @@
       // Set to null to simulate on the native CT grid.
       "xy_dim": 128,
 
-      // Dose actor voxel spacing in mm: [x, y, z]
+      // Dose actor voxel spacing in mm: [x, y, z].
       // - null => match the simulation CT spacing exactly
       // - [4.0, 4.0, 4.0] => force a coarser isotropic dose grid
       "output_dose_spacing_mm": null,
@@ -224,30 +230,31 @@
   // ==========================================================================
   // PHASE 3 - Post-Processing
   // ==========================================================================
-  "phase_3": {                                                                         //changed
-    "sub_dir_name": "post_processing",                                                 //changed
+  "phase_3": {
+    "sub_dir_name": "post_processing",
 
-    "spect_postprocess_stage": {                                                       //changed
-      "file_prefix": "spect_postprocess",                                              //changed
+    "spect_postprocess_stage": {
+      "file_prefix": "spect_postprocess",
 
       // Whether to apply PBPK TAC weighting to SIMIND projections.
-      "apply_tac": true,                                                               //changed
+      "apply_tac": true,
 
       // Whether to apply Poisson noise to projections before reconstruction.
-      "apply_poisson_noise": true,                                                     //changed
+      "apply_poisson_noise": true,
 
       // Whether to run PyTomography OSEM+TEW reconstruction.
-      "apply_reconstruction": true,                                                    //changed
+      "apply_reconstruction": true,
 
       // Whether to apply frame durations to projections.
-      "apply_frame_duration": true,                                                    //changed
+      "apply_frame_duration": true,
 
       // Frame start times in minutes.
       // These are the times at which TACs are sampled and applied to projections.
-      "FrameStartTimes": [120, 1440, 2880],                                            //changed
+      "FrameStartTimes": [120, 1440, 2880],
 
       // Frame durations in seconds, one per frame above.
-      "FrameDurations": [10, 10, 10],                                                  //changed
+      // Controls simulated camera exposure time — affects count statistics and noise.
+      "FrameDurations": [10, 10, 10],
 
       // OSEM reconstruction settings.
       "ReconstructionAlgorithm": "OSEM",
@@ -255,14 +262,11 @@
       "Subsets": 8
     },
 
-    "dosemap_postprocess_stage": {                                                     //changed
-      "file_prefix": "dosemap_postprocess",                                            //changed
-
-      // Whether to apply PBPK TAC weighting to dose maps (cumulated activity).
-      "apply_tac": true,                                                               //changed
-
-      // Frame start times in minutes for dose map time-activity sampling.
-      "CumulativeTimepoints": [120, 1440, 2880]                                            //changed
+    "dosemap_postprocess_stage": {
+      "file_prefix": "dosemap_postprocess"
+      // No additional parameters needed. The stage integrates each ROI's TAC
+      // from t=0 to the end of the PBPK simulation (10x isotope half-life)
+      // and produces a single total absorbed dose map in Gy.
     }
   }
 }

@@ -15,7 +15,7 @@ The **Theranostic Digital Twins (TDT) Pipeline** is a quantitative software fram
 - **Patient-specific anatomy** from clinical CT scans
 - **Organ/tumor segmentation** (TotalSegmentator-based workflows)
 - **Pharmacokinetic (PBPK) modeling** to generate time-activity behavior
-- **Monte Carlo Dosimetry SPECT simulation  + reconstruction** (SIMIND/PyTomography) to produce quantitative images
+- **Monte Carlo SPECT simulation + reconstruction** (SIMIND/PyTomography) to produce quantitative images
 - **Monte Carlo dosimetry simulation** (OpenGATE/Geant4) to generate organ-level dose maps
 
 Because uptake and dose can vary substantially between patients, TDTs support personalized evaluation of therapy strategies by enabling controlled, repeatable experiments across anatomy, kinetics, and imaging physics. A key objective is demonstrating agreement with patient measurements to support reliability and validation; longer-term, this work supports **Virtual Theranostic Trials (VTTs)** and patient-specific dosimetry prediction.
@@ -92,10 +92,10 @@ Then edit `inputs/config.json`.
 - `phase_2.simind_stage.SIMINDDirectory` — path to your SIMIND install.
 - `phase_1.segmentation_stage.roi_subset` — list of ROIs to segment.
 - `phase_1.segmentation_stage.label_map_path` — path to `tdt_map.json` label map file.
+- `phase_1.pbpk_tac_stage.isotope` — isotope for PBPK TAC generation (e.g. `"lu177"`). The TAC is simulated for 10x the isotope half-life.
 - `phase_2.simind_stage.roi_subset` — list of ROIs for SIMIND simulation.
 - `phase_2.opengate_stage.roi_subset` — list of ROIs for OpenGATE dosimetry.
 - `phase_3.spect_postprocess_stage.FrameStartTimes` and `FrameDurations` — frame timing for SPECT reconstruction.
-- `phase_3.dosemap_postprocess_stage.CumulativeTimepoints` — timepoints (in minutes) at which to report cumulative absorbed dose.
 
 #### Common tweaks (runtime / quality)
 - `phase_2.simind_stage.xy_dim` — in-plane resize for SIMIND inputs (smaller = faster).
@@ -208,8 +208,8 @@ tdt_test_run_CT_0/
       <prefix>_<t_hr>_tot_w1/w2/w3.nii.gz   <- PBPK-weighted projections per frame
     reconstructed_SPECT_<t_hr>.nii.gz        <- reconstructed SPECT image per frame
     dosemap_postprocess/                     <- (if --dosimetry --postprocess)
-      work_dir/                              <- metadata and intermediate files
-    <prefix>_cumulative_dose_<t_hr>hr.nii.gz <- cumulative dose map (Gy) per timepoint
+      work_dir/                              <- metadata
+    <prefix>_total_dose.nii.gz               <- total absorbed dose map (Gy)
   logging_file_CT_0.log                      <- per-CT pipeline log
 ```
 
@@ -217,7 +217,8 @@ tdt_test_run_CT_0/
 - `*_tot_w1/w2/w3.a00` are SIMIND energy-window projection totals (lower / photopeak / upper).
 - `calib.res` is produced by SIMIND Jaszczak calibration and converts counts -> activity.
 - All dose maps in the dosimetry output are in native CT resolution (upsampled back if `xy_dim` was set).
-- Cumulative dose maps are computed using per-ROI weighting: each ROI's dose-per-decay map is multiplied by that ROI's own cumulated activity (integrated TAC from t=0), then summed across ROIs. This avoids unphysical cross-terms.
+- The total dose map is computed using per-ROI weighting: each ROI's dose-per-decay map is multiplied by that ROI's own cumulated activity (TAC integrated from t=0 over 10x the isotope half-life, capturing >99.9% of all decays), then summed across ROIs. This avoids unphysical cross-terms.
+- PBPK TAC simulation length is derived automatically from the configured isotope half-life (10x multiplier). If any SPECT frame time extends beyond this, the TAC is extended to cover it.
 - In `PRODUCTION` mode, SIMIND `work_dir` is deleted after post-processing to save disk space.
 - SIMIND header files are preserved in `headers/` to support reconstruction.
 - PBPK TACs are saved as JSON + npz in Phase 1 and reused by both SPECT and dosimetry post-processing.
@@ -230,11 +231,11 @@ tdt_test_run_CT_0/
 src/stages/
   segmentation_stage.py         <- TotalSegmentator + ROI unification (merged)
   synthetic_lesions_stage.py    <- Optional synthetic lesion generation
-  pbpk_tac_stage.py             <- PBPK TAC generation for all segmented ROIs
+  pbpk_tac_stage.py             <- PBPK TAC generation (isotope-aware stop time)
   simind_simulation_stage.py    <- SIMIND preprocessing + Monte Carlo simulation (merged)
   opengate_simulation_stage.py  <- OpenGATE voxel-source dosimetry
   spect_postprocess_stage.py    <- TAC weighting + Poisson noise + OSEM reconstruction
-  dosemap_postprocess_stage.py  <- Per-ROI TAC-weighted cumulative dose map generation
+  dosemap_postprocess_stage.py  <- Per-ROI TAC-weighted total absorbed dose map
 ```
 
 ---

@@ -15,11 +15,10 @@ Core responsibilities
 
 Stop time behaviour
 -------------------
-The PBPK simulation stop time is derived automatically from the downstream
-config timepoints (SPECT FrameStartTimes + FrameDurations and dosimetry
-CumulativeTimepoints). A 20% buffer is added beyond the latest required
-timepoint, with a floor of MIN_PBPK_STOP_MINUTES to ensure reasonable TAC
-resolution even when downstream stages request only early timepoints.
+The PBPK simulation stop time is derived from the isotope half-life. The TAC
+is simulated for PBPK_HALF_LIFE_MULTIPLIER x the half-life (default 10x),
+which captures effectively all decay. If any SPECT frame time extends beyond
+this, the stop time is extended to cover it.
 
 Expected Context interface
 --------------------------
@@ -28,6 +27,8 @@ Incoming `context` is expected to provide:
 - context.ct_input_path : str  (NIfTI path or DICOM directory for height/weight extraction)
 - context.config["phase_1"]["pbpk_tac_stage"] with keys:
     - "file_prefix" : str
+    - "model_type" : str  (e.g. "PSMA")
+    - "isotope" : str  (e.g. "lu177")
     - "VOIs" : list[str]  (PyCNO observables, e.g. ["Kidney","Liver","Rest",...])
     - "Randomization_Kidney_SG_Para" : bool
 - context.downstream_roi_subset : list[str]
@@ -42,6 +43,8 @@ On success, this stage sets:
 - context.pbpk_weight_kg : Optional[float]
 - context.pbpk_parameters : Optional[dict[str, float]]
 - context.pbpk_vois : list[str]
+- context.pbpk_isotope : str
+- context.pbpk_stop_time_min : float
 
 Maintainer / contact: pyazdi@bccrc.ca
 """
@@ -56,10 +59,16 @@ import numpy as np
 import pycno
 import pydicom
 
-# Minimum PBPK simulation duration in minutes.
-# The actual stop time may be longer if downstream stages require later timepoints.
-# Default 4320 min = 72 hours (approx 11 Lu-177 half-lives).
-MIN_PBPK_STOP_MINUTES = 4320.0
+# ---------------------------------------------------------------------------
+# Isotope half-life lookup table (values in minutes).
+# Add new isotopes here as they become supported.
+# ---------------------------------------------------------------------------
+ISOTOPE_HALF_LIVES_MIN: Dict[str, float] = {
+    "lu177": 6.647 * 24.0 * 60.0,   # 6.647 days = 9571.68 min
+}
+
+# Number of half-lives to simulate. 10 half-lives captures >99.9% of total decays.
+PBPK_HALF_LIFE_MULTIPLIER: int = 10
 
 
 class PbpkTacStage:
@@ -89,8 +98,19 @@ class PbpkTacStage:
         self.ct_input_path: str = context.ct_input_path
 
         self.prefix: str = self.stage_cfg.get("file_prefix", self.stage_cfg.get("name", "pbpk"))
+        self.model_type: str = self.stage_cfg.get("model_type", "PSMA")
         self.vois_pbpk: List[str] = list(self.stage_cfg["VOIs"])
         self.randomize_kidney_sg_para: bool = self.stage_cfg["Randomization_Kidney_SG_Para"]
+
+        # Isotope configuration
+        raw_isotope = str(self.stage_cfg.get("isotope", "lu177")).lower().strip().replace("-", "")
+        if raw_isotope not in ISOTOPE_HALF_LIVES_MIN:
+            raise ValueError(
+                f"Unsupported isotope '{raw_isotope}' in pbpk_tac_stage config. "
+                f"Supported: {sorted(ISOTOPE_HALF_LIVES_MIN.keys())}"
+            )
+        self.isotope: str = raw_isotope
+        self.half_life_min: float = ISOTOPE_HALF_LIVES_MIN[self.isotope]
 
         self.downstream_roi_subset: List[str] = list(context.downstream_roi_subset)
         if "body" not in self.downstream_roi_subset:
@@ -214,42 +234,36 @@ class PbpkTacStage:
 
     def _compute_stop_time(self) -> float:
         """
-        Derive PBPK simulation stop time from downstream config timepoints.
+        Derive PBPK simulation stop time from isotope half-life.
 
-        Scans SPECT frame times and dosimetry cumulative timepoints to find
-        the latest time any downstream stage will need, then adds a 20% buffer.
-        The result is floored at MIN_PBPK_STOP_MINUTES to ensure reasonable
-        TAC resolution even when downstream stages request only early timepoints.
+        The base stop time is PBPK_HALF_LIFE_MULTIPLIER x the isotope half-life,
+        which captures effectively all decays (>99.9% at 10x). If any SPECT frame
+        time extends beyond this, the stop time is increased to cover it.
 
         Returns
         -------
         float  stop time in minutes
         """
-        max_t = 0.0
-        cfg = self.context.config
+        stop = self.half_life_min * PBPK_HALF_LIFE_MULTIPLIER
 
+        # Check if SPECT frame times require a longer TAC
+        cfg = self.context.config
         try:
             spect = cfg["phase_3"]["spect_postprocess_stage"]
             starts = spect.get("FrameStartTimes", [])
             durations = spect.get("FrameDurations", [])
             for s, d in zip(starts, durations):
-                max_t = max(max_t, float(s) + float(d) / 60.0)
+                t_end = float(s) + float(d) / 60.0
+                if t_end > stop:
+                    stop = t_end
         except (KeyError, TypeError):
             pass
-
-        try:
-            dose = cfg["phase_3"]["dosemap_postprocess_stage"]
-            for t in dose.get("CumulativeTimepoints", []):
-                max_t = max(max_t, float(t))
-        except (KeyError, TypeError):
-            pass
-
-        stop = max(MIN_PBPK_STOP_MINUTES, max_t * 1.2)
 
         if self.debug:
             print(
-                f"[PbpkTacStage] Auto-derived stop time: {stop:.0f} min "
-                f"({stop / 60.0:.1f} hr) from max downstream t={max_t:.0f} min"
+                f"[PbpkTacStage] Isotope: {self.isotope} | "
+                f"half-life: {self.half_life_min:.1f} min ({self.half_life_min / 60.0 / 24.0:.2f} days) | "
+                f"stop time: {stop:.0f} min ({stop / 60.0:.1f} hr, {stop / 60.0 / 24.0:.1f} days)"
             )
 
         return stop
@@ -270,13 +284,14 @@ class PbpkTacStage:
         self.context.pbpk_parameters = dict(self.parameters) if self.parameters else None
 
         model = pycno.Model(
-            model_name="PSMA",
+            model_name=self.model_type,
             hotamount=10,
             coldamount=100,
             parameters=self.parameters,
         )
 
         stop = self._compute_stop_time()
+        self._stop_time = stop
         steps = int(np.ceil(stop)) if stop > 0 else 1
         time, tacs = model.simulate(stop=stop, steps=steps, observables=self.vois_pbpk)
         return np.asarray(time, dtype=float), np.asarray(tacs, dtype=float)
@@ -323,7 +338,10 @@ class PbpkTacStage:
         (json_path, npz_path)
         """
         json_data: Dict[str, Any] = {
-            "model_type": "PSMA",
+            "model_type": self.model_type,
+            "isotope": self.isotope,
+            "half_life_min": self.half_life_min,
+            "stop_time_min": float(time[-1]),
             "pbpk_height_m": None if self.height is None else float(self.height),
             "pbpk_weight_kg": None if self.weight is None else float(self.weight),
             "pbpk_parameters": {k: float(v) for k, v in self.parameters.items()},
@@ -361,6 +379,10 @@ class PbpkTacStage:
             "output_dir": self.output_dir,
             "work_dir": self.work_dir,
             "file_prefix": self.prefix,
+            "model_type": self.model_type,
+            "isotope": self.isotope,
+            "half_life_min": self.half_life_min,
+            "half_life_multiplier": PBPK_HALF_LIFE_MULTIPLIER,
             "ct_input_path": self.ct_input_path,
             "vois_pbpk": list(self.vois_pbpk),
             "randomize_kidney_sg_para": bool(self.randomize_kidney_sg_para),
@@ -415,6 +437,8 @@ class PbpkTacStage:
             self.context.pbpk_weight_kg = json_data.get("pbpk_weight_kg")
             self.context.pbpk_parameters = json_data.get("pbpk_parameters")
             self.context.pbpk_vois = json_data.get("vois_pbpk", [])
+            self.context.pbpk_isotope = json_data.get("isotope", self.isotope)
+            self.context.pbpk_stop_time_min = json_data.get("stop_time_min", float(time_arr[-1]))
             return self.context
 
         time, tacs = self._run_psma_model()
@@ -457,6 +481,8 @@ class PbpkTacStage:
         self.context.pbpk_weight_kg = self.weight
         self.context.pbpk_parameters = dict(self.parameters)
         self.context.pbpk_vois = list(self.vois_pbpk)
+        self.context.pbpk_isotope = self.isotope
+        self.context.pbpk_stop_time_min = float(time[-1])
 
         self.context.extras["pbpk_tac_stage"] = {
             "output_dir": self.output_dir,

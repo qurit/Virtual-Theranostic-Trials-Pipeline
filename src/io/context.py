@@ -56,8 +56,6 @@ class Context:
         self.totseg_plan: Optional[Dict[str, Any]] = None               # which tasks ran + ROI subsets
         self.tdt_roi_seg_path: Optional[str] = None                     # unified TDT multilabel NIfTI handoff 
 
-        # --- Removed: Stage 1.2 ROI Unification was separate, now merged into segmentation_stage --- 
-
         # Stage 1.2: Synthetic Lesions (optional) 
         self.synthetic_lesions_outdir: Optional[str] = None
         self.synthetic_lesions_results: Optional[Dict[str, Any]] = None
@@ -124,9 +122,8 @@ class Context:
 
         # Stage 3.2: Dosimetry Post-Processing 
         self.dosemap_postprocess_output_dir: Optional[str] = None       
-        self.dosemap_postprocess_paths: Optional[Dict[str, str]] = None 
+        self.dosemap_postprocess_dose_path: Optional[str] = None
 
-        # --- Removed: Phase 4 dosimetry fields moved to Phase 2 Stage 2.2 above --- 
 
     def require(self, *names: str) -> None:
         """
