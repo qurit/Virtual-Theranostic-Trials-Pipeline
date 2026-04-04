@@ -518,6 +518,7 @@ def main() -> int:
     print(f"Flags: --spect={args.spect} --dosimetry={args.dosimetry} --postprocess={args.postprocess}") 
     print("")
 
+    any_failed = False
     for idx, name in enumerate(items):
         ct_path = os.path.join(ct_inputs_dir, name)
 
@@ -527,19 +528,22 @@ def main() -> int:
                 ct_input=ct_path,
                 ct_indx=idx,
                 logging_on=args.logging_on,
-                save_ct_scan=args.save_ct_scan,  
+                save_ct_scan=args.save_ct_scan,
                 save_config=args.save_config,
                 mode=args.mode,
                 synthetic_lesions=args.synthetic_lesions,
-                run_spect=args.spect,       
-                run_dosimetry=args.dosimetry, 
-                run_postprocess=args.postprocess, 
+                run_spect=args.spect,
+                run_dosimetry=args.dosimetry,
+                run_postprocess=args.postprocess,
             )
             pipeline.run()
-        except Exception as e:
-            print(f"[ERROR] CT index {idx} failed for input: {ct_path}\n{e}")
+        except Exception:
+            import traceback
+            print(f"[ERROR] CT index {idx} failed for input: {ct_path}")
+            traceback.print_exc()
+            any_failed = True
 
-    return 0
+    return 1 if any_failed else 0
 
 
 if __name__ == "__main__":

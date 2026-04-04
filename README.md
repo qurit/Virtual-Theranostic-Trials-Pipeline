@@ -240,6 +240,59 @@ src/stages/
 
 ---
 
+---
+
+## Web UI
+
+In addition to the CLI, the pipeline ships with a browser-based interface that walks you through the same run in six guided steps.
+
+### Install additional dependencies
+
+The web UI requires a few extra packages not included in the base conda environment:
+
+```bash
+conda activate tdt_env
+pip install "fastapi>=0.111" "uvicorn[standard]>=0.30" python-multipart pillow nibabel pydicom
+```
+
+> `nibabel` and `pydicom` are used only for CT slice previews. If they are already installed as transitive dependencies (e.g. from TotalSegmentator), no action is needed.
+
+### Launch
+
+```bash
+python run_server.py
+```
+
+This starts the server on **http://localhost:8765** and opens the page automatically.
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port PORT` | `8765` | Port to listen on |
+| `--host HOST` | `127.0.0.1` | Interface to bind |
+| `--no-browser` | — | Don't auto-open the browser |
+
+### Step-by-step flow
+
+| Step | What happens |
+|------|-------------|
+| **1 – Configure** | Auto-generated form from `config_template.json`. Toggle pipeline stages, set ROI subset, adjust simulation parameters. Hover any field label for a description. |
+| **2 – CT Input** | Enter the path to your CT input directory (same folder you'd pass to `--input_ct_dir`). Or drag-and-drop / browse a folder to upload it. The server discovers patients using the same logic as `main.py`. |
+| **3 – Preview** | Axial, coronal, and sagittal middle-slice previews for each detected CT. Errors are shown inline — you can still proceed if a preview fails. |
+| **4 – Per-Patient** | Toggle between a single shared config or independent per-patient configs (pre-filled from Step 1). |
+| **5 – Run** | Launches the pipeline via the same `main.py` entrypoint. Live stdout/stderr streams to the browser via WebSocket. A progress bar tracks patients. |
+| **6 – Summary** | Shows which outputs were generated, total elapsed time (e.g. *2 hrs 14 min 32 sec*), and a per-patient timing breakdown. |
+
+### Notes
+
+- The web UI and CLI share the same code path — `python run_server.py` calls `main.py` under the hood.
+- The existing CLI is completely unaffected; `python run_server.py` is an additional entry point.
+- Output folders are written to the same `<repo_root>/<output_folder_title>_CT_<index>/` locations.
+- The server only binds to `127.0.0.1` by default, so it is not exposed on the network.
+
+---
+
 ## Contact
 
 Maintainer: Peter Yazdi
