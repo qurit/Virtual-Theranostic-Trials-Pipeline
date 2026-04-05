@@ -268,10 +268,15 @@ class TdtPipeline:
         context.run_postprocess = self.run_postprocess 
 
         # downstream_roi_subset flows from phase-1 config into all downstream stages.
+        # `body` is always available from segmentation and is auto-added here so
+        # downstream stages do not require users to list it explicitly.
         roi_subset = self.config["phase_1"]["segmentation_stage"]["roi_subset"]
         if isinstance(roi_subset, str):
             roi_subset = [roi_subset]
-        context.downstream_roi_subset = [str(r).strip() for r in roi_subset if str(r).strip()]
+        normalized_roi_subset = [str(r).strip() for r in roi_subset if str(r).strip()]
+        if "body" not in normalized_roi_subset:
+            normalized_roi_subset.append("body")
+        context.downstream_roi_subset = normalized_roi_subset
 
         self.logger.debug("Context initialized for CT_%s", self.ct_indx)
 

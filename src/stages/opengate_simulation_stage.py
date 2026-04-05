@@ -186,17 +186,28 @@ class OpenGateSimulationStage:
         self.tdt_name2id: Dict[str, int] = self._load_tdt_label_map(self.label_map_path)
 
         # Build final ROI list from opengate_stage config (independent from phase_1) 
-        opengate_roi_subset = self.stage_cfg.get("roi_subset")                         
-        if opengate_roi_subset is None:                                                
-            opengate_roi_subset = getattr(context, "downstream_roi_subset", None)      
-        if isinstance(opengate_roi_subset, str):                                       
-            opengate_roi_subset = [opengate_roi_subset]                                
-        if opengate_roi_subset is None:                                                
+        opengate_roi_subset = self.stage_cfg.get("roi_subset")
+        if opengate_roi_subset is None:
+            opengate_roi_subset = getattr(context, "downstream_roi_subset", None)
+        if isinstance(opengate_roi_subset, str):
+            opengate_roi_subset = [opengate_roi_subset]
+        if opengate_roi_subset is None:
             raise ValueError("OpenGATE roi_subset must be provided (in config or context)") 
+
+        normalized_opengate_roi_subset: List[str] = []
+        for roi_name in opengate_roi_subset:
+            roi_name = str(roi_name).strip()
+            if roi_name and roi_name not in normalized_opengate_roi_subset:
+                normalized_opengate_roi_subset.append(roi_name)
+
+        if "body" not in normalized_opengate_roi_subset:
+            normalized_opengate_roi_subset.append("body")
+        if getattr(context, "synthetic_lesions_enabled", False) and "synthetic_lesion" not in normalized_opengate_roi_subset:
+            normalized_opengate_roi_subset.append("synthetic_lesion")
 
         # Validate OpenGATE ROI subset against phase_1 segmented ROIs 
         phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])         
-        invalid_rois = [r for r in opengate_roi_subset if r not in phase1_rois and r != "body"] 
+        invalid_rois = [r for r in normalized_opengate_roi_subset if r not in phase1_rois and r != "body"] 
         if invalid_rois:                                                               
             raise ValueError(                                                          
                 f"OpenGATE roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. " 
@@ -206,7 +217,7 @@ class OpenGateSimulationStage:
         roi_list: List[str] = []
         if "body" in self.tdt_name2id:
             roi_list.append("body")
-        for roi_name in opengate_roi_subset:                                           
+        for roi_name in normalized_opengate_roi_subset:
             if roi_name not in roi_list:
                 roi_list.append(roi_name)
         if not roi_list:

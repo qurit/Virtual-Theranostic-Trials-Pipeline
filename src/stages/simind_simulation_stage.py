@@ -419,12 +419,24 @@ class SimindSimulationStage:
         self.resize: Optional[int] = self.stage_cfg.get("xy_dim")                     
 
         # SIMIND ROI subset (independent from phase_1 roi_subset) 
-        simind_roi_subset = self.stage_cfg.get("roi_subset")                           
-        if simind_roi_subset is None:                                                  
-            simind_roi_subset = getattr(context, "downstream_roi_subset", [])          
-        if isinstance(simind_roi_subset, str):                                         
-            simind_roi_subset = [simind_roi_subset]                                    
-        self.simind_roi_subset: List[str] = [str(r).strip() for r in simind_roi_subset if str(r).strip()] 
+        simind_roi_subset = self.stage_cfg.get("roi_subset")
+        if simind_roi_subset is None:
+            simind_roi_subset = getattr(context, "downstream_roi_subset", [])
+        if isinstance(simind_roi_subset, str):
+            simind_roi_subset = [simind_roi_subset]
+
+        normalized_simind_roi_subset: List[str] = []
+        for roi_name in simind_roi_subset:
+            roi_name = str(roi_name).strip()
+            if roi_name and roi_name not in normalized_simind_roi_subset:
+                normalized_simind_roi_subset.append(roi_name)
+
+        if "body" not in normalized_simind_roi_subset:
+            normalized_simind_roi_subset.append("body")
+        if getattr(context, "synthetic_lesions_enabled", False) and "synthetic_lesion" not in normalized_simind_roi_subset:
+            normalized_simind_roi_subset.append("synthetic_lesion")
+
+        self.simind_roi_subset = normalized_simind_roi_subset
 
         # Validate SIMIND ROI subset against phase_1 segmented ROIs 
         phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])         
