@@ -53,6 +53,13 @@ const CLI_FLAGS = [
   {key:'logging_on',     label:'Logging',            desc:"Write a detailed pipeline log file to each patient's output directory"},
 ];
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
+// Maps each stage key to the flag that gates it (stage hidden + cleared when flag is OFF)
+const STAGE_FLAG_MAP = {
+  synthetic_lesions_stage: 'synthetic_lesions',
+  simind_stage:            'spect',
+  opengate_stage:          'dosimetry',
+  spect_postprocess_stage: 'postprocess',
+};
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 async function apiFetch(path,opts={}){
@@ -726,8 +733,9 @@ function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipe
   const [open,setOpen]=useState(false);
   const stages=Object.entries(phaseData).filter(([k,v])=>{
     if(k==='sub_dir_name'||typeof v!=='object'||v===null) return false;
-    // Hide synthetic_lesions_stage entirely when the flag is off
-    if(k==='synthetic_lesions_stage'&&!flags?.synthetic_lesions) return false;
+    // Hide stages whose controlling flag is OFF
+    const flagKey=STAGE_FLAG_MAP[k];
+    if(flagKey&&!flags?.[flagKey]) return false;
     return true;
   });
   // Constrain to phase_1 selection for all non-segmentation stages
@@ -834,14 +842,17 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
 
   const handleFlagChange=(key,checked)=>{
     setFlags(prev=>({...prev,[key]:checked}));
-    // When synthetic_lesions is turned OFF, immediately clear specs from all patient configs
-    if(key==='synthetic_lesions'&&!checked){
+    if(!checked){
+      // Clear stage-specific data when the controlling flag is turned OFF
       setPatientConfigs(prev=>{
         const updated={...prev};
         Object.keys(updated).forEach(nm=>{
-          if(updated[nm]?.phase_1?.synthetic_lesions_stage){
+          if(key==='synthetic_lesions'&&updated[nm]?.phase_1?.synthetic_lesions_stage)
             updated[nm]=deepSet(updated[nm],['phase_1','synthetic_lesions_stage','specs'],null);
-          }
+          if(key==='spect'&&updated[nm]?.phase_2?.simind_stage)
+            updated[nm]=deepSet(updated[nm],['phase_2','simind_stage','roi_subset'],[]);
+          if(key==='dosimetry'&&updated[nm]?.phase_2?.opengate_stage)
+            updated[nm]=deepSet(updated[nm],['phase_2','opengate_stage','roi_subset'],[]);
         });
         return updated;
       });
@@ -1075,6 +1086,12 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
         const specs=cfg?.phase_1?.synthetic_lesions_stage?.specs;
         if(!specs||typeof specs!=='object'||Object.keys(specs).length===0)
           issues.push(`[${p.name}] Synthetic Lesions is ON but no organ specs are configured — add at least one spec in Phase 1`);
+      }
+      // SPECT: simind must have at least one ROI selected
+      if(flags.spect){
+        const roi=cfg?.phase_2?.simind_stage?.roi_subset;
+        if(!Array.isArray(roi)||roi.length===0)
+          issues.push(`[${p.name}] SPECT is ON but no ROIs are selected in the SIMIND stage`);
       }
       // Post-processing + SPECT: at least one option enabled
       if(flags.postprocess&&flags.spect){
