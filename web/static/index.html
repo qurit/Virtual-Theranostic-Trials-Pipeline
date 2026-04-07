@@ -722,9 +722,14 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
 }
 
 // ─── PhaseSection ─────────────────────────────────────────────────────────────
-function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,phase1RoiSubset,patientShape}){
+function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,phase1RoiSubset,patientShape,flags}){
   const [open,setOpen]=useState(false);
-  const stages=Object.entries(phaseData).filter(([k,v])=>k!=='sub_dir_name'&&typeof v==='object'&&v!==null);
+  const stages=Object.entries(phaseData).filter(([k,v])=>{
+    if(k==='sub_dir_name'||typeof v!=='object'||v===null) return false;
+    // Hide synthetic_lesions_stage entirely when the flag is off
+    if(k==='synthetic_lesions_stage'&&!flags?.synthetic_lesions) return false;
+    return true;
+  });
   // Constrain to phase_1 selection for all non-segmentation stages
   const constrained=(Array.isArray(phase1RoiSubset)&&phase1RoiSubset.length>0)
     ?roiChoices.filter(r=>phase1RoiSubset.includes(r))
@@ -827,6 +832,22 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
     });
   },[patients,projectDirs,applyToAll,configMeta]);
 
+  const handleFlagChange=(key,checked)=>{
+    setFlags(prev=>({...prev,[key]:checked}));
+    // When synthetic_lesions is turned OFF, immediately clear specs from all patient configs
+    if(key==='synthetic_lesions'&&!checked){
+      setPatientConfigs(prev=>{
+        const updated={...prev};
+        Object.keys(updated).forEach(nm=>{
+          if(updated[nm]?.phase_1?.synthetic_lesions_stage){
+            updated[nm]=deepSet(updated[nm],['phase_1','synthetic_lesions_stage','specs'],null);
+          }
+        });
+        return updated;
+      });
+    }
+  };
+
   const roiChoices=(configMeta?.roi_choices||[]).filter(r=>r!=='body');
 
   return(
@@ -864,7 +885,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
           {CLI_FLAGS.map(({key,label,desc})=>(
             <label key={key} className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors select-none
               ${flags[key]?'border-blue-400 bg-blue-50':'border-slate-200 hover:border-slate-300 bg-white'}`}>
-              <input type="checkbox" checked={!!flags[key]} onChange={e=>setFlags(prev=>({...prev,[key]:e.target.checked}))}
+              <input type="checkbox" checked={!!flags[key]} onChange={e=>handleFlagChange(key,e.target.checked)}
                 className="mt-0.5 w-4 h-4 accent-blue-600 flex-shrink-0"/>
               <div><p className="font-semibold text-slate-800 text-sm">{label}</p>
                 <p className="text-xs text-slate-500 mt-0.5 leading-snug">{desc}</p></div>
@@ -919,9 +940,9 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
                           descriptions={configMeta.field_descriptions||{}}
                           pipelineOptions={configMeta.pipeline_options||{}}
                           roiChoices={roiChoices}
-                          // Pass p1RoiSubset for ALL phases — PhaseSection skips it for segmentation_stage
                           phase1RoiSubset={p1RoiSubset}
-                          patientShape={shape}/>
+                          patientShape={shape}
+                          flags={flags}/>
                       ):null)}
                     </div>
                   )}
