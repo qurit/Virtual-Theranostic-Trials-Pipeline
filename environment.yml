@@ -1,4 +1,4 @@
-name: tdt_env
+name: vtt_env
 channels:
   - conda-forge
   - defaults

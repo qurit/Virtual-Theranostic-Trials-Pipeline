@@ -27,14 +27,15 @@ import copy
 from typing import Any, Dict, Literal
 
 from src.io.context import Context
+from src.tests.validate_config import validate_config
 
-from src.stages.segmentation_stage import SegmentationStage                    
+from src.stages.segmentation_stage import SegmentationStage
 from src.stages.synthetic_lesions_stage import SyntheticLesionsStage
-from src.stages.pbpk_tac_stage import PbpkTacStage                            
+from src.stages.pbpk_tac_stage import PbpkTacStage
 from src.stages.simind_simulation_stage import SimindSimulationStage
-from src.stages.spect_postprocess_stage import SpectPostprocessStage           
-from src.stages.opengate_simulation_stage import OpenGateSimulationStage
-from src.stages.dosemap_postprocess_stage import DosemapPostprocessStage       
+from src.stages.spect_postprocess_stage import SpectPostprocessStage
+#from src.stages.opengate_simulation_stage import OpenGateSimulationStage
+from src.stages.dosemap_postprocess_stage import DosemapPostprocessStage
 
 
 CTInputType = Literal["nii", "dicom"]
@@ -69,8 +70,7 @@ class TdtPipeline:
         Index used for naming (e.g., output folder suffix "_CT_{ct_indx}").
     logging_on : bool, default=True
         If True, writes a per-CT log file into the CT output folder.
-    save_ct_scan : bool, default=False  
-        If True, copies the CT input into the CT output folder for provenance/debugging.
+        The log records launched_via, config path, output folder, and timing.
     save_config : bool, default=False
         If True, saves a copy of the config JSON into the output folder.
     mode : {"DEBUG", "PRODUCTION"}, default="PRODUCTION"
@@ -91,13 +91,13 @@ class TdtPipeline:
         ct_input: str,
         ct_indx: int,
         logging_on: bool = True,
-        save_ct_scan: bool = False, 
         save_config: bool = False,
         mode: Literal["DEBUG", "PRODUCTION"] = "PRODUCTION",
         synthetic_lesions: bool = False,
-        run_spect: bool = False,      
-        run_dosimetry: bool = False,   
-        run_postprocess: bool = False, 
+        run_spect: bool = False,
+        run_dosimetry: bool = False,
+        run_postprocess: bool = False,
+        launched_via: str = "cli",
     ) -> None:
         self.config_path: str = config_path
         self.ct_input: str = ct_input
@@ -105,8 +105,9 @@ class TdtPipeline:
         self.current_dir_path: str = os.path.abspath(os.path.dirname(__file__))
 
         self.logging_on: bool = logging_on
-        self.save_ct_scan: bool = save_ct_scan  
+        self.save_ct_scan: bool = True       # always enabled; CT copy is always written
         self.save_config: bool = save_config
+        self.launched_via: str = launched_via
         self.mode: Literal["DEBUG", "PRODUCTION"] = mode
         self.synthetic_lesions: bool = synthetic_lesions
         self.run_spect: bool = run_spect       
@@ -155,6 +156,67 @@ class TdtPipeline:
         else:
             shutil.copy2(self.ct_input, dst)
 
+    def _inject_computed_paths(self) -> None:
+        """
+        Inject developer-controlled paths and naming fields from
+        ``src/data/pipeline_paths.json`` into the live config so that
+        per-run config files do not need to carry them.
+
+        Fields injected
+        ---------------
+        - ``input_paths.label_map_path``   → phase_1.segmentation_stage.label_map_path
+        - ``input_paths.SIMINDDirectory``  → phase_2.simind_stage.SIMINDDirectory
+        - ``phase_*/sub_dir_name``         → each phase's sub_dir_name
+        - ``phase_*/*/file_prefix``        → each stage's file_prefix
+        - ``phase_1/segmentation_stage/unification_prefix``
+        """
+        repo_root = self.current_dir_path
+        paths_file = os.path.join(repo_root, "src", "data", "pipeline_paths.json")
+
+        pipeline_paths: Dict[str, Any] = {}
+        try:
+            with open(paths_file, encoding="utf-8") as fh:
+                pipeline_paths = json.loads(json_minify(fh.read()))
+        except Exception:
+            pass
+
+        input_paths = pipeline_paths.get("input_paths", {})
+
+        # ── label_map_path ────────────────────────────────────────────────────
+        seg_stage = self.config["phase_1"]["segmentation_stage"]
+        lmp = input_paths.get("label_map_path", "").strip()
+        if not lmp:
+            lmp = os.path.join(repo_root, "src", "data", "tdt_map.json")
+        seg_stage["label_map_path"] = lmp
+
+        # ── SIMINDDirectory ───────────────────────────────────────────────────
+        simind_dir = input_paths.get("SIMINDDirectory", "").strip()
+        simind_stage = self.config["phase_2"]["simind_stage"]
+        if simind_dir:
+            simind_stage["SIMINDDirectory"] = simind_dir
+
+        # ── Sub-directory names and file prefixes from pipeline_paths.json ────
+        # These are developer-controlled naming conventions that should not
+        # appear in user-facing config files.  Inject them here so all stages
+        # find them in context.config regardless of what the user's config contains.
+        _STAGE_FIELDS = ("file_prefix", "unification_prefix", "sub_dir_name")
+        for phase_key in ("phase_1", "phase_2", "phase_3"):
+            pp_phase = pipeline_paths.get(phase_key, {})
+            if not isinstance(pp_phase, dict):
+                continue
+            cfg_phase = self.config.setdefault(phase_key, {})
+            # Top-level sub_dir_name for the phase
+            if "sub_dir_name" in pp_phase:
+                cfg_phase["sub_dir_name"] = pp_phase["sub_dir_name"]
+            # Per-stage fields
+            for stage_key, stage_data in pp_phase.items():
+                if stage_key == "sub_dir_name" or not isinstance(stage_data, dict):
+                    continue
+                cfg_stage = cfg_phase.setdefault(stage_key, {})
+                for field in _STAGE_FIELDS:
+                    if field in stage_data:
+                        cfg_stage[field] = stage_data[field]
+
     def _log_setup(self) -> logging.Logger:
         """
         Configure a per-CT log file handler.
@@ -179,6 +241,8 @@ class TdtPipeline:
             logger.addHandler(fh)
 
         logger.info("----Log started----")
+        logger.info("Launched via: %s", self.launched_via)
+        logger.info("Config file:  %s", self.config_path)
         logger.info("Output folder: %s", self.output_folder_path)
         return logger
 
@@ -218,10 +282,15 @@ class TdtPipeline:
         else:
             raise FileNotFoundError(f"CT input not found: {self.ct_input}")
 
+        # Inject paths that are no longer stored in the config file.
+        # label_map_path: always the repo-relative tdt_map.json.
+        # SIMINDDirectory: read from pipeline_paths.json (set once by the user there).
+        self._inject_computed_paths()
+
         if self.save_config:
             self._save_config_copy(config_path)
 
-        if self.save_ct_scan: 
+        if self.save_ct_scan:
             self._save_ct_scan_copy()
 
         # Enable synthetic lesions only if the flag is set AND lesion specs are defined in config.
@@ -268,10 +337,15 @@ class TdtPipeline:
         context.run_postprocess = self.run_postprocess 
 
         # downstream_roi_subset flows from phase-1 config into all downstream stages.
+        # 'body' is always segmented and auto-added here so downstream stages never
+        # require the user to list it explicitly.
         roi_subset = self.config["phase_1"]["segmentation_stage"]["roi_subset"]
         if isinstance(roi_subset, str):
             roi_subset = [roi_subset]
-        context.downstream_roi_subset = [str(r).strip() for r in roi_subset if str(r).strip()]
+        normalized_roi_subset = [str(r).strip() for r in roi_subset if str(r).strip()]
+        if "body" not in normalized_roi_subset:
+            normalized_roi_subset.append("body")
+        context.downstream_roi_subset = normalized_roi_subset
 
         self.logger.debug("Context initialized for CT_%s", self.ct_indx)
 
@@ -455,10 +529,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Enable per-CT log file writing. Default: enabled.",
     )
     parser.add_argument(
-        "--save_ct_scan",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Copy the CT input into the CT output folder for provenance. Default: disabled.",
+        "--ct_index_start",
+        type=int,
+        default=0,
+        help="Starting CT index for output folder naming (e.g. 1 → _CT_1, _CT_2, …). Default: 0.",
     )
     parser.add_argument(
         "--save_config",
@@ -486,10 +560,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ) 
     parser.add_argument( 
         "--postprocess", 
-        action=argparse.BooleanOptionalAction, 
-        default=False, 
-        help="Run post-processing in Phase 3 for whichever simulations ran. Default: disabled.", 
-    ) 
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run post-processing in Phase 3 for whichever simulations ran. Default: disabled.",
+    )
+    parser.add_argument(
+        "--launched_via",
+        default="cli",
+        choices=["cli", "web_ui"],
+        help="How the pipeline was invoked — recorded in the log file. Default: cli.",
+    )
 
     return parser
 
@@ -518,8 +598,48 @@ def main() -> int:
     print(f"Flags: --spect={args.spect} --dosimetry={args.dosimetry} --postprocess={args.postprocess}") 
     print("")
 
+    # Pre-flight: validate config before touching any CT.
+    # Inject computed paths first so validation sees the real values.
+    try:
+        with open(args.config_file, encoding="utf-8") as _f:
+            _cfg_raw = json.loads(json_minify(_f.read()))
+
+        # Inject paths from pipeline_paths.json (same logic as TdtPipeline._inject_computed_paths)
+        _repo = os.path.abspath(os.path.dirname(__file__))
+        _pp_path = os.path.join(_repo, "src", "data", "pipeline_paths.json")
+        _pp: Dict[str, Any] = {}
+        try:
+            with open(_pp_path, encoding="utf-8") as _ppf:
+                _pp = json.loads(json_minify(_ppf.read()))
+        except Exception:
+            pass
+        _input_paths = _pp.get("input_paths", {})
+
+        _lmp = _input_paths.get("label_map_path", "").strip()
+        if not _lmp:
+            _lmp = os.path.join(_repo, "src", "data", "tdt_map.json")
+        _cfg_raw["phase_1"]["segmentation_stage"]["label_map_path"] = _lmp
+
+        _sdir = _input_paths.get("SIMINDDirectory", "").strip()
+        if _sdir:
+            _cfg_raw["phase_2"]["simind_stage"]["SIMINDDirectory"] = _sdir
+
+        validate_config(
+            _cfg_raw,
+            run_spect=args.spect,
+            run_dosimetry=args.dosimetry,
+            run_postprocess=args.postprocess,
+            synthetic_lesions=args.synthetic_lesions,
+        )
+    except ValueError as _ve:
+        print(f"\n[ERROR] {_ve}\n")
+        return 1
+    except FileNotFoundError as _fnf:
+        print(f"\n[ERROR] Config file not found: {_fnf}\n")
+        return 1
+
     any_failed = False
-    for idx, name in enumerate(items):
+    for idx, name in enumerate(items, start=args.ct_index_start):
         ct_path = os.path.join(ct_inputs_dir, name)
 
         try:
@@ -528,13 +648,13 @@ def main() -> int:
                 ct_input=ct_path,
                 ct_indx=idx,
                 logging_on=args.logging_on,
-                save_ct_scan=args.save_ct_scan,
                 save_config=args.save_config,
                 mode=args.mode,
                 synthetic_lesions=args.synthetic_lesions,
                 run_spect=args.spect,
                 run_dosimetry=args.dosimetry,
                 run_postprocess=args.postprocess,
+                launched_via=args.launched_via,
             )
             pipeline.run()
         except Exception:

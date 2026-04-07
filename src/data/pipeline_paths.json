@@ -1,0 +1,38 @@
+{
+  "input_paths": {
+    "label_map_path": "/Users/peteryazdi/Desktop/BC_Cancer/TDT_Main/Theranostic-Virtual-Patient-Pipeline/src/data/vtt_map.json",
+    "SIMINDDirectory": "/Users/peteryazdi/Desktop/BC_Cancer/TDT_Main/simind "
+  },
+  "phase_1": {
+    "sub_dir_name": "digital_twin",
+    "segmentation_stage": {
+      "file_prefix": "segmentation",
+      "unification_prefix": "unified_labels"
+    },
+    "synthetic_lesions_stage": {
+      "file_prefix": "synthetic_lesions"
+    },
+    "pbpk_tac_stage": {
+      "file_prefix": "pbpk"
+    }
+  },
+  "phase_2": {
+    "sub_dir_name": "simulations",
+    "simind_stage": {
+      "file_prefix": "simind"
+    },
+    "opengate_stage": {
+      "file_prefix": "opengate_simulation",
+      "sub_dir_name": "opengate_simulation"
+    }
+  },
+  "phase_3": {
+    "sub_dir_name": "post_processing",
+    "spect_postprocess_stage": {
+      "file_prefix": "spect_postprocess"
+    },
+    "dosemap_postprocess_stage": {
+      "file_prefix": "dosemap_postprocess"
+    }
+  }
+}

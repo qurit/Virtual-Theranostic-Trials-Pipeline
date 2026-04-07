@@ -5,1872 +5,1199 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Virtual Theranostic Trials</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
-    .log-panel { font-family: 'Courier New', 'Menlo', monospace; white-space: pre-wrap; }
-    /* Spinner animation */
+    body { background: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
+    .terminal-font { font-family: 'JetBrains Mono','Fira Code','Cascadia Code','Consolas',monospace; }
+    .spin { animation: spin 1s linear infinite; display: inline-block; }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .spinner { animation: spin 0.8s linear infinite; }
-    /* Pulse for active status dot */
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-    .pulsing { animation: pulse 1.2s ease-in-out infinite; }
-    /* Smooth progress bar */
-    .progress-bar { transition: width 0.4s ease; }
-    /* Tooltip */
-    .tooltip-box { pointer-events: none; }
+    .blink { animation: blink 1s step-end infinite; }
+    @keyframes blink { 0%,100%{opacity:1;}50%{opacity:0;} }
+    ::-webkit-scrollbar{width:6px;height:6px;}
+    ::-webkit-scrollbar-track{background:transparent;}
+    ::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px;}
   </style>
 </head>
-<body class="bg-gray-50 min-h-screen">
-  <div id="root"></div>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
 
-  <script type="text/babel">
-    const { useState, useEffect, useRef, useCallback, useMemo } = React;
+// ─── constants ────────────────────────────────────────────────────────────────
+const DEVELOPER_FIELDS = new Set([
+  'output_folder_title','sub_dir_name','file_prefix',
+  'unification_prefix','label_map_path','SIMINDDirectory',
+]);
+const PHASE_LABELS = {
+  phase_1:'Phase 1 — Digital Twin & Ground Truth',
+  phase_2:'Phase 2 — Simulations',
+  phase_3:'Phase 3 — Post-Processing',
+};
+const STAGE_LABELS = {
+  segmentation_stage:'Segmentation & ROI Unification',
+  synthetic_lesions_stage:'Synthetic Lesion Generation',
+  pbpk_tac_stage:'PBPK Pharmacokinetics',
+  simind_stage:'SIMIND SPECT Simulation',
+  opengate_stage:'OpenGATE Dosimetry',
+  spect_postprocess_stage:'SPECT Post-Processing',
+  dosemap_postprocess_stage:'Dose Map Post-Processing',
+  gate:'Monte Carlo Engine',source:'Source Definition',physics:'Physics Settings',
+};
+const CLI_FLAGS = [
+  {key:'spect',          label:'SPECT Simulation',  desc:'Run SIMIND Monte Carlo SPECT projection simulation (Phase 2)'},
+  {key:'dosimetry',      label:'Dosimetry',          desc:'Run OpenGATE Monte Carlo absorbed-dose simulation (Phase 2)'},
+  {key:'postprocess',    label:'Post-Processing',    desc:'Apply TAC weighting, Poisson noise, OSEM reconstruction (Phase 3)'},
+  {key:'synthetic_lesions',label:'Synthetic Lesions',desc:'Insert synthetic tumour lesions before simulation (Phase 1)'},
+  {key:'logging_on',     label:'Logging',            desc:"Write a detailed pipeline log file to each patient's output directory"},
+];
+const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Helpers
-    // ─────────────────────────────────────────────────────────────────────────
+// ─── helpers ──────────────────────────────────────────────────────────────────
+async function apiFetch(path,opts={}){
+  return fetch(path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});
+}
+function deepSet(obj,path,value){
+  const out=JSON.parse(JSON.stringify(obj));let cur=out;
+  for(let i=0;i<path.length-1;i++) cur=cur[path[i]];
+  cur[path[path.length-1]]=value;return out;
+}
+// Strip ANSI escape codes so terminal output is clean
+function stripAnsi(str){
+  return str.replace(/(\x1b|\u001b)\[[0-9;]*[A-Za-z]/g,'').replace(/\[\d+m/g,'');
+}
 
-    async function apiFetch(path, opts = {}) {
-      const res = await fetch(path, {
-        headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
-        ...opts,
-      });
-      if (!res.ok) {
-        let detail = res.statusText;
-        try { const j = await res.json(); detail = j.detail || j.message || detail; } catch(_) {}
-        throw new Error(detail);
-      }
-      return res.json();
-    }
+// ─── StepBar ──────────────────────────────────────────────────────────────────
+function StepBar({step}){
+  const steps=['Welcome','CT Input','Configure','Run'];
+  return(
+    <div className="sticky top-0 z-20 bg-white border-b border-slate-200 shadow-sm">
+      <div className="max-w-4xl mx-auto px-6 py-3 flex items-center justify-center gap-1">
+        {steps.map((label,i)=>{
+          const n=i+1,done=n<step,active=n===step;
+          return(
+            <React.Fragment key={n}>
+              <div className="flex flex-col items-center min-w-[60px]">
+                <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold select-none
+                  ${done?'bg-emerald-500 text-white':active?'bg-blue-600 text-white':'bg-slate-200 text-slate-400'}`}>
+                  {done?'✓':n}
+                </div>
+                <span className={`text-[11px] mt-0.5 font-medium ${active?'text-blue-600':'text-slate-400'}`}>{label}</span>
+              </div>
+              {i<steps.length-1&&<div className={`h-px w-10 mb-4 flex-shrink-0 ${done?'bg-emerald-400':'bg-slate-200'}`}/>}
+            </React.Fragment>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
-    function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
-
-    // Convert ANSI escape sequences to HTML spans so the log panel matches the real terminal.
-    // Supports foreground colors (30-37, 90-97), bold (1), and reset (0).
-    function ansiToHtml(text) {
-      const FG = {
-        '30':'#4a4a4a', '31':'#e06c75', '32':'#98c379', '33':'#e5c07b',
-        '34':'#61afef', '35':'#c678dd', '36':'#56b6c2', '37':'#abb2bf',
-        '90':'#5c6370', '91':'#ff7b7b', '92':'#b5e890', '93':'#ffd580',
-        '94':'#7ec8ff', '95':'#d9a6ff', '96':'#7ee8f8', '97':'#ffffff',
-      };
-      let out = '';
-      let bold = false;
-      let fg = null;
-      const segs = text.split(/(\x1b\[[0-9;]*m)/);
-      for (const seg of segs) {
-        const m = seg.match(/^\x1b\[([0-9;]*)m$/);
-        if (m) {
-          for (const code of (m[1] || '0').split(';')) {
-            if (code === '' || code === '0') { bold = false; fg = null; }
-            else if (code === '1') { bold = true; }
-            else if (FG[code]) { fg = FG[code]; }
-          }
-        } else if (seg) {
-          const esc = seg.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-          const style = [];
-          if (fg)   style.push(`color:${fg}`);
-          if (bold) style.push('font-weight:700');
-          out += style.length ? `<span style="${style.join(';')}">${esc}</span>` : esc;
-        }
-      }
-      return out;
-    }
-
-    function setDeep(obj, keys, value) {
-      const result = deepClone(obj);
-      let curr = result;
-      for (let i = 0; i < keys.length - 1; i++) curr = curr[keys[i]];
-      curr[keys[keys.length - 1]] = value;
-      return result;
-    }
-
-    function formatDuration(sec) {
-      if (!sec && sec !== 0) return '—';
-      sec = Math.max(0, sec);
-      const h = Math.floor(sec / 3600);
-      const m = Math.floor((sec % 3600) / 60);
-      const s = Math.floor(sec % 60);
-      const parts = [];
-      if (h > 0) parts.push(`${h} hr${h !== 1 ? 's' : ''}`);
-      if (m > 0) parts.push(`${m} min`);
-      parts.push(`${s} sec`);
-      return parts.join(' ');
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Primitive UI components
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function Toggle({ value, onChange, label, description, disabled }) {
-      return (
-        <label className={`flex items-start gap-3 ${disabled ? 'opacity-50' : 'cursor-pointer'}`}>
-          <div
-            className={`relative flex-shrink-0 inline-flex h-6 w-11 items-center rounded-full transition-colors mt-0.5
-              ${value ? 'bg-indigo-600' : 'bg-gray-300'} ${disabled ? '' : 'cursor-pointer'}`}
-            onClick={() => !disabled && onChange(!value)}
-          >
-            <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform
-              ${value ? 'translate-x-6' : 'translate-x-1'}`} />
-          </div>
-          <div className="min-w-0">
-            <span className="text-sm font-medium text-gray-700 leading-5">{label}</span>
-            {description && <p className="text-xs text-gray-500 mt-0.5 leading-4">{description}</p>}
-          </div>
-        </label>
-      );
-    }
-
-    function Tooltip({ text }) {
-      const [show, setShow] = useState(false);
-      if (!text) return null;
-      return (
-        <span className="relative inline-block ml-1 align-middle">
-          <span
-            className="cursor-help text-gray-400 hover:text-indigo-500 text-xs select-none"
-            onMouseEnter={() => setShow(true)}
-            onMouseLeave={() => setShow(false)}
-          >ⓘ</span>
-          {show && (
-            <div className="tooltip-box absolute z-50 left-0 top-5 w-72 bg-gray-900 text-white text-xs rounded-lg p-3 shadow-2xl leading-5">
-              {text}
+// ─── Page 1 ───────────────────────────────────────────────────────────────────
+function Page1Welcome({onNext}){
+  return(
+    <div className="max-w-3xl mx-auto px-6 py-12">
+      <div className="mb-8">
+        <h1 className="text-4xl font-bold text-slate-900 mb-1">Virtual Theranostic Trials</h1>
+        <p className="text-blue-600 font-semibold text-lg">BC Cancer Research Centre</p>
+      </div>
+      <div className="bg-blue-50 border border-blue-100 rounded-2xl p-6 mb-6">
+        <h2 className="font-semibold text-blue-900 mb-3 text-lg">Pipeline Overview</h2>
+        <p className="text-slate-600 text-sm mb-5">VTT builds a patient-specific digital twin from a CT scan and simulates personalised theranostic treatment end-to-end:</p>
+        {[
+          {n:'1',color:'bg-blue-100 text-blue-700',title:'Digital Twin & Ground Truth',lines:['TotalSegmentator organ segmentation','Optional synthetic lesion insertion','PBPK time-activity curve generation']},
+          {n:'2',color:'bg-violet-100 text-violet-700',title:'Monte Carlo Simulations',lines:['SIMIND SPECT projection simulation','OpenGATE absorbed-dose Monte Carlo']},
+          {n:'3',color:'bg-emerald-100 text-emerald-700',title:'Post-Processing',lines:['TAC-weighted OSEM+TEW SPECT reconstruction','Cumulated-activity dosimetry maps']},
+        ].map(({n,color,title,lines})=>(
+          <div key={n} className="flex gap-4 mb-4 last:mb-0">
+            <div className={`${color} w-7 h-7 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold mt-0.5`}>{n}</div>
+            <div><p className="font-semibold text-slate-800 text-sm">{title}</p>
+              <ul className="mt-1 space-y-0.5">{lines.map(l=><li key={l} className="text-xs text-slate-500">· {l}</li>)}</ul>
             </div>
-          )}
-        </span>
-      );
-    }
+          </div>
+        ))}
+      </div>
+      <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 mb-8">
+        <p className="font-semibold text-amber-800 mb-2 text-sm">Before you start</p>
+        <ul className="space-y-1 text-amber-700 text-xs">
+          <li>· Conda environment active: <code className="bg-amber-100 px-1 rounded font-mono">conda activate vtt</code></li>
+          <li>· SIMIND path set in <code className="bg-amber-100 px-1 rounded font-mono">src/data/pipeline_paths.json</code></li>
+          <li>· CT data as DICOM subfolders or <code className="bg-amber-100 px-1 rounded font-mono">.nii / .nii.gz</code> files</li>
+        </ul>
+      </div>
+      <button onClick={onNext} className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 rounded-xl font-semibold text-base transition-colors shadow-sm">Get Started →</button>
+    </div>
+  );
+}
 
-    function Collapsible({ title, children, defaultOpen = false, badge, className = '' }) {
-      const [open, setOpen] = useState(defaultOpen);
-      return (
-        <div className={`border border-gray-200 rounded-xl overflow-hidden mb-3 ${className}`}>
-          <button
-            type="button"
-            className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left"
-            onClick={() => setOpen(o => !o)}
-          >
-            <span className="font-semibold text-gray-800 text-sm">{title}</span>
-            <div className="flex items-center gap-2 flex-shrink-0">
-              {badge && (
-                <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-medium">
-                  {badge}
-                </span>
-              )}
-              <span className="text-gray-400 text-sm">{open ? '▾' : '▸'}</span>
-            </div>
-          </button>
-          {open && <div className="p-4 bg-white">{children}</div>}
+// ─── Page 2 ───────────────────────────────────────────────────────────────────
+function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,onNext,onBack}){
+  const [folderPath,setFolderPath]=useState('');
+  const [picking,setPicking]=useState(false);
+  const [scanning,setScanning]=useState(false);
+  const [error,setError]=useState('');
+  const [previews,setPreviews]=useState({});
+
+  const pickAndScan=async()=>{
+    setPicking(true);setError('');
+    try{
+      const res=await apiFetch('/api/pick-directory',{method:'POST',body:'{}'});
+      const data=await res.json();
+      if(data.cancelled||!data.path){setPicking(false);return;}
+      setFolderPath(data.path);setPicking(false);setScanning(true);
+      setPatients([]);setPreviews({});setPatientShapes({});
+      const sres=await apiFetch('/api/scan-directory',{method:'POST',body:JSON.stringify({path:data.path})});
+      if(!sres.ok){const err=await sres.json();setError(err.detail||'Scan failed');setScanning(false);return;}
+      const sdata=await sres.json();
+      setPatients(sdata.patients);
+      sdata.patients.forEach(p=>loadPreview(p));
+    }catch(e){setError('Error: '+e.message);}
+    setPicking(false);setScanning(false);
+  };
+  const loadPreview=async(patient)=>{
+    setPreviews(prev=>({...prev,[patient.name]:{loading:true}}));
+    try{
+      const res=await apiFetch('/api/preview-ct',{method:'POST',body:JSON.stringify({path:patient.path,ct_type:patient.type})});
+      if(!res.ok){setPreviews(prev=>({...prev,[patient.name]:{error:'Preview failed'}}));return;}
+      const data=await res.json();
+      setPreviews(prev=>({...prev,[patient.name]:{...data,loading:false}}));
+      if(data.shape) setPatientShapes(prev=>({...prev,[patient.name]:data.shape}));
+    }catch(e){setPreviews(prev=>({...prev,[patient.name]:{error:e.message}}));}
+  };
+  const busy=picking||scanning;
+  return(
+    <div className="max-w-4xl mx-auto px-6 py-8">
+      <div className="flex items-center gap-3 mb-6">
+        <button onClick={onBack} className="text-slate-400 hover:text-slate-600 text-sm flex items-center gap-1">← Back</button>
+        <h2 className="text-2xl font-bold text-slate-900">Select CT Input Folder</h2>
+      </div>
+      <p className="text-slate-500 text-sm mb-6">Each top-level item is one patient — a DICOM subfolder or a <code className="bg-slate-100 px-1 rounded">.nii/.nii.gz</code> file.</p>
+      <div className="flex items-center gap-4 mb-6">
+        <button onClick={pickAndScan} disabled={busy}
+          className="flex items-center gap-2 bg-white border-2 border-blue-500 hover:bg-blue-50 text-blue-600 px-6 py-3 rounded-xl font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm">
+          {picking?<><span className="spin">⟳</span>&nbsp;Opening picker…</>:scanning?<><span className="spin">⟳</span>&nbsp;Scanning…</>:<>📁&nbsp;Choose CT Folder</>}
+        </button>
+        {folderPath&&!busy&&(
+          <div className="flex items-center gap-2 text-sm text-slate-500 min-w-0">
+            <span className="text-emerald-500 flex-shrink-0">✓</span>
+            <span className="terminal-font bg-slate-100 px-2 py-1 rounded text-xs truncate max-w-sm">{folderPath}</span>
+          </div>
+        )}
+      </div>
+      {error&&<div className="bg-red-50 border border-red-200 rounded-xl p-3 mb-4 text-red-700 text-sm">{error}</div>}
+      {patients.length>0&&(
+        <>
+          <h3 className="text-base font-semibold text-slate-700 mb-3">Detected {patients.length} patient{patients.length!==1?'s':''}</h3>
+          <div className="space-y-4 mb-8">
+            {patients.map((p,i)=>{
+              const preview=previews[p.name]||{};
+              return(
+                <div key={p.name} className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm">
+                  <div className="flex items-center gap-3 mb-3">
+                    <span className="bg-blue-100 text-blue-700 font-bold text-xs px-3 py-1 rounded-full">CT_{i+1}</span>
+                    <span className="font-semibold text-slate-800">{p.name}</span>
+                    <span className="text-xs text-slate-400 uppercase tracking-wide">{p.type}</span>
+                    {p.file_count!=null&&<span className="text-xs text-slate-400">{p.file_count} files</span>}
+                  </div>
+                  {preview.loading&&<div className="flex items-center gap-2 text-sm text-slate-400 py-4"><span className="spin">⟳</span> Generating previews…</div>}
+                  {preview.error&&<p className="text-sm text-red-500 py-2">{preview.error}</p>}
+                  {!preview.loading&&!preview.error&&preview.axial&&(
+                    <div className="flex gap-3 items-start">
+                      {['axial','coronal','sagittal'].map(view=>(
+                        <div key={view} className="flex-1 min-w-0">
+                          <p className="text-[11px] text-slate-400 text-center mb-1 capitalize font-medium">{view}</p>
+                          <div className="h-44 bg-black rounded-lg border border-slate-200 flex items-center justify-center overflow-hidden">
+                            <img src={`data:image/png;base64,${preview[view]}`} alt={view}
+                              style={{maxWidth:'100%',maxHeight:'100%',objectFit:'contain',display:'block'}}/>
+                          </div>
+                        </div>
+                      ))}
+                      {preview.shape&&(
+                        <div className="flex-shrink-0 w-20 flex flex-col justify-center text-xs text-slate-400 pt-5 space-y-0.5">
+                          <p className="font-semibold text-slate-600 text-[11px]">CT Shape</p>
+                          <p>X: {preview.shape[0]}</p><p>Y: {preview.shape[1]}</p><p>Z: {preview.shape[2]}</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <button onClick={onNext} className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 rounded-xl font-semibold text-base transition-colors shadow-sm">Continue to Configure →</button>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── XyzDimFieldInner ─────────────────────────────────────────────────────────
+function XyzDimFieldInner({value,onChange,desc,patientShape}){
+  const initNull=value===null||value===undefined;
+  const initXyz=(Array.isArray(value)&&value.length>=3)?[String(value[0]),String(value[1]),String(value[2])]:['','',''];
+  const [isNull,setIsNull]=useState(initNull);
+  const [xyz,setXyz]=useState(initXyz);
+  const [errors,setErrors]=useState(['','','']);
+  const [showDesc,setShowDesc]=useState(false);
+  const ax=['X','Y','Z'];
+  const validate=(idx,val)=>{
+    if(val==='')return'Required';
+    const n=parseInt(val,10);
+    if(isNaN(n)||n<=0)return'Positive integer required';
+    if(patientShape&&n>=patientShape[idx])return`Must be < ${patientShape[idx]}`;
+    return'';
+  };
+  const change=(idx,val)=>{const nx=xyz.map((v,i)=>i===idx?val:v);setXyz(nx);setErrors(errors.map((e,i)=>i===idx?validate(idx,val):e));};
+  const blur=(idx)=>{const e=validate(idx,xyz[idx]);const ne=errors.map((x,i)=>i===idx?e:x);setErrors(ne);if(ne.every(e=>!e)&&xyz.every(v=>v!==''))onChange(xyz.map(v=>parseInt(v,10)));};
+  const toggleNull=(c)=>{setIsNull(c);if(c){onChange(null);setErrors(['','','']);}else setXyz(['','','']);};
+  return(
+    <div className="py-2 border-b border-slate-100 last:border-0">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-1.5 flex-shrink-0 pt-0.5">
+          <span className="text-sm font-medium text-slate-700">xyz_dim</span>
+          {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
         </div>
-      );
-    }
-
-    function Alert({ type = 'info', children }) {
-      const styles = {
-        info:    'bg-blue-50 border-blue-200 text-blue-800',
-        warning: 'bg-amber-50 border-amber-200 text-amber-800',
-        error:   'bg-red-50 border-red-200 text-red-800',
-        success: 'bg-green-50 border-green-200 text-green-800',
-      };
-      return (
-        <div className={`border rounded-xl p-4 text-sm leading-5 ${styles[type] || styles.info}`}>
-          {children}
-        </div>
-      );
-    }
-
-    function Spinner() {
-      return (
-        <svg className="spinner w-4 h-4 text-indigo-600" fill="none" viewBox="0 0 24 24">
-          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-        </svg>
-      );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Config field renderers
-    // ─────────────────────────────────────────────────────────────────────────
-
-    // "body" is always included by the pipeline — never show it as a user-facing checkbox
-    const ROI_CHOICES_SELECTABLE = ['kidney', 'liver', 'prostate', 'spleen', 'heart', 'salivary_glands'];
-    // Fields to hide in the default view (shown in Advanced section)
-    const ADVANCED_FIELDS = new Set(['sub_dir_name', 'file_prefix', 'unification_prefix']);
-    // Fields where the value can be very large and should accept scientific notation (e.g. 1e8)
-    const SCIENTIFIC_FIELDS = new Set(['NumPhotons', 'total_histories']);
-
-    function FieldLabel({ name, descriptions }) {
-      const desc = descriptions[name] || '';
-      const label = name
-        .replace(/_/g, ' ')
-        .replace(/([A-Z])/g, ' $1')
-        .replace(/^./, c => c.toUpperCase())
-        .trim();
-      return (
-        <div className="flex items-center mb-1">
-          <label className="text-sm font-medium text-gray-700">{label}</label>
-          <Tooltip text={desc} />
-        </div>
-      );
-    }
-
-    function toSciStr(n) {
-      if (n === null || n === undefined) return '';
-      if (typeof n !== 'number') return String(n);
-      if (Math.abs(n) >= 1e6 || (n !== 0 && Math.abs(n) < 0.001)) {
-        return n.toExponential().replace(/e\+?/, 'e');
-      }
-      return String(n);
-    }
-
-    function ConfigField({ name, value, path, onChange, descriptions }) {
-      const [strVal, setStrVal] = useState(() => toSciStr(value));
-      const [numErr, setNumErr] = useState('');
-
-      // Keep strVal in sync when value changes externally (e.g. template load)
-      useEffect(() => {
-        if (typeof value === 'number') setStrVal(toSciStr(value));
-      }, [value]);
-
-      const borderOk  = "border-gray-300";
-      const borderErr = "border-red-400 ring-1 ring-red-400";
-      const inputBase = "w-full text-sm rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent border";
-      const inputClass = `${inputBase} ${borderOk}`;
-
-      // ── ROI subset: checkboxes (body always included, never shown) ──
-      if (name === 'roi_subset') {
-        return (
-          <div className="mb-4">
-            <FieldLabel name={name} descriptions={descriptions} />
-            <div className="flex flex-wrap gap-x-5 gap-y-2 mt-1">
-              {ROI_CHOICES_SELECTABLE.map(roi => (
-                <label key={roi} className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={Array.isArray(value) && value.includes(roi)}
-                    onChange={e => {
-                      const cur = Array.isArray(value) ? value : [];
-                      const next = e.target.checked
-                        ? [...cur, roi]
-                        : cur.filter(r => r !== roi);
-                      onChange(path, next);
-                    }}
-                    className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                  />
-                  <span className="text-sm text-gray-700">{roi}</span>
-                </label>
+        <div className="flex items-start gap-3 flex-wrap justify-end">
+          <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none pt-1">
+            <input type="checkbox" checked={isNull} onChange={e=>toggleNull(e.target.checked)} className="accent-blue-600"/>
+            null&nbsp;<span className="text-slate-400">(native CT resolution)</span>
+          </label>
+          {!isNull&&(
+            <div className="flex items-start gap-1.5">
+              {ax.map((a,idx)=>(
+                <div key={a} className="flex flex-col items-center gap-0.5">
+                  <div className="flex items-center gap-0.5">
+                    <span className="text-[10px] font-semibold text-slate-500 w-3.5">{a}</span>
+                    <input type="number" value={xyz[idx]} min="1" max={patientShape?patientShape[idx]-1:undefined}
+                      placeholder={patientShape?`<${patientShape[idx]}`:'…'}
+                      onChange={e=>change(idx,e.target.value)} onBlur={()=>blur(idx)}
+                      className={`w-[72px] px-1.5 py-1 text-sm border rounded-lg text-right focus:outline-none focus:ring-2
+                        ${errors[idx]?'border-red-400 focus:ring-red-300 bg-red-50':'border-slate-300 focus:ring-blue-400'}`}/>
+                  </div>
+                  {errors[idx]&&<span className="text-[9px] text-red-500 text-center leading-tight max-w-[76px]">{errors[idx]}</span>}
+                </div>
               ))}
             </div>
-            <p className="text-xs text-gray-400 mt-1">
-              <span className="font-medium">body</span> is handled internally by the pipeline and not shown here.
-            </p>
-          </div>
-        );
+          )}
+        </div>
+      </div>
+      {showDesc&&<p className="text-xs text-slate-400 mt-1.5 leading-relaxed">{desc}</p>}
+    </div>
+  );
+}
+
+// ─── NullField ────────────────────────────────────────────────────────────────
+function NullField({call}){
+  const [isNull,setIsNull]=useState(true);
+  const [txt,setTxt]=useState('');
+  return(
+    <div className="flex items-center gap-2">
+      <label className="flex items-center gap-1 text-xs text-slate-500 cursor-pointer select-none">
+        <input type="checkbox" checked={isNull} onChange={e=>{setIsNull(e.target.checked);if(e.target.checked)call(null);}} className="accent-blue-600"/>
+        null
+      </label>
+      {!isNull&&(
+        <input type="text" value={txt} placeholder="value"
+          onChange={e=>setTxt(e.target.value)}
+          onBlur={e=>{const r=e.target.value;const n=parseFloat(r);call(isNaN(n)?(r||null):n);}}
+          className="w-32 px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"/>
+      )}
+    </div>
+  );
+}
+
+// ─── RandomSeedField ─────────────────────────────────────────────────────────
+function RandomSeedField({value,onChange,desc}){
+  const [showDesc,setShowDesc]=useState(false);
+  const isAuto=value==='auto';
+  const [fixedVal,setFixedVal]=useState(isAuto?'42':String(value));
+  return(
+    <div className="py-2 border-b border-slate-100 last:border-0">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          <span className="text-sm font-medium text-slate-700">random_seed</span>
+          {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
+        </div>
+        <div className="flex items-center gap-1.5">
+          <button onClick={()=>onChange('auto')}
+            className={`px-3 py-1 text-xs rounded-lg border font-semibold transition-colors
+              ${isAuto?'bg-blue-600 text-white border-blue-600':'bg-white text-slate-500 border-slate-300 hover:border-blue-400'}`}>
+            auto
+          </button>
+          <button onClick={()=>{const n=parseInt(fixedVal);onChange(isNaN(n)?42:n);}}
+            className={`px-3 py-1 text-xs rounded-lg border font-semibold transition-colors
+              ${!isAuto?'bg-slate-700 text-white border-slate-700':'bg-white text-slate-500 border-slate-300 hover:border-slate-400'}`}>
+            fixed
+          </button>
+          {!isAuto&&(
+            <input type="number" value={fixedVal}
+              onChange={e=>setFixedVal(e.target.value)}
+              onBlur={()=>{const n=parseInt(fixedVal);if(!isNaN(n))onChange(n);}}
+              className="w-24 px-2 py-1 text-sm border border-slate-300 rounded-lg text-right focus:outline-none focus:ring-2 focus:ring-blue-400"/>
+          )}
+        </div>
+      </div>
+      {showDesc&&<p className="text-xs text-slate-400 mt-1 leading-relaxed">{desc}</p>}
+    </div>
+  );
+}
+
+// ─── SpecsEditor ─────────────────────────────────────────────────────────────
+// Per-ROI lesion spec UI for synthetic_lesions_stage.specs
+function UserDefinedInputs({nLesions,centers,radii,onUpdateCenters,onUpdateRadii}){
+  // centers = [[z,y,x], ...], radii = [r, ...]
+  const rows=Array.from({length:nLesions},(_,i)=>({
+    z:centers[i]?String(centers[i][0]):'0',
+    y:centers[i]?String(centers[i][1]):'0',
+    x:centers[i]?String(centers[i][2]):'0',
+    r:radii[i]!=null?String(radii[i]):'5',
+  }));
+  const commit=(newRows)=>{
+    onUpdateCenters(newRows.map(r=>[parseFloat(r.z)||0,parseFloat(r.y)||0,parseFloat(r.x)||0]));
+    onUpdateRadii(newRows.map(r=>parseFloat(r.r)||5));
+  };
+  const [local,setLocal]=useState(rows);
+  const set=(i,f,v)=>{const nr=local.map((r,ri)=>ri===i?{...r,[f]:v}:r);setLocal(nr);commit(nr);};
+  return(
+    <div className="mt-1 overflow-x-auto">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-slate-400 text-[10px]">
+            <th className="text-left pb-1 pr-1 font-medium w-6">#</th>
+            <th className="text-left pb-1 pr-1 font-medium">Z</th>
+            <th className="text-left pb-1 pr-1 font-medium">Y</th>
+            <th className="text-left pb-1 pr-1 font-medium">X</th>
+            <th className="text-left pb-1 font-medium">Radius (mm)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {local.map((row,i)=>(
+            <tr key={i} className="border-t border-slate-50">
+              <td className="py-0.5 pr-1 text-slate-400">{i+1}</td>
+              {['z','y','x'].map(f=>(
+                <td key={f} className="py-0.5 pr-1">
+                  <input type="number" value={row[f]} onChange={e=>set(i,f,e.target.value)}
+                    className="w-16 px-1.5 py-0.5 border border-slate-200 rounded text-right focus:outline-none focus:ring-1 focus:ring-blue-400"/>
+                </td>
+              ))}
+              <td className="py-0.5">
+                <input type="number" value={row.r} onChange={e=>set(i,'r',e.target.value)} min="0"
+                  className="w-16 px-1.5 py-0.5 border border-slate-200 rounded text-right focus:outline-none focus:ring-1 focus:ring-blue-400"/>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SpecRoiCard({roi,spec,onUpdateSpec,onRemove}){
+  const [open,setOpen]=useState(true);
+  const [numErrs,setNumErrs]=useState({});
+  const setField=(field,val)=>{
+    let newSpec={...spec,[field]:val};
+    // When prob changes, initialize/clean optional fields
+    if(field==='prob'){
+      if(val==='user_defined'){
+        const n=spec.n_lesions||1;
+        newSpec.user_centers_zyx=Array.from({length:n},()=>[0,0,0]);
+        newSpec.radii_mm=Array.from({length:n},()=>5.0);
+        delete newSpec.sigma_mm;
+      } else if(val==='gaussian'){
+        delete newSpec.user_centers_zyx;delete newSpec.radii_mm;
+        if(!newSpec.sigma_mm) newSpec.sigma_mm=10.0;
+      } else {
+        delete newSpec.user_centers_zyx;delete newSpec.radii_mm;delete newSpec.sigma_mm;
       }
-
-      // ── VOIs: textarea ──
-      if (name === 'VOIs' && Array.isArray(value)) {
-        return (
-          <div className="mb-4">
-            <FieldLabel name={name} descriptions={descriptions} />
-            <textarea
-              className={`${inputClass} font-mono`}
-              rows={3}
-              value={value.join(', ')}
-              onChange={e => onChange(path, e.target.value.split(',').map(s => s.trim()).filter(Boolean))}
-            />
-            <p className="text-xs text-gray-400 mt-1">Comma-separated PyCNO VOI observable names</p>
-          </div>
-        );
-      }
-
-      // ── Frame times / durations: comma-separated numbers ──
-      if (name === 'FrameStartTimes' || name === 'FrameDurations') {
-        const unit = name === 'FrameStartTimes' ? 'minutes' : 'seconds';
-        return (
-          <div className="mb-4">
-            <FieldLabel name={name} descriptions={descriptions} />
-            <input
-              type="text"
-              className={inputClass}
-              value={Array.isArray(value) ? value.join(', ') : String(value)}
-              onChange={e => {
-                const nums = e.target.value
-                  .split(',')
-                  .map(s => parseFloat(s.trim()))
-                  .filter(n => !isNaN(n));
-                onChange(path, nums);
-              }}
-              placeholder={`e.g. 120, 1440, 2880 (in ${unit})`}
-            />
-            <p className="text-xs text-gray-400 mt-1">Comma-separated numbers ({unit})</p>
-          </div>
-        );
-      }
-
-      // ── Boolean: toggle ──
-      if (typeof value === 'boolean') {
-        const desc = descriptions[name] || '';
-        const label = name.replace(/_/g, ' ').replace(/([A-Z])/g, ' $1').replace(/^./, c => c.toUpperCase()).trim();
-        return (
-          <div className="mb-3">
-            <Toggle value={value} onChange={v => onChange(path, v)} label={label} description={desc} />
-          </div>
-        );
-      }
-
-      // ── Number (with scientific notation support for large fields) ──
-      if (typeof value === 'number' || (value === null && name.match(/num|count|dim|size|iter|hist|seed|margin|sigma|frac|tol|scale|cut/i))) {
-        const isSci = SCIENTIFIC_FIELDS.has(name);
-
-        if (isSci) {
-          return (
-            <div className="mb-4">
-              <FieldLabel name={name} descriptions={descriptions} />
-              <input
-                type="text"
-                className={`${inputBase} ${numErr ? borderErr : borderOk} font-mono`}
-                value={strVal}
-                placeholder="e.g. 1e8 or 100000000"
-                onChange={e => {
-                  setStrVal(e.target.value);
-                  const parsed = parseFloat(e.target.value);
-                  if (isNaN(parsed)) {
-                    setNumErr('Must be a number (e.g. 1e8, 5e7)');
-                  } else {
-                    setNumErr('');
-                    onChange(path, parsed);
-                  }
-                }}
-              />
-              {numErr
-                ? <p className="text-xs text-red-500 mt-1">{numErr}</p>
-                : <p className="text-xs text-gray-400 mt-1">Accepts scientific notation — e.g. <code>1e8</code>, <code>5e7</code></p>
-              }
-            </div>
-          );
-        }
-
-        return (
-          <div className="mb-4">
-            <FieldLabel name={name} descriptions={descriptions} />
-            <input
-              type="number"
-              className={`${inputBase} ${numErr ? borderErr : borderOk}`}
-              value={value ?? ''}
-              onChange={e => {
-                if (e.target.value === '') { onChange(path, null); setNumErr(''); return; }
-                const v = parseFloat(e.target.value);
-                if (isNaN(v)) { setNumErr('Must be a number'); }
-                else { setNumErr(''); onChange(path, v); }
-              }}
-              step={typeof value === 'number' && value !== 0 && Math.abs(value) < 1 ? 0.01 : 1}
-            />
-            {numErr && <p className="text-xs text-red-500 mt-1">{numErr}</p>}
-          </div>
-        );
-      }
-
-      // ── String ──
-      if (typeof value === 'string' || value === null) {
-        return (
-          <div className="mb-4">
-            <FieldLabel name={name} descriptions={descriptions} />
-            <input
-              type="text"
-              className={inputClass}
-              value={value ?? ''}
-              placeholder={value === null ? 'null — leave empty to keep as null' : ''}
-              onChange={e => {
-                const v = e.target.value;
-                onChange(path, v === '' && value === null ? null : v);
-              }}
-            />
-          </div>
-        );
-      }
-
-      return null;
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Synthetic lesions specs editor
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function LesionOrganSpec({ organ, spec, specPath, onChange, descriptions }) {
-      const prob = spec.prob || 'uniform';
-      const inputBase = "w-full text-sm rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 border border-gray-300";
-
-      // Helper to parse user_centers_zyx textarea (one row per lesion: "z, y, x")
-      const centersToStr = (arr) =>
-        Array.isArray(arr) ? arr.map(c => Array.isArray(c) ? c.join(', ') : c).join('\n') : '';
-      const strToCenters = (str) =>
-        str.split('\n').map(line => line.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n))).filter(r => r.length === 3);
-
-      return (
-        <div>
-          {/* n_lesions — always shown */}
-          <div className="mb-4">
-            <label className="block text-sm font-medium text-gray-700 mb-1">Number of Lesions</label>
-            <input type="number" min={1} className={inputBase} value={spec.n_lesions ?? 1}
-              onChange={e => onChange([...specPath, 'n_lesions'], Math.max(1, parseInt(e.target.value) || 1))} />
-          </div>
-
-          {/* prob dropdown */}
-          <div className="mb-4">
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Placement Mode
-              <Tooltip text={descriptions['prob']} />
-            </label>
-            <select
-              className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              value={prob}
-              onChange={e => {
-                const newProb = e.target.value;
-                // Build a clean spec for the new mode
-                const base = { n_lesions: spec.n_lesions, prob: newProb, margin_mm: spec.margin_mm ?? 1.0, seed: spec.seed ?? 0 };
-                if (newProb === 'gaussian') base.sigma_mm = spec.sigma_mm ?? 60.0;
-                if (newProb === 'user_defined') {
-                  base.radii_mm = spec.radii_mm ?? [];
-                  base.user_centers_zyx = spec.user_centers_zyx ?? [];
-                }
-                onChange(specPath, base);
-              }}
-            >
-              <option value="uniform">uniform — random placement throughout organ</option>
-              <option value="gaussian">gaussian — centroid-weighted (Gaussian) placement</option>
-              <option value="user_defined">user_defined — specify exact voxel coordinates</option>
-              <option value="tom">tom — not yet implemented</option>
+    // When n_lesions changes for user_defined, resize coord arrays
+    if(field==='n_lesions'&&spec.prob==='user_defined'){
+      const c=[...(spec.user_centers_zyx||[])];
+      const r=[...(spec.radii_mm||[])];
+      while(c.length<val)c.push([0,0,0]);c.length=val;
+      while(r.length<val)r.push(5.0);r.length=val;
+      newSpec.user_centers_zyx=c;newSpec.radii_mm=r;
+    }
+    onUpdateSpec(newSpec);
+  };
+  const numField=(label,field,step,isInt)=>{
+    const val=spec[field]??0;const err=numErrs[field]||'';
+    return(
+      <div key={field} className="flex items-center justify-between py-1.5 border-b border-slate-50 last:border-0 gap-2">
+        <span className="text-xs font-medium text-slate-600 flex-shrink-0">{label}</span>
+        <div className="flex flex-col items-end gap-0.5">
+          <input type="number" defaultValue={val} step={step||1}
+            onChange={e=>{const v=e.target.value;setNumErrs(prev=>({...prev,[field]:v===''||isNaN(parseFloat(v))?'Must be a number':''}));}}
+            onBlur={e=>{const v=e.target.value;if(v===''||isNaN(parseFloat(v))){setNumErrs(prev=>({...prev,[field]:'Must be a number'}));return;}setNumErrs(prev=>({...prev,[field]:''}));setField(field,isInt?parseInt(v):parseFloat(v));}}
+            className={`w-24 px-2 py-0.5 text-xs border rounded text-right focus:outline-none focus:ring-1 ${err?'border-red-400 bg-red-50':'border-slate-200 focus:ring-blue-400'}`}/>
+          {err&&<span className="text-[9px] text-red-500">{err}</span>}
+        </div>
+      </div>
+    );
+  };
+  return(
+    <div className="border border-slate-200 rounded-lg mb-1.5 overflow-hidden">
+      <div className="flex items-center bg-slate-50 px-3 py-1.5">
+        <button onClick={()=>setOpen(o=>!o)} className="flex-1 text-left text-xs font-semibold text-slate-700">{open?'▼':'▶'}&nbsp;{roi}</button>
+        <button onClick={onRemove} className="text-red-400 hover:text-red-600 text-[11px] px-1.5 py-0.5 rounded hover:bg-red-50">✕ Remove</button>
+      </div>
+      {open&&(
+        <div className="px-3 py-2">
+          {numField('n_lesions','n_lesions',1,true)}
+          <div className="flex items-center justify-between py-1.5 border-b border-slate-50 gap-2">
+            <span className="text-xs font-medium text-slate-600">prob</span>
+            <select value={spec.prob||'uniform'} onChange={e=>setField('prob',e.target.value)}
+              className="px-2 py-0.5 text-xs border border-slate-200 rounded focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white">
+              {PROB_OPTIONS.map(o=><option key={o} value={o}>{o}</option>)}
             </select>
           </div>
-
-          {/* TOM: disabled notice */}
-          {prob === 'tom' && (
-            <Alert type="warning">
-              <strong>TOM mode</strong> is not yet implemented in the pipeline.
-              Selecting it will cause the run to fail. Use <em>uniform</em> or <em>gaussian</em> instead.
-            </Alert>
+          {spec.prob==='gaussian'&&numField('sigma_mm','sigma_mm',1,false)}
+          {spec.prob==='user_defined'&&(
+            <UserDefinedInputs
+              nLesions={spec.n_lesions||1}
+              centers={spec.user_centers_zyx||[]}
+              radii={spec.radii_mm||[]}
+              onUpdateCenters={v=>onUpdateSpec({...spec,user_centers_zyx:v})}
+              onUpdateRadii={v=>onUpdateSpec({...spec,radii_mm:v})}/>
           )}
-
-          {/* gaussian: sigma_mm */}
-          {prob === 'gaussian' && (
-            <div className="mb-4">
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                sigma_mm
-                <Tooltip text={descriptions['sigma_mm']} />
-              </label>
-              <input type="number" min={0.1} step={1} className={inputBase}
-                value={spec.sigma_mm ?? 60}
-                onChange={e => onChange([...specPath, 'sigma_mm'], parseFloat(e.target.value) || 60)} />
-              <p className="text-xs text-gray-400 mt-1">Standard deviation of the Gaussian centroid weighting (mm)</p>
-            </div>
-          )}
-
-          {/* user_defined: radii_mm + user_centers_zyx */}
-          {prob === 'user_defined' && (
-            <>
-              <div className="mb-4">
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Radii (mm) — one per lesion
-                </label>
-                <input type="text" className={`${inputBase} font-mono`}
-                  value={Array.isArray(spec.radii_mm) ? spec.radii_mm.join(', ') : ''}
-                  placeholder="e.g. 5.0, 3.5, 4.2"
-                  onChange={e => {
-                    const vals = e.target.value.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n) && n > 0);
-                    onChange([...specPath, 'radii_mm'], vals);
-                  }} />
-                <p className="text-xs text-gray-400 mt-1">Comma-separated positive values — must match number of lesions above</p>
-              </div>
-              <div className="mb-4">
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Voxel Centers (z, y, x) — one per line
-                </label>
-                <textarea
-                  className={`${inputBase} font-mono`}
-                  rows={Math.max(3, spec.n_lesions || 1)}
-                  value={centersToStr(spec.user_centers_zyx)}
-                  placeholder={`One lesion per line:\n100, 200, 150\n120, 180, 160`}
-                  onChange={e => onChange([...specPath, 'user_centers_zyx'], strToCenters(e.target.value))}
-                />
-                <p className="text-xs text-gray-400 mt-1">
-                  Integer voxel indices in <strong>z, y, x</strong> order (same as the NIfTI array axes). Must match number of lesions.
-                </p>
-              </div>
-            </>
-          )}
-
-          {/* margin_mm and seed — always shown */}
-          <div className="mb-4">
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              margin_mm <Tooltip text={descriptions['margin_mm']} />
-            </label>
-            <input type="number" min={0} step={0.5} className={inputBase}
-              value={spec.margin_mm ?? 1.0}
-              onChange={e => onChange([...specPath, 'margin_mm'], parseFloat(e.target.value) || 1.0)} />
-          </div>
-          <div className="mb-1">
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              seed <Tooltip text={descriptions['seed']} />
-            </label>
-            <input type="number" min={0} step={1} className={inputBase}
-              value={spec.seed ?? 0}
-              onChange={e => onChange([...specPath, 'seed'], parseInt(e.target.value) || 0)} />
-            <p className="text-xs text-gray-400 mt-1">0 = non-reproducible random seed</p>
-          </div>
+          {numField('margin_mm','margin_mm',0.1,false)}
+          {numField('seed','seed',1,true)}
         </div>
-      );
-    }
+      )}
+    </div>
+  );
+}
 
-    function SyntheticLesionsSpecs({ specs, path, onChange, descriptions }) {
-      const organs = specs ? Object.keys(specs) : [];
-      const handleAdd = () => {
-        const organ = window.prompt('Enter organ name (must be in your ROI subset, e.g. kidney, liver):');
-        if (!organ || !organ.trim()) return;
-        const trimmed = organ.trim();
-        if (specs && specs[trimmed]) { alert(`Organ "${trimmed}" already has specs.`); return; }
-        onChange(path, {
-          ...(specs || {}),
-          [trimmed]: { n_lesions: 1, prob: 'uniform', margin_mm: 1.0, seed: 0 },
-        });
-      };
-      const handleRemove = (organ) => {
-        const next = { ...(specs || {}) };
-        delete next[organ];
-        onChange(path, next);
-      };
-
-      return (
-        <div className="mb-4">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-medium text-gray-700">Lesion Specs by Organ</span>
-            <button type="button"
-              className="text-xs bg-indigo-50 text-indigo-700 px-2.5 py-1 rounded-lg hover:bg-indigo-100 font-medium"
-              onClick={handleAdd}
-            >+ Add Organ</button>
-          </div>
-          {organs.length === 0 && (
-            <p className="text-sm text-gray-400 italic py-2">
-              No lesion specs defined. Click "+ Add Organ" to add lesions to an organ.
+function SpecsEditor({value,onChange,roiChoices,desc}){
+  const [showDesc,setShowDesc]=useState(false);
+  const [addRoi,setAddRoi]=useState('');
+  const isDisabled=value===null;
+  const specs=value||{};
+  const usedRois=Object.keys(specs);
+  const available=(roiChoices||[]).filter(r=>r!=='body'&&!usedRois.includes(r));
+  const handleAdd=()=>{if(!addRoi)return;onChange({...specs,[addRoi]:{n_lesions:1,prob:'uniform',margin_mm:1.0,seed:0}});setAddRoi('');};
+  const handleUpdateSpec=(roi,newSpec)=>onChange({...specs,[roi]:newSpec});
+  const handleRemove=(roi)=>{const u={...specs};delete u[roi];onChange(Object.keys(u).length?u:null);};
+  return(
+    <div className="py-2 border-b border-slate-100 last:border-0">
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm font-medium text-slate-700">specs</span>
+          <span className="text-[10px] text-slate-400 bg-slate-100 px-1.5 rounded font-mono">per-organ lesion config</span>
+          {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
+        </div>
+        {isDisabled
+          ?<button onClick={()=>onChange({})} className="text-xs text-blue-600 hover:text-blue-800 border border-blue-200 hover:border-blue-400 px-2 py-0.5 rounded-lg">+ Enable specs</button>
+          :<button onClick={()=>onChange(null)} className="text-xs text-red-400 hover:text-red-600 border border-red-200 hover:border-red-400 px-2 py-0.5 rounded-lg">✕ Disable all</button>
+        }
+      </div>
+      {showDesc&&<p className="text-xs text-slate-400 mb-2 leading-relaxed">{desc}</p>}
+      {isDisabled?(
+        <p className="text-xs text-slate-400 italic">No specs — lesions will not be inserted.</p>
+      ):(
+        <>
+          {usedRois.length===0&&<p className="text-xs text-slate-400 italic mb-2">No ROIs configured yet — add one below.</p>}
+          {usedRois.map(roi=>(
+            <SpecRoiCard key={roi} roi={roi} spec={specs[roi]}
+              onUpdateSpec={ns=>handleUpdateSpec(roi,ns)} onRemove={()=>handleRemove(roi)}/>
+          ))}
+          {available.length>0?(
+            <div className="flex items-center gap-2 mt-2">
+              <select value={addRoi} onChange={e=>setAddRoi(e.target.value)}
+                className="flex-1 px-2 py-1 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white">
+                <option value="">Select ROI to add…</option>
+                {available.map(r=><option key={r} value={r}>{r}</option>)}
+              </select>
+              <button onClick={handleAdd} disabled={!addRoi}
+                className="px-3 py-1 text-xs bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed font-semibold">
+                + Add
+              </button>
+            </div>
+          ):(
+            <p className="text-xs text-slate-400 italic mt-2">
+              {(roiChoices||[]).filter(r=>r!=='body').length===0
+                ?'Select Phase 1 ROIs first to unlock lesion placement options.'
+                :'All available ROIs are already configured.'}
             </p>
           )}
-          {organs.map(organ => (
-            <Collapsible
-              key={organ}
-              title={organ}
-              badge={`${specs[organ].n_lesions} lesion${specs[organ].n_lesions !== 1 ? 's' : ''} · ${specs[organ].prob}`}
-              defaultOpen={true}
-            >
-              <div className="flex justify-end mb-3">
-                <button type="button" className="text-xs text-red-600 hover:text-red-700 hover:underline"
-                  onClick={() => handleRemove(organ)}>Remove organ</button>
-              </div>
-              <LesionOrganSpec
-                organ={organ}
-                spec={specs[organ]}
-                specPath={[...path, organ]}
-                onChange={onChange}
-                descriptions={descriptions}
-              />
-            </Collapsible>
-          ))}
-        </div>
-      );
-    }
+        </>
+      )}
+    </div>
+  );
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Stage config section renderer
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function StageConfig({ stageConfig, path, onChange, descriptions }) {
-      const entries = Object.entries(stageConfig);
-      const visible = entries.filter(([k]) => !ADVANCED_FIELDS.has(k));
-      const advanced = entries.filter(([k]) => ADVANCED_FIELDS.has(k));
-
-      return (
-        <div>
-          {visible.map(([k, v]) => {
-            if (k === 'specs') {
-              return (
-                <SyntheticLesionsSpecs
-                  key={k}
-                  specs={v}
-                  path={[...path, k]}
-                  onChange={onChange}
-                  descriptions={descriptions}
-                />
-              );
-            }
-            if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
-              // Nested object (gate, source, physics, …)
-              const nested = Object.entries(v);
-              return (
-                <Collapsible key={k} title={k.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase())} defaultOpen={false}>
-                  {nested.map(([sk, sv]) => (
-                    <ConfigField
-                      key={sk}
-                      name={sk}
-                      value={sv}
-                      path={[...path, k, sk]}
-                      onChange={onChange}
-                      descriptions={descriptions}
-                    />
-                  ))}
-                </Collapsible>
-              );
-            }
-            return (
-              <ConfigField
-                key={k}
-                name={k}
-                value={v}
-                path={[...path, k]}
-                onChange={onChange}
-                descriptions={descriptions}
-              />
+// ─── FrameTimesSection ────────────────────────────────────────────────────────
+function FrameTimesSection({frameStartTimes,frameDurations,basePath,patientName,onChange}){
+  const toStr=v=>(v===undefined||v===null)?'':String(v);
+  const init=()=>{
+    const fst=Array.isArray(frameStartTimes)?frameStartTimes:[];
+    const fd=Array.isArray(frameDurations)?frameDurations:[];
+    const n=Math.max(fst.length,fd.length,1);
+    return Array.from({length:n},(_,i)=>({start:toStr(fst[i]),dur:toStr(fd[i])}));
+  };
+  const [rows,setRows]=useState(init);
+  const [errs,setErrs]=useState([]);
+  const validate=r=>{const e=[];r.forEach((row,i)=>{if(row.start===''||isNaN(Number(row.start)))e.push({i,f:'start'});if(row.dur===''||isNaN(Number(row.dur)))e.push({i,f:'dur'});});return e;};
+  const commit=nr=>{const e=validate(nr);setErrs(e);if(!e.length){onChange(patientName,[...basePath,'FrameStartTimes'],nr.map(r=>Number(r.start)));onChange(patientName,[...basePath,'FrameDurations'],nr.map(r=>Number(r.dur)));}};
+  const set=(i,f,v)=>{const nr=rows.map((r,ri)=>ri===i?{...r,[f]:v}:r);setRows(nr);commit(nr);};
+  const addRow=()=>{const r=[...rows,{start:'',dur:''}];setRows(r);setErrs(validate(r));};
+  const delRow=i=>{const r=rows.filter((_,ri)=>ri!==i)||[{start:'',dur:''}];if(!r.length)r.push({start:'',dur:''});setRows(r);commit(r);};
+  const errFor=(i,f)=>errs.find(e=>e.i===i&&e.f===f);
+  return(
+    <div className="py-2 border-b border-slate-100 last:border-0">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-sm font-medium text-slate-700">Acquisition Frames</span>
+        <button onClick={addRow} className="text-xs text-blue-600 hover:text-blue-800 border border-blue-200 hover:border-blue-400 px-2 py-0.5 rounded-lg font-medium">+ Add frame</button>
+      </div>
+      {errs.length>0&&<p className="text-xs text-red-500 mb-1.5">Fix errors — pipeline will reject non-numeric values.</p>}
+      <table className="w-full text-xs">
+        <thead><tr className="text-slate-400 text-[11px]">
+          <th className="text-left pb-1 pr-2 font-medium w-8">#</th>
+          <th className="text-left pb-1 pr-2 font-medium">Start time (min p.i.)</th>
+          <th className="text-left pb-1 pr-2 font-medium">Duration (sec)</th>
+          <th className="w-6"></th>
+        </tr></thead>
+        <tbody>
+          {rows.map((row,i)=>{
+            const eS=errFor(i,'start'),eD=errFor(i,'dur');
+            return(
+              <tr key={i} className="border-t border-slate-50">
+                <td className="py-1 pr-2 text-slate-400 font-mono">{i+1}</td>
+                <td className="py-1 pr-2">
+                  <input type="number" value={row.start} onChange={e=>set(i,'start',e.target.value)} onBlur={e=>set(i,'start',e.target.value)}
+                    className={`w-32 px-2 py-0.5 border rounded text-right focus:outline-none focus:ring-1 ${eS?'border-red-400 bg-red-50':'border-slate-200 focus:ring-blue-400'}`}/>
+                  {eS&&<p className="text-[9px] text-red-500">Number required</p>}
+                </td>
+                <td className="py-1 pr-2">
+                  <input type="number" value={row.dur} onChange={e=>set(i,'dur',e.target.value)} onBlur={e=>set(i,'dur',e.target.value)}
+                    className={`w-24 px-2 py-0.5 border rounded text-right focus:outline-none focus:ring-1 ${eD?'border-red-400 bg-red-50':'border-slate-200 focus:ring-blue-400'}`}/>
+                  {eD&&<p className="text-[9px] text-red-500">Number required</p>}
+                </td>
+                <td className="py-1">{rows.length>1&&<button onClick={()=>delRow(i)} className="text-red-400 hover:text-red-600 text-[11px] px-1">✕</button>}</td>
+              </tr>
             );
           })}
-          {advanced.length > 0 && (
-            <Collapsible title="Advanced" defaultOpen={false}>
-              {advanced.map(([k, v]) => (
-                <ConfigField
-                  key={k}
-                  name={k}
-                  value={v}
-                  path={[...path, k]}
-                  onChange={onChange}
-                  descriptions={descriptions}
-                />
-              ))}
-            </Collapsible>
-          )}
-        </div>
-      );
-    }
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Step 1 — Configuration
-    // ─────────────────────────────────────────────────────────────────────────
+// ─── FieldRenderer ────────────────────────────────────────────────────────────
+function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape}){
+  const desc=descriptions[fieldKey]||'';
+  const [showDesc,setShowDesc]=useState(false);
+  const [numErr,setNumErr]=useState('');
+  const call=v=>onChange(patientName,path,v);
+  const LabelRow=({children})=>(
+    <div className="flex items-center justify-between py-2 border-b border-slate-100 last:border-0 gap-3">
+      <div className="flex items-center gap-1.5 flex-shrink-0">
+        <span className="text-sm font-medium text-slate-700">{fieldKey}</span>
+        {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
+      </div>
+      {children}
+    </div>
+  );
+  const DescLine=()=>showDesc?<p className="text-xs text-slate-400 pb-2 -mt-1 leading-relaxed">{desc}</p>:null;
 
-    function Step1Config({
-      config, setConfig,
-      flags, setFlags,
-      mode, setMode,
-      descriptions,
-      onNext,
-      hideBasic,  // true when embedded in per-patient step
-    }) {
-      if (!config) {
-        return (
-          <div className="flex items-center justify-center py-16 gap-3 text-gray-400">
-            <Spinner /> <span>Loading configuration template…</span>
+  if(fieldKey==='xyz_dim') return<XyzDimFieldInner value={value} onChange={call} desc={desc} patientShape={patientShape}/>;
+  if(fieldKey==='random_seed') return<RandomSeedField value={value} onChange={call} desc={desc}/>;
+  if(typeof value==='boolean') return<><LabelRow><input type="checkbox" checked={value} onChange={e=>call(e.target.checked)} className="w-4 h-4 accent-blue-600 flex-shrink-0"/></LabelRow><DescLine/></>;
+  if(typeof value==='number') return(
+    <><LabelRow>
+      <div className="flex flex-col items-end gap-0.5">
+        <input type="number" defaultValue={value}
+          onChange={e=>{setNumErr(e.target.value!==''&&isNaN(parseFloat(e.target.value))?'Must be a number':'');}}
+          onBlur={e=>{const v=e.target.value;if(v===''||isNaN(parseFloat(v))){setNumErr('Must be a number');}else{setNumErr('');call(parseFloat(v));}}}
+          className={`w-32 px-2 py-1 text-sm border rounded-lg text-right focus:outline-none focus:ring-2 ${numErr?'border-red-400 focus:ring-red-300 bg-red-50':'border-slate-300 focus:ring-blue-400'}`}/>
+        {numErr&&<span className="text-xs text-red-500">{numErr}</span>}
+      </div>
+    </LabelRow><DescLine/></>
+  );
+  if(value===null) return<><LabelRow><NullField call={call}/></LabelRow><DescLine/></>;
+  if(typeof value==='string'){
+    const opts=pipelineOptions&&pipelineOptions[fieldKey];
+    if(opts&&Array.isArray(opts)) return(
+      <><LabelRow>
+        <select value={value} onChange={e=>call(e.target.value)}
+          className="px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white">
+          {opts.map(o=><option key={o} value={o}>{o}</option>)}
+        </select>
+      </LabelRow><DescLine/></>
+    );
+    return<><LabelRow><input type="text" defaultValue={value} onBlur={e=>call(e.target.value)} className="w-44 px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"/></LabelRow><DescLine/></>;
+  }
+  if(Array.isArray(value)){
+    if(fieldKey==='roi_subset'&&roiChoices&&roiChoices.length>0){
+      const choices=roiChoices.filter(r=>r!=='body');
+      return(
+        <div className="py-2 border-b border-slate-100 last:border-0">
+          <div className="flex items-center gap-1.5 mb-2">
+            <span className="text-sm font-medium text-slate-700">{fieldKey}</span>
+            {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
           </div>
-        );
-      }
-
-      const handleChange = useCallback((path, value) => {
-        setConfig(cfg => setDeep(cfg, Array.isArray(path) ? path : path.split('.'), value));
-      }, [setConfig]);
-
-      const flagDefs = [
-        { key: 'spect',             label: 'SPECT Simulation',    desc: 'Run SIMIND Monte Carlo SPECT projection simulation (Phase 2)' },
-        { key: 'dosimetry',         label: 'Dosimetry',           desc: 'Run OpenGATE Monte Carlo absorbed dose calculation (Phase 2)' },
-        { key: 'postprocess',       label: 'Post-Processing',     desc: 'Apply TAC weighting, Poisson noise, and OSEM reconstruction (Phase 3)' },
-        { key: 'synthetic_lesions', label: 'Synthetic Lesions',   desc: 'Insert synthetic spherical lesions into segmented organs (Phase 1)' },
-        { key: 'logging_on',        label: 'Per-CT Logging',      desc: 'Write detailed per-CT log files into each output folder' },
-        { key: 'save_ct_scan',      label: 'Save CT Input',       desc: 'Copy the CT input file/folder into the output for provenance' },
-        { key: 'save_config',       label: 'Save Config JSON',    desc: 'Copy the config JSON into each CT output folder' },
-      ];
-
-      const simindPath = config?.phase_2?.simind_stage?.SIMINDDirectory || '';
-      const showSimindWarning = flags.spect && (simindPath.includes('jhubadmin') || !simindPath.trim());
-
-      // ROI cross-validation: SIMIND / OpenGATE roi_subset must be a subset of segmentation roi_subset
-      const segROIs        = config?.phase_1?.segmentation_stage?.roi_subset || [];
-      const simindROIs     = config?.phase_2?.simind_stage?.roi_subset     || [];
-      const opengateROIs   = config?.phase_2?.opengate_stage?.roi_subset   || [];
-      const simindBadROIs  = flags.spect     ? simindROIs.filter(r => !segROIs.includes(r))    : [];
-      const opengateBadROIs= flags.dosimetry ? opengateROIs.filter(r => !segROIs.includes(r))  : [];
-
-      return (
-        <div className="space-y-5">
-          {!hideBasic && (
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <h3 className="text-base font-semibold text-gray-900 mb-4">Basic Settings</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Output Folder Title
-                    <Tooltip text={descriptions['output_folder_title']} />
-                  </label>
-                  <input
-                    type="text"
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                    value={config.output_folder_title || ''}
-                    onChange={e => handleChange(['output_folder_title'], e.target.value)}
-                    placeholder="e.g. my_trial_run"
-                  />
-                  <p className="text-xs text-gray-400 mt-1">
-                    Outputs: <code className="bg-gray-100 px-1 rounded">&lt;title&gt;_CT_0/</code>, <code className="bg-gray-100 px-1 rounded">&lt;title&gt;_CT_1/</code>, …
-                  </p>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Pipeline Mode</label>
-                  <select
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                    value={mode}
-                    onChange={e => setMode(e.target.value)}
-                  >
-                    <option value="PRODUCTION">PRODUCTION — clean intermediate files</option>
-                    <option value="DEBUG">DEBUG — keep all intermediate files</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {!hideBasic && (
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <h3 className="text-base font-semibold text-gray-900 mb-4">Pipeline Stages to Run</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {flagDefs.map(({ key, label, desc }) => (
-                  <Toggle
-                    key={key}
-                    value={flags[key] ?? false}
-                    onChange={v => setFlags(f => ({ ...f, [key]: v }))}
-                    label={label}
-                    description={desc}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-
-          {showSimindWarning && (
-            <Alert type="warning">
-              ⚠ <strong>SPECT is enabled</strong> but <code>SIMINDDirectory</code> looks like a placeholder path.
-              Please update it under Phase 2 → SIMIND Simulation → SIMIND Directory.
-            </Alert>
-          )}
-
-          {(simindBadROIs.length > 0 || opengateBadROIs.length > 0) && (
-            <Alert type="error">
-              <strong>ROI mismatch — the pipeline will fail at runtime.</strong>{' '}
-              {simindBadROIs.length > 0 && (
-                <span>SIMIND roi_subset contains ROIs not in Segmentation: <code>{simindBadROIs.join(', ')}</code>. </span>
-              )}
-              {opengateBadROIs.length > 0 && (
-                <span>OpenGATE roi_subset contains ROIs not in Segmentation: <code>{opengateBadROIs.join(', ')}</code>. </span>
-              )}
-              Fix by adding the missing ROIs to <em>Phase 1 → Segmentation → roi_subset</em>, or removing them from the simulation subset.
-            </Alert>
-          )}
-
-          {/* Phase 1 */}
-          <Collapsible title="Phase 1: Digital Twin & Ground Truth" defaultOpen={true}>
-            <Collapsible title="Segmentation + ROI Unification" defaultOpen={true}>
-              <StageConfig
-                stageConfig={config.phase_1.segmentation_stage}
-                path={['phase_1', 'segmentation_stage']}
-                onChange={handleChange}
-                descriptions={descriptions}
-              />
-            </Collapsible>
-            {flags.synthetic_lesions && (
-              <Collapsible title="Synthetic Lesions" defaultOpen={false}>
-                <Alert type="info">
-                  Lesions are only inserted if <code>specs</code> below is non-empty <em>and</em> the
-                  <code>--synthetic_lesions</code> flag is enabled (it is).
-                </Alert>
-                <div className="mt-3">
-                  <StageConfig
-                    stageConfig={config.phase_1.synthetic_lesions_stage}
-                    path={['phase_1', 'synthetic_lesions_stage']}
-                    onChange={handleChange}
-                    descriptions={descriptions}
-                  />
-                </div>
-              </Collapsible>
-            )}
-            <Collapsible title="PBPK TAC Generation" defaultOpen={false}>
-              <Alert type="info">
-                TACs are generated for <strong>all VOIs listed below</strong> regardless of which ROIs
-                were segmented. The pipeline maps each segmented organ to its VOI automatically
-                (e.g. kidney → Kidney, liver → Liver). Unmatched organs fall back to the "Rest" VOI.
-              </Alert>
-              <div className="mt-3">
-                <StageConfig
-                  stageConfig={config.phase_1.pbpk_tac_stage}
-                  path={['phase_1', 'pbpk_tac_stage']}
-                  onChange={handleChange}
-                  descriptions={descriptions}
-                />
-              </div>
-            </Collapsible>
-          </Collapsible>
-
-          {/* Phase 2 */}
-          {(flags.spect || flags.dosimetry) ? (
-            <Collapsible title="Phase 2: Simulations" defaultOpen={false}>
-              {flags.spect && (
-                <Collapsible title="SIMIND SPECT Simulation" defaultOpen={true}>
-                  {simindBadROIs.length > 0 && (
-                    <Alert type="error">
-                      <strong>ROI mismatch:</strong> the following ROIs are in the SIMIND subset but
-                      not in Segmentation: <code>{simindBadROIs.join(', ')}</code>.
-                      Add them to Phase 1 → Segmentation → roi_subset or remove them here.
-                    </Alert>
-                  )}
-                  <StageConfig
-                    stageConfig={config.phase_2.simind_stage}
-                    path={['phase_2', 'simind_stage']}
-                    onChange={handleChange}
-                    descriptions={descriptions}
-                  />
-                </Collapsible>
-              )}
-              {flags.dosimetry && (
-                <Collapsible title="OpenGATE Dosimetry" defaultOpen={!flags.spect}>
-                  {opengateBadROIs.length > 0 && (
-                    <Alert type="error">
-                      <strong>ROI mismatch:</strong> the following ROIs are in the OpenGATE subset but
-                      not in Segmentation: <code>{opengateBadROIs.join(', ')}</code>.
-                      Add them to Phase 1 → Segmentation → roi_subset or remove them here.
-                    </Alert>
-                  )}
-                  <StageConfig
-                    stageConfig={config.phase_2.opengate_stage}
-                    path={['phase_2', 'opengate_stage']}
-                    onChange={handleChange}
-                    descriptions={descriptions}
-                  />
-                </Collapsible>
-              )}
-            </Collapsible>
-          ) : (
-            <div className="bg-gray-100 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-400">
-              Phase 2 (Simulations) — enable SPECT or Dosimetry above to configure
-            </div>
-          )}
-
-          {/* Phase 3 */}
-          {flags.postprocess && (flags.spect || flags.dosimetry) ? (
-            <Collapsible title="Phase 3: Post-Processing" defaultOpen={false}>
-              {flags.spect && (
-                <Collapsible title="SPECT Post-Processing" defaultOpen={true}>
-                  <StageConfig
-                    stageConfig={config.phase_3.spect_postprocess_stage}
-                    path={['phase_3', 'spect_postprocess_stage']}
-                    onChange={handleChange}
-                    descriptions={descriptions}
-                  />
-                </Collapsible>
-              )}
-              {flags.dosimetry && (
-                <Collapsible title="Dosemap Post-Processing" defaultOpen={!flags.spect}>
-                  <StageConfig
-                    stageConfig={config.phase_3.dosemap_postprocess_stage}
-                    path={['phase_3', 'dosemap_postprocess_stage']}
-                    onChange={handleChange}
-                    descriptions={descriptions}
-                  />
-                </Collapsible>
-              )}
-            </Collapsible>
-          ) : flags.postprocess ? (
-            <Alert type="warning">
-              Post-Processing is enabled but requires at least one simulation stage (SPECT or Dosimetry).
-            </Alert>
-          ) : (
-            <div className="bg-gray-100 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-400">
-              Phase 3 (Post-Processing) — enable Post-Processing + a simulation stage above to configure
-            </div>
-          )}
-
-          {onNext && (() => {
-            const blocked = simindBadROIs.length > 0 || opengateBadROIs.length > 0;
-            return (
-              <button
-                className={`w-full font-semibold py-3 rounded-xl transition-colors text-white
-                  ${blocked ? 'bg-gray-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700'}`}
-                onClick={blocked ? undefined : onNext}
-                disabled={blocked}
-              >
-                {blocked ? '⚠ Fix ROI mismatch above before continuing' : 'Continue to CT Upload →'}
-              </button>
-            );
-          })()}
-        </div>
-      );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Step 2 — CT Upload / Directory Selection
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function Step2CTUpload({ ctDir, setCtDir, patients, setPatients, onNext }) {
-      const [inputPath, setInputPath] = useState(ctDir || '');
-      const [scanning, setScanning] = useState(false);
-      const [uploading, setUploading] = useState(false);
-      const [uploadProgress, setUploadProgress] = useState(0);
-      const [error, setError] = useState('');
-      const [dragging, setDragging] = useState(false);
-      const fileInputRef = useRef(null);
-
-      const scan = async (pathOverride) => {
-        const p = (pathOverride || inputPath).trim();
-        if (!p) { setError('Please enter the full path to your CT directory.'); return; }
-        setScanning(true);
-        setError('');
-        try {
-          const res = await apiFetch('/api/scan-directory', {
-            method: 'POST',
-            body: JSON.stringify({ path: p }),
-          });
-          setCtDir(res.path);
-          setPatients(res.patients);
-          setInputPath(res.path);
-        } catch (e) {
-          setError(e.message);
-        } finally {
-          setScanning(false);
-        }
-      };
-
-      const handleDrop = async (e) => {
-        e.preventDefault();
-        setDragging(false);
-        const items = e.dataTransfer.items;
-        if (!items || items.length === 0) return;
-
-        // Check if a single folder was dropped
-        const entry = items[0]?.webkitGetAsEntry?.();
-        if (!entry) {
-          setError('Could not read dropped item. Please type the path manually.');
-          return;
-        }
-        if (!entry.isDirectory) {
-          setError('Please drop a folder (directory), not a single file.');
-          return;
-        }
-
-        // We got files via dataTransfer — upload them
-        const fileList = Array.from(e.dataTransfer.files);
-        if (fileList.length === 0) {
-          setError('No files received from drop. Please type the path manually.');
-          return;
-        }
-        await uploadFiles(fileList);
-      };
-
-      const handleFileInputChange = async (e) => {
-        const files = Array.from(e.target.files);
-        if (files.length === 0) return;
-        await uploadFiles(files);
-      };
-
-      const uploadFiles = (files) => {
-        setUploading(true);
-        setUploadProgress(0);
-        setError('');
-
-        const formData = new FormData();
-        for (const f of files) {
-          const relPath = f.webkitRelativePath || f.name;
-          formData.append('files', f, relPath);
-        }
-
-        return new Promise((resolve) => {
-          const xhr = new XMLHttpRequest();
-          xhr.open('POST', '/api/upload-ct');
-
-          xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable) {
-              setUploadProgress(Math.round((e.loaded / e.total) * 100));
-            }
-          };
-
-          xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              try {
-                const data = JSON.parse(xhr.responseText);
-                setCtDir(data.path);
-                setPatients(data.patients);
-                setInputPath(data.path);
-                setUploadProgress(100);
-              } catch (e) {
-                setError('Upload failed: could not parse server response.');
-              }
-            } else {
-              let detail = xhr.statusText;
-              try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) {}
-              setError(`Upload failed: ${detail}`);
-            }
-            setUploading(false);
-            resolve();
-          };
-
-          xhr.onerror = () => {
-            setError('Upload failed: network error.');
-            setUploading(false);
-            resolve();
-          };
-
-          xhr.send(formData);
-        });
-      };
-
-      return (
-        <div className="space-y-5">
-          <Alert type="info">
-            <strong>Each entry</strong> inside the selected folder is treated as one patient:
-            a <code>.nii</code> / <code>.nii.gz</code> file is loaded as NIfTI,
-            and a subdirectory is treated as a DICOM series.
-          </Alert>
-
-          <div className="bg-white rounded-xl border border-gray-200 p-5">
-            <h3 className="text-base font-semibold text-gray-900 mb-4">CT Input Directory</h3>
-
-            {/* Drop zone */}
-            <div
-              className={`border-2 border-dashed rounded-xl p-10 text-center transition-colors mb-5 cursor-pointer select-none
-                ${dragging   ? 'border-indigo-400 bg-indigo-50' :
-                  uploading  ? 'border-indigo-300 bg-indigo-50 cursor-wait' :
-                               'border-gray-300 bg-gray-50 hover:border-indigo-300 hover:bg-indigo-50/30'}`}
-              onDragOver={e => { e.preventDefault(); setDragging(true); }}
-              onDragLeave={() => setDragging(false)}
-              onDrop={handleDrop}
-              onClick={() => !uploading && fileInputRef.current?.click()}
-            >
-              <input
-                ref={fileInputRef}
-                type="file"
-                webkitdirectory=""
-                directory=""
-                multiple
-                className="hidden"
-                onChange={handleFileInputChange}
-              />
-              {uploading ? (
-                <>
-                  <div className="flex justify-center mb-3"><Spinner /></div>
-                  <p className="text-sm font-medium text-indigo-700">Uploading… {uploadProgress}%</p>
-                  <div className="w-full max-w-xs mx-auto bg-indigo-200 rounded-full h-1.5 mt-2">
-                    <div className="bg-indigo-600 h-1.5 rounded-full progress-bar" style={{ width: `${uploadProgress}%` }} />
-                  </div>
-                  <p className="text-xs text-indigo-400 mt-2">
-                    Tip: for local files, cancelling and typing the path below is instant
-                  </p>
-                </>
-              ) : (
-                <>
-                  <div className="text-4xl mb-3">📂</div>
-                  <p className="text-sm font-medium text-gray-700">Drop your CT folder here</p>
-                  <p className="text-xs text-gray-400 mt-1">or click to browse</p>
-                  <p className="text-xs text-amber-500 mt-3 font-medium">
-                    Running locally? Type the folder path below — it's instant and skips uploading.
-                  </p>
-                </>
-              )}
-            </div>
-
-            {/* Manual path input */}
-            <div className="relative">
-              <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-gray-200" /></div>
-              <div className="relative flex justify-center text-xs">
-                <span className="bg-white px-3 text-gray-400">or enter path directly</span>
-              </div>
-            </div>
-            <div className="flex gap-2 mt-4">
-              <input
-                type="text"
-                className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                placeholder="/absolute/path/to/ct_input_directory"
-                value={inputPath}
-                onChange={e => setInputPath(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && scan()}
-              />
-              <button
-                className="bg-indigo-600 hover:bg-indigo-700 text-white font-medium px-5 py-2 rounded-lg text-sm disabled:opacity-50 flex items-center gap-2"
-                onClick={() => scan()}
-                disabled={scanning || uploading}
-              >
-                {scanning ? <><Spinner /> Scanning…</> : 'Scan'}
-              </button>
-            </div>
-            {error && <p className="text-sm text-red-600 mt-2">{error}</p>}
+          <DescLine/>
+          {choices.length===0&&<p className="text-xs text-slate-400 italic">No ROIs available — constrained by Phase 1 selection</p>}
+          <div className="flex flex-wrap gap-1.5">
+            {choices.map(roi=>(
+              <label key={roi} className={`px-2 py-0.5 rounded-full text-xs cursor-pointer border select-none transition-colors
+                ${value.includes(roi)?'bg-blue-100 border-blue-400 text-blue-700':'bg-slate-100 border-slate-300 text-slate-500 hover:border-slate-400'}`}>
+                <input type="checkbox" checked={value.includes(roi)}
+                  onChange={e=>call(e.target.checked?[...value,roi]:value.filter(r=>r!==roi))} className="hidden"/>
+                {roi}
+              </label>
+            ))}
           </div>
-
-          {/* Patient list */}
-          {patients.length > 0 && (
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-base font-semibold text-gray-900">
-                  Found {patients.length} patient{patients.length !== 1 ? 's' : ''}
-                </h3>
-                <span className="text-xs text-gray-400">{ctDir}</span>
-              </div>
-              <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
-                {patients.map((p, i) => (
-                  <div key={p.name} className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
-                    <span className="text-xs font-mono text-gray-400 w-5 text-right flex-shrink-0">{i + 1}</span>
-                    <span className="text-lg flex-shrink-0">{p.type === 'nifti' ? '🗜️' : '📁'}</span>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-gray-800 truncate">{p.name}</p>
-                      <p className="text-xs text-gray-400">
-                        {p.type === 'nifti' ? 'NIfTI' : `DICOM directory${p.file_count ? ` · ${p.file_count} files` : ''}`}
-                      </p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <button
-                className="w-full mt-5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl transition-colors"
-                onClick={onNext}
-              >
-                Preview CTs →
-              </button>
-            </div>
-          )}
         </div>
       );
     }
+    return(
+      <><LabelRow>
+        <textarea key={JSON.stringify(value)} defaultValue={value.join(', ')}
+          onBlur={e=>{const parts=e.target.value.split(',').map(s=>s.trim()).filter(Boolean);call(parts.map(p=>{const n=Number(p);return isNaN(n)?p:n;}));}}
+          rows={2} className="w-56 px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"/>
+      </LabelRow><DescLine/></>
+    );
+  }
+  return null;
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Step 3 — CT Preview & Confirmation
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function Step3Preview({ patients, onNext }) {
-      const [previews, setPreviews] = useState({});     // name → {axial, coronal, sagittal, shape}
-      const [loading, setLoading]   = useState({});     // name → bool
-      const [errors,  setErrors]    = useState({});     // name → string
-
-      useEffect(() => {
-        patients.forEach(p => {
-          if (previews[p.name] || loading[p.name]) return;
-          setLoading(prev => ({ ...prev, [p.name]: true }));
-          apiFetch('/api/preview-ct', {
-            method: 'POST',
-            body: JSON.stringify({ path: p.path, ct_type: p.type }),
-          })
-            .then(res => setPreviews(prev => ({ ...prev, [p.name]: res })))
-            .catch(e  => setErrors (prev => ({ ...prev, [p.name]: e.message })))
-            .finally(()=> setLoading(prev => ({ ...prev, [p.name]: false })));
-        });
-      }, [patients]);
-
-      const loadedCount = Object.keys(previews).length;
-      const errorCount  = Object.keys(errors).length;
-
-      return (
-        <div className="space-y-4">
-          <Alert type="info">
-            Review the CT previews below. Each shows the middle <strong>axial</strong>,
-            <strong> coronal</strong>, and <strong>sagittal</strong> slice.
-            Confirm the anatomy looks correct before running the pipeline.
-          </Alert>
-
-          {loadedCount < patients.length && errorCount + loadedCount < patients.length && (
-            <div className="flex items-center gap-2 text-sm text-gray-500">
-              <Spinner />
-              <span>Loading previews… ({loadedCount}/{patients.length})</span>
-            </div>
-          )}
-
-          {patients.map(p => (
-            <div key={p.name} className="bg-white rounded-xl border border-gray-200 p-4">
-              <div className="flex items-center gap-2 mb-3">
-                <span>{p.type === 'nifti' ? '🗜️' : '📁'}</span>
-                <h4 className="font-semibold text-gray-900">{p.name}</h4>
-                {loading[p.name] && (
-                  <span className="flex items-center gap-1.5 text-xs text-gray-400">
-                    <Spinner /> loading…
-                  </span>
-                )}
-                {previews[p.name] && (
-                  <span className="text-xs text-gray-400 ml-auto">
-                    {previews[p.name].shape?.join(' × ')} voxels
-                  </span>
-                )}
-              </div>
-
-              {errors[p.name] && (
-                <Alert type="error">
-                  ⚠ Could not load preview: {errors[p.name]}
-                </Alert>
-              )}
-
-              {previews[p.name] && (() => {
-                const prev = previews[p.name];
-                return (
-                  <div className="grid grid-cols-3 gap-3">
-                    {['axial', 'coronal', 'sagittal'].map(view => (
-                      <div key={view} className="text-center">
-                        <div className="h-48 bg-black rounded-lg border border-gray-200 overflow-hidden flex items-center justify-center">
-                          <img
-                            src={`data:image/png;base64,${prev[view]}`}
-                            alt={`${p.name} ${view}`}
-                            className="max-h-full max-w-full object-contain"
-                          />
-                        </div>
-                        <p className="text-xs text-gray-400 mt-1 capitalize font-medium">{view}</p>
-                      </div>
+// ─── StageSection ─────────────────────────────────────────────────────────────
+function StageSection({stageKey,stageData,basePath,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape}){
+  const [open,setOpen]=useState(false);
+  const isSpectPost=stageKey==='spect_postprocess_stage';
+  const isSynLesion=stageKey==='synthetic_lesions_stage';
+  const entries=Object.entries(stageData).filter(([k])=>
+    !DEVELOPER_FIELDS.has(k)&&
+    !(isSpectPost&&(k==='FrameStartTimes'||k==='FrameDurations'))&&
+    !(isSynLesion&&k==='specs')
+  );
+  return(
+    <div className="border border-slate-100 rounded-lg overflow-hidden">
+      <button onClick={()=>setOpen(o=>!o)}
+        className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-slate-50 transition-colors text-left">
+        <span className="text-sm font-medium text-slate-600">{STAGE_LABELS[stageKey]||stageKey}</span>
+        <span className="text-slate-300 text-xs">{open?'▲':'▼'}</span>
+      </button>
+      {open&&(
+        <div className="px-4 pb-3">
+          {entries.map(([k,v])=>{
+            const fPath=[...basePath,k];
+            if(typeof v==='object'&&v!==null&&!Array.isArray(v)){
+              const sub=Object.entries(v).filter(([sk])=>!DEVELOPER_FIELDS.has(sk));
+              if(!sub.length)return null;
+              return(
+                <div key={k} className="mt-3">
+                  <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-1">{STAGE_LABELS[k]||k}</p>
+                  <div className="pl-3 border-l-2 border-slate-100">
+                    {sub.map(([sk,sv])=>(
+                      <FieldRenderer key={sk} fieldKey={sk} value={sv} path={[...fPath,sk]}
+                        patientName={patientName} onChange={onChange} descriptions={descriptions}
+                        pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}/>
                     ))}
                   </div>
-                );
-              })()}
-            </div>
-          ))}
-
-          {errorCount > 0 && (
-            <Alert type="warning">
-              {errorCount} CT{errorCount !== 1 ? 's' : ''} could not be previewed.
-              You can still proceed — preview errors do not prevent the pipeline from running.
-            </Alert>
-          )}
-
-          <button
-            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl transition-colors"
-            onClick={onNext}
-          >
-            CTs look correct — Continue →
-          </button>
-        </div>
-      );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Step 4 — Per-patient config (optional)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function Step4PerPatient({
-      patients, config, flags, mode, descriptions,
-      sameConfig, setSameConfig,
-      perPatientConfigs, setPerPatientConfigs,
-      onNext,
-    }) {
-      // Initialise per-patient configs from the global config on first expansion
-      const initIfNeeded = () => {
-        if (Object.keys(perPatientConfigs).length === 0) {
-          const init = {};
-          patients.forEach(p => { init[p.name] = deepClone(config); });
-          setPerPatientConfigs(init);
-        }
-      };
-
-      const handleToggle = (val) => {
-        setSameConfig(val);
-        if (!val) initIfNeeded();
-      };
-
-      const makeSetConfig = (patientName) => (updater) => {
-        setPerPatientConfigs(prev => ({
-          ...prev,
-          [patientName]: typeof updater === 'function' ? updater(prev[patientName]) : updater,
-        }));
-      };
-
-      return (
-        <div className="space-y-5">
-          <div className="bg-white rounded-xl border border-gray-200 p-5">
-            <h3 className="text-base font-semibold text-gray-900 mb-4">Per-Patient Configuration</h3>
-            <Toggle
-              value={sameConfig}
-              onChange={handleToggle}
-              label="Apply the same configuration to all patients"
-              description={
-                sameConfig
-                  ? 'All patients will use the configuration set in Step 1.'
-                  : 'Expand each patient below to customise their configuration independently.'
-              }
-            />
-          </div>
-
-          {!sameConfig && patients.map(p => (
-            <Collapsible key={p.name} title={p.name} defaultOpen={false}>
-              {perPatientConfigs[p.name] ? (
-                <Step1Config
-                  config={perPatientConfigs[p.name]}
-                  setConfig={makeSetConfig(p.name)}
-                  flags={flags}
-                  setFlags={() => {}}
-                  mode={mode}
-                  setMode={() => {}}
-                  descriptions={descriptions}
-                  onNext={null}
-                  hideBasic={true}
-                />
-              ) : (
-                <div className="flex items-center gap-2 text-gray-400 text-sm py-4">
-                  <Spinner /> Initialising…
                 </div>
-              )}
-            </Collapsible>
-          ))}
-
-          <button
-            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl transition-colors"
-            onClick={onNext}
-          >
-            Run Pipeline →
-          </button>
+              );
+            }
+            return<FieldRenderer key={k} fieldKey={k} value={v} path={fPath}
+              patientName={patientName} onChange={onChange} descriptions={descriptions}
+              pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}/>;
+          })}
+          {isSynLesion&&'specs' in stageData&&(
+            <SpecsEditor value={stageData.specs}
+              onChange={v=>onChange(patientName,[...basePath,'specs'],v)}
+              roiChoices={roiChoices} desc={descriptions['specs']||''}/>
+          )}
+          {isSpectPost&&'FrameStartTimes' in stageData&&'FrameDurations' in stageData&&(
+            <FrameTimesSection frameStartTimes={stageData.FrameStartTimes}
+              frameDurations={stageData.FrameDurations}
+              basePath={basePath} patientName={patientName} onChange={onChange}/>
+          )}
         </div>
-      );
-    }
+      )}
+    </div>
+  );
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Step 5 — Run
-    // ─────────────────────────────────────────────────────────────────────────
+// ─── PhaseSection ─────────────────────────────────────────────────────────────
+function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,phase1RoiSubset,patientShape}){
+  const [open,setOpen]=useState(false);
+  const stages=Object.entries(phaseData).filter(([k,v])=>k!=='sub_dir_name'&&typeof v==='object'&&v!==null);
+  // Constrain to phase_1 selection for all non-segmentation stages
+  const constrained=(Array.isArray(phase1RoiSubset)&&phase1RoiSubset.length>0)
+    ?roiChoices.filter(r=>phase1RoiSubset.includes(r))
+    :roiChoices;
+  return(
+    <div className="border border-slate-200 rounded-xl overflow-hidden">
+      <button onClick={()=>setOpen(o=>!o)}
+        className="w-full flex items-center justify-between px-4 py-3 bg-slate-50 hover:bg-slate-100 transition-colors text-left">
+        <span className="text-sm font-semibold text-slate-700">{PHASE_LABELS[phaseKey]||phaseKey}</span>
+        <span className="text-slate-400 text-xs">{open?'▲':'▼'}</span>
+      </button>
+      {open&&(
+        <div className="p-3 space-y-2">
+          {stages.map(([sk,sd])=>(
+            <StageSection key={sk} stageKey={sk} stageData={sd}
+              basePath={[phaseKey,sk]} patientName={patientName} onChange={onChange}
+              descriptions={descriptions} pipelineOptions={pipelineOptions}
+              // segmentation_stage sees full choices; everything else is constrained
+              roiChoices={sk==='segmentation_stage'?roiChoices:constrained}
+              patientShape={patientShape}/>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
-    function Step5Run({ config, flags, mode, ctDir, patients, sameConfig, perPatientConfigs, onDone }) {
-      const [runId,   setRunId]   = useState(null);
-      const [status,  setStatus]  = useState('idle');   // idle | running | done | error
-      const [copied,  setCopied]  = useState(false);
-      const [logs,    setLogs]    = useState('');
-      const [summary, setSummary] = useState(null);
-      const [starting,setStarting]= useState(false);
-      const logsRef = useRef(null);
-      const wsRef   = useRef(null);
+// ─── Page 3 ───────────────────────────────────────────────────────────────────
+function Page3Configure({patients,projectName,setProjectName,projectDirs,setProjectDirs,
+                         patientConfigs,setPatientConfigs,flags,setFlags,mode,setMode,
+                         patientShapes,onNext,onBack}){
+  const [dirsCreated,setDirsCreated]=useState(Object.keys(projectDirs).length>0);
+  const [creating,setCreating]=useState(false);
+  const [createError,setCreateError]=useState('');
+  const [configMeta,setConfigMeta]=useState(null);
+  const [applyToAll,setApplyToAll]=useState(false);
+  const [openCards,setOpenCards]=useState({});
+  const saveTimers=useRef({});
 
-      const resetForRetry = () => {
-        wsRef.current?.close();
-        setRunId(null);
-        setStatus('idle');
-        setLogs('');
-        setSummary(null);
-      };
+  useEffect(()=>{
+    apiFetch('/api/config-template').then(r=>r.json()).then(d=>{
+      setConfigMeta(d);
+      if(Object.keys(patientConfigs).length===0&&d.template){
+        const init={};patients.forEach(p=>{init[p.name]=JSON.parse(JSON.stringify(d.template));});
+        setPatientConfigs(init);
+      }
+    }).catch(console.error);
+  },[]);
 
-      // Auto-scroll log panel
-      useEffect(() => {
-        if (logsRef.current) {
-          logsRef.current.scrollTop = logsRef.current.scrollHeight;
+  const createDirs=async()=>{
+    if(!projectName.trim()){setCreateError('Enter a project name first.');return;}
+    setCreating(true);setCreateError('');
+    try{
+      const res=await apiFetch('/api/create-output-dirs',{method:'POST',body:JSON.stringify({project_name:projectName.trim(),patients})});
+      if(!res.ok){const err=await res.json();setCreateError(err.detail||'Failed');setCreating(false);return;}
+      const data=await res.json();
+      setProjectDirs(data.dirs);setDirsCreated(true);
+      setPatientConfigs(prev=>{const u={...prev};Object.keys(u).forEach(nm=>{u[nm]={...u[nm],output_folder_title:projectName.trim()};});return u;});
+    }catch(e){setCreateError('Error: '+e.message);}
+    setCreating(false);
+  };
+
+  const handleConfigChange=useCallback((patientName,path,value)=>{
+    setPatientConfigs(prev=>{
+      const tmpl=configMeta?.template||{};
+      const updated={...prev};
+      updated[patientName]=deepSet(updated[patientName]||tmpl,path,value);
+      const isP1Roi=path[0]==='phase_1'&&path[path.length-1]==='roi_subset';
+      if(isP1Roi){
+        const p1Set=new Set(value);
+        const trimRoi=(cfg,ph,st)=>{const cur=cfg?.[ph]?.[st]?.roi_subset;return Array.isArray(cur)?deepSet(cfg,[ph,st,'roi_subset'],cur.filter(r=>p1Set.has(r))):cfg;};
+        updated[patientName]=trimRoi(updated[patientName],'phase_2','simind_stage');
+        updated[patientName]=trimRoi(updated[patientName],'phase_2','opengate_stage');
+        // Also trim specs keys that are no longer in roi_subset
+        const specs=updated[patientName]?.phase_1?.synthetic_lesions_stage?.specs;
+        if(specs&&typeof specs==='object'){
+          const newSpecs={};Object.keys(specs).forEach(k=>{if(p1Set.has(k))newSpecs[k]=specs[k];});
+          updated[patientName]=deepSet(updated[patientName],['phase_1','synthetic_lesions_stage','specs'],Object.keys(newSpecs).length?newSpecs:null);
         }
-      }, [logs]);
-
-      // Warn before leaving while running
-      useEffect(() => {
-        const handler = (e) => {
-          if (status === 'running') {
-            e.preventDefault();
-            e.returnValue = 'A pipeline run is in progress. Are you sure you want to leave?';
+      }
+      const toSync=applyToAll?patients.filter(p=>p.name!==patientName):[];
+      toSync.forEach(p=>{
+        updated[p.name]=deepSet(updated[p.name]||tmpl,path,value);
+        if(isP1Roi){
+          const p1Set=new Set(value);
+          const trimRoi=(cfg,ph,st)=>{const cur=cfg?.[ph]?.[st]?.roi_subset;return Array.isArray(cur)?deepSet(cfg,[ph,st,'roi_subset'],cur.filter(r=>p1Set.has(r))):cfg;};
+          updated[p.name]=trimRoi(updated[p.name],'phase_2','simind_stage');
+          updated[p.name]=trimRoi(updated[p.name],'phase_2','opengate_stage');
+          const specs=updated[p.name]?.phase_1?.synthetic_lesions_stage?.specs;
+          if(specs&&typeof specs==='object'){
+            const ns={};Object.keys(specs).forEach(k=>{if(p1Set.has(k))ns[k]=specs[k];});
+            updated[p.name]=deepSet(updated[p.name],['phase_1','synthetic_lesions_stage','specs'],Object.keys(ns).length?ns:null);
           }
-        };
-        window.addEventListener('beforeunload', handler);
-        return () => window.removeEventListener('beforeunload', handler);
-      }, [status]);
-
-      // Extract current patient from log
-      const currentPatient = useMemo(() => {
-        const matches = [...logs.matchAll(/\[VTT\] ── Processing CT (\d+)\/(\d+): (.+?) ──/g)];
-        if (!matches.length) return null;
-        const last = matches[matches.length - 1];
-        return { index: parseInt(last[1]), total: parseInt(last[2]), name: last[3].trim() };
-      }, [logs]);
-
-      const startRun = async () => {
-        setStarting(true);
-        try {
-          const body = {
-            ct_dir: ctDir,
-            config,
-            flags,
-            mode,
-            per_patient_configs: sameConfig ? null : perPatientConfigs,
-          };
-          const res = await apiFetch('/api/run', { method: 'POST', body: JSON.stringify(body) });
-          const id = res.run_id;
-          setRunId(id);
-          setStatus('running');
-
-          // Open WebSocket
-          const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-          const ws = new WebSocket(`${proto}//${location.host}/ws/${id}`);
-          wsRef.current = ws;
-
-          let doneReceived = false;
-          ws.onmessage = (e) => {
-            const msg = JSON.parse(e.data);
-            if (msg.type === 'log') {
-              setLogs(prev => prev + msg.data);
-            } else if (msg.type === 'done') {
-              doneReceived = true;
-              setStatus(msg.status);
-              setSummary(msg);
-              ws.close();
-              onDone(msg);
-            }
-          };
-          ws.onerror = () => {
-            if (!doneReceived) {
-              setStatus('error');
-              setLogs(prev => prev + '\n[WebSocket error — connection lost]\n');
-            }
-          };
-        } catch (e) {
-          setStatus('error');
-          setLogs(prev => prev + `\n[Error starting run] ${e.message}\n`);
-        } finally {
-          setStarting(false);
         }
-      };
+      });
+      const saveOne=async(nm)=>{const dir=projectDirs[nm];if(!dir)return;try{await apiFetch('/api/save-patient-config',{method:'POST',body:JSON.stringify({output_dir:dir,config:updated[nm]})});}catch(e){console.error('Auto-save failed:',e);}};
+      clearTimeout(saveTimers.current[patientName]);
+      saveTimers.current[patientName]=setTimeout(()=>{saveOne(patientName);toSync.forEach(p=>saveOne(p.name));},500);
+      return updated;
+    });
+  },[patients,projectDirs,applyToAll,configMeta]);
 
-      useEffect(() => () => wsRef.current?.close(), []);
+  const roiChoices=(configMeta?.roi_choices||[]).filter(r=>r!=='body');
 
-      const activeFlags = Object.entries(flags)
-        .filter(([k, v]) => v && ['spect', 'dosimetry', 'postprocess', 'synthetic_lesions'].includes(k))
-        .map(([k]) => k);
+  return(
+    <div className="max-w-4xl mx-auto px-6 py-8">
+      <div className="flex items-center gap-3 mb-6">
+        <button onClick={onBack} className="text-slate-400 hover:text-slate-600 text-sm flex items-center gap-1">← Back</button>
+        <h2 className="text-2xl font-bold text-slate-900">Configure Pipeline</h2>
+      </div>
 
-      return (
-        <div className="space-y-4">
-          {/* Pre-run summary card */}
-          {status === 'idle' && (
-            <div className="bg-white rounded-xl border border-gray-200 p-7 text-center">
-              <div className="text-5xl mb-4">🚀</div>
-              <h3 className="text-lg font-semibold text-gray-900 mb-2">Ready to Run</h3>
-              <div className="text-sm text-gray-500 space-y-1 mb-7">
-                <p><strong>{patients.length}</strong> patient{patients.length !== 1 ? 's' : ''} · Mode: <strong>{mode}</strong></p>
-                <p>
-                  Stages:&nbsp;
-                  <strong>
-                    {activeFlags.length > 0
-                      ? ['Segmentation + PBPK', ...activeFlags].join(', ')
-                      : 'Segmentation + PBPK only'}
-                  </strong>
-                </p>
-                {!sameConfig && <p className="text-indigo-600">Per-patient configurations enabled</p>}
-              </div>
-              <button
-                className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-10 py-3 rounded-xl text-base transition-colors disabled:opacity-50 flex items-center gap-2 mx-auto"
-                onClick={startRun}
-                disabled={starting}
-              >
-                {starting ? <><Spinner /> Starting…</> : 'Run Pipeline'}
+      {/* Project name */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-5 shadow-sm">
+        <h3 className="font-semibold text-slate-800 mb-1">Project Name</h3>
+        <p className="text-xs text-slate-500 mb-4">Creates <code className="bg-slate-100 px-1 rounded">{'{name}'}_CT_1</code>, … directories in the repo root.</p>
+        <div className="flex gap-3 items-start">
+          <input type="text" value={projectName} onChange={e=>setProjectName(e.target.value)}
+            onKeyDown={e=>{if(e.key==='Enter'&&!dirsCreated)createDirs();}} placeholder="e.g. my_study" disabled={dirsCreated}
+            className="flex-1 px-3 py-2 border border-slate-300 rounded-xl terminal-font text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-400"/>
+          {!dirsCreated
+            ?<button onClick={createDirs} disabled={creating||!projectName.trim()}
+                className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2 rounded-xl font-semibold text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm whitespace-nowrap">
+                {creating?<><span className="spin">⟳</span>&nbsp;Creating…</>:'Create Output Dirs'}
               </button>
-            </div>
-          )}
-
-          {/* Progress + status bar */}
-          {status !== 'idle' && (
-            <div className="bg-white rounded-xl border border-gray-200 p-4">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  {status === 'running' && <span className="w-2.5 h-2.5 bg-green-500 rounded-full pulsing" />}
-                  {status === 'done'    && <span className="w-2.5 h-2.5 bg-green-500 rounded-full" />}
-                  {status === 'error'   && <span className="w-2.5 h-2.5 bg-red-500 rounded-full" />}
-                  <span className="text-sm font-semibold text-gray-800">
-                    {status === 'running' ? 'Pipeline running…' :
-                     status === 'done'    ? '✓ Pipeline complete' :
-                                           '✗ Pipeline finished with errors'}
-                  </span>
-                </div>
-                {summary && (
-                  <span className="text-sm text-gray-500">{summary.elapsed_str}</span>
-                )}
-                {status === 'running' && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-amber-600 font-medium">⚠ stops entire run</span>
-                    <button
-                      className="text-xs font-semibold text-white bg-red-500 hover:bg-red-600 px-3 py-1.5 rounded-lg transition-colors"
-                      onClick={async () => {
-                        if (!runId) return;
-                        await fetch(`/api/runs/${runId}/stop`, { method: 'POST' });
-                      }}
-                    >
-                      ⏹ Stop
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {currentPatient && status === 'running' && (
-                <div>
-                  <div className="flex justify-between text-xs text-gray-500 mb-1">
-                    <span className="truncate max-w-xs">Processing: <strong>{currentPatient.name}</strong></span>
-                    <span className="flex-shrink-0 ml-2">{currentPatient.index} / {currentPatient.total}</span>
-                  </div>
-                  <div className="w-full bg-gray-200 rounded-full h-1.5">
-                    <div
-                      className="bg-indigo-600 h-1.5 rounded-full progress-bar"
-                      style={{ width: `${(currentPatient.index / currentPatient.total) * 100}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Log panel */}
-          {status !== 'idle' && (
-            <div className="rounded-xl overflow-hidden border border-gray-700">
-              <div className="bg-gray-800 px-3 py-1.5 flex items-center justify-between">
-                <span className="text-xs text-gray-400 font-mono">pipeline output</span>
-                <button
-                  onClick={() => {
-                    navigator.clipboard.writeText(logs || '').then(() => {
-                      setCopied(true);
-                      setTimeout(() => setCopied(false), 2000);
-                    });
-                  }}
-                  className="text-xs text-gray-400 hover:text-white flex items-center gap-1 px-2 py-0.5 rounded hover:bg-gray-700 transition-colors"
-                >
-                  {copied ? '✓ Copied' : '⎘ Copy'}
-                </button>
-              </div>
-              <div
-                ref={logsRef}
-                className="log-panel bg-gray-950 p-4 h-96 overflow-y-auto text-xs leading-5"
-                style={{ color: '#abb2bf' }}
-                dangerouslySetInnerHTML={{ __html:
-                  logs
-                    ? ansiToHtml(logs)
-                    : '<span style="color:#5c6370">Waiting for output…</span>'
-                }}
-              />
-            </div>
-          )}
-
-          {/* Error panel — shown when pipeline fails */}
-          {status === 'error' && (() => {
-            // Show the last 40 lines of raw output so the user can see exactly what failed
-            const allLines = logs.split('\n');
-            const tail = allLines.slice(Math.max(0, allLines.length - 40));
-            // Trim leading blank lines from the tail
-            while (tail.length > 0 && !tail[0].trim()) tail.shift();
-            return (
-              <div className="bg-red-50 border border-red-200 rounded-xl p-4 space-y-3">
-                <div className="flex items-start gap-2">
-                  <span className="text-red-500 text-lg leading-none mt-0.5">✗</span>
-                  <div className="flex-1">
-                    <p className="text-sm font-semibold text-red-800">Pipeline failed</p>
-                    <p className="text-xs text-red-600 mt-0.5">
-                      Last output (scroll the log panel above for full context):
-                    </p>
-                  </div>
-                </div>
-                <div
-                  className="bg-gray-950 rounded-lg p-3 font-mono text-xs overflow-x-auto overflow-y-auto max-h-56 leading-5"
-                  style={{ color: '#abb2bf' }}
-                  dangerouslySetInnerHTML={{ __html:
-                    tail.length
-                      ? ansiToHtml(tail.join('\n'))
-                      : '<span style="color:#5c6370">(no output captured — check that main.py exists and your environment is activated)</span>'
-                  }}
-                />
-                <button
-                  className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2.5 rounded-xl transition-colors text-sm"
-                  onClick={resetForRetry}
-                >
-                  ↩ Fix config and try again
-                </button>
-              </div>
-            );
-          })()}
+            :<span className="flex items-center gap-1.5 text-emerald-600 font-semibold text-sm px-3 py-2 whitespace-nowrap">✓ Created</span>
+          }
         </div>
-      );
-    }
+        {createError&&<p className="mt-2 text-sm text-red-600">{createError}</p>}
+        {dirsCreated&&<div className="mt-3 space-y-0.5">{patients.map((p,i)=><p key={p.name} className="text-xs terminal-font text-slate-400">✓ {projectDirs[p.name]||`${projectName}_CT_${i+1}`}</p>)}</div>}
+      </div>
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Step 6 — Completion Summary
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function Step6Summary({ summary, patients, flags, config, onRestart }) {
-      if (!summary) return (
-        <div className="text-center py-16 text-gray-400">No summary available.</div>
-      );
-
-      const success = summary.status === 'done';
-      const outputTitle = summary.output_title || config?.output_folder_title || '—';
-      const outputRoot  = summary.output_root  || '.';
-
-      const stages = [
-        { label: 'Segmentation + ROI Unification', always: true },
-        { label: 'PBPK TAC Generation',             always: true },
-        { label: 'Synthetic Lesion Generation',     key: 'synthetic_lesions' },
-        { label: 'SPECT Simulation (SIMIND)',        key: 'spect' },
-        { label: 'Dosimetry Simulation (OpenGATE)', key: 'dosimetry' },
-        { label: 'Post-Processing',                  key: 'postprocess' },
-      ];
-
-      return (
-        <div className="space-y-4">
-          {/* Status banner */}
-          <div className={`rounded-xl border p-5 ${success ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
-            <div className="flex items-start gap-4">
-              <span className="text-4xl">{success ? '✅' : '❌'}</span>
-              <div>
-                <h3 className="text-lg font-bold text-gray-900">
-                  {success ? 'Pipeline Completed Successfully' : 'Pipeline Finished with Errors'}
-                </h3>
-                <p className="text-sm text-gray-600 mt-0.5">
-                  Total time: <strong>{summary.elapsed_str}</strong>
-                </p>
-                <p className="text-sm text-gray-500 mt-1">
-                  Output:&nbsp;
-                  <code className="bg-white/60 px-1.5 py-0.5 rounded text-indigo-700 font-mono text-xs break-all">
-                    {outputRoot}/{outputTitle}_CT_0{'/'}&nbsp;…
-                  </code>
-                </p>
-              </div>
-            </div>
-          </div>
-
-          {/* Outputs generated */}
-          <div className="bg-white rounded-xl border border-gray-200 p-5">
-            <h3 className="text-base font-semibold text-gray-900 mb-3">Outputs Generated</h3>
-            <div className="space-y-2">
-              {stages.map(({ label, always, key }) => {
-                const ran = always || (key && flags[key]);
-                return (
-                  <div key={label} className={`flex items-center gap-2.5 text-sm ${ran ? 'text-gray-800' : 'text-gray-300'}`}>
-                    <span className={`flex-shrink-0 ${ran ? 'text-green-500' : 'text-gray-300'}`}>
-                      {ran ? '✓' : '—'}
-                    </span>
-                    <span>{label}</span>
-                  </div>
-                );
-              })}
-            </div>
-            <div className="mt-4 p-3 bg-gray-50 rounded-lg text-xs text-gray-500 leading-5 break-all">
-              <span className="font-medium">Output location:</span><br />
-              <code className="font-mono text-indigo-700">{outputRoot}/{outputTitle}_CT_0/</code><br />
-              <code className="font-mono text-indigo-700">{outputRoot}/{outputTitle}_CT_1/</code>, …
-            </div>
-          </div>
-
-          {/* Per-patient timing */}
-          {summary.patient_times && Object.keys(summary.patient_times).length > 0 && (
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <h3 className="text-base font-semibold text-gray-900 mb-3">Per-Patient Timing</h3>
-              <div className="space-y-2">
-                {Object.entries(summary.patient_times).map(([name, times]) => (
-                  <div key={name} className="flex items-center justify-between p-2.5 bg-gray-50 rounded-lg">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="text-sm text-gray-400 flex-shrink-0">
-                        {times.duration ? '✓' : '⏳'}
-                      </span>
-                      <span className="text-sm text-gray-700 truncate">{name}</span>
-                    </div>
-                    <span className="text-sm font-mono text-gray-500 flex-shrink-0 ml-3">
-                      {times.duration || '—'}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <button
-            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl transition-colors"
-            onClick={onRestart}
-          >
-            Start a New Run
-          </button>
-        </div>
-      );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Stepper
-    // ─────────────────────────────────────────────────────────────────────────
-
-    const STEPS = [
-      { n: 1, label: 'Configure' },
-      { n: 2, label: 'CT Input' },
-      { n: 3, label: 'Preview' },
-      { n: 4, label: 'Per-Patient' },
-      { n: 5, label: 'Run' },
-      { n: 6, label: 'Summary' },
-    ];
-
-    function Stepper({ current }) {
-      return (
-        <div className="flex items-start">
-          {STEPS.map((s, i) => (
-            <React.Fragment key={s.n}>
-              <div className="flex flex-col items-center" style={{ minWidth: 52 }}>
-                <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0
-                  ${current === s.n ? 'bg-indigo-600 text-white ring-4 ring-indigo-100' :
-                    current > s.n  ? 'bg-green-500 text-white' :
-                                     'bg-gray-200 text-gray-500'}`}
-                >
-                  {current > s.n ? '✓' : s.n}
-                </div>
-                <span className={`text-xs mt-1.5 text-center leading-tight
-                  ${current === s.n ? 'text-indigo-600 font-semibold' : 'text-gray-400'}`}>
-                  {s.label}
-                </span>
-              </div>
-              {i < STEPS.length - 1 && (
-                <div className={`flex-1 h-0.5 mt-4 mx-1 ${current > s.n ? 'bg-green-400' : 'bg-gray-200'}`} />
-              )}
-            </React.Fragment>
+      {/* Pipeline Options */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-5 shadow-sm">
+        <h3 className="font-semibold text-slate-800 mb-1">Pipeline Options</h3>
+        <p className="text-xs text-slate-500 mb-4">Select which stages to run.</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-5">
+          {CLI_FLAGS.map(({key,label,desc})=>(
+            <label key={key} className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors select-none
+              ${flags[key]?'border-blue-400 bg-blue-50':'border-slate-200 hover:border-slate-300 bg-white'}`}>
+              <input type="checkbox" checked={!!flags[key]} onChange={e=>setFlags(prev=>({...prev,[key]:e.target.checked}))}
+                className="mt-0.5 w-4 h-4 accent-blue-600 flex-shrink-0"/>
+              <div><p className="font-semibold text-slate-800 text-sm">{label}</p>
+                <p className="text-xs text-slate-500 mt-0.5 leading-snug">{desc}</p></div>
+            </label>
           ))}
         </div>
-      );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // App root
-    // ─────────────────────────────────────────────────────────────────────────
-
-    function App() {
-      const [step, setStep] = useState(1);
-
-      // Config-template data
-      const [configTemplate, setConfigTemplate] = useState(null);
-      const [fieldDescs,     setFieldDescs]     = useState({});
-      const [templateError,  setTemplateError]  = useState('');
-
-      // Step 1 state
-      const [config, setConfig] = useState(null);
-      const [flags,  setFlags]  = useState({
-        spect: false, dosimetry: false, postprocess: false,
-        synthetic_lesions: false, logging_on: true, save_ct_scan: false, save_config: false,
-      });
-      const [mode, setMode] = useState('PRODUCTION');
-
-      // Step 2 state
-      const [ctDir,    setCtDir]    = useState('');
-      const [patients, setPatients] = useState([]);
-
-      // Step 4 state
-      const [sameConfig,         setSameConfig]         = useState(true);
-      const [perPatientConfigs,  setPerPatientConfigs]  = useState({});
-
-      // Step 5/6 state
-      const [summary, setSummary] = useState(null);
-
-      // Load config template on mount
-      useEffect(() => {
-        apiFetch('/api/config-template')
-          .then(res => {
-            setConfigTemplate(res.template);
-            setConfig(deepClone(res.template));
-            setFieldDescs(res.field_descriptions || {});
-          })
-          .catch(e => setTemplateError(e.message));
-      }, []);
-
-      const next = () => setStep(s => Math.min(s + 1, 6));
-
-      const restart = () => {
-        setStep(1);
-        setConfig(deepClone(configTemplate));
-        setFlags({ spect: false, dosimetry: false, postprocess: false, synthetic_lesions: false, logging_on: true, save_ct_scan: false, save_config: false });
-        setMode('PRODUCTION');
-        setCtDir('');
-        setPatients([]);
-        setSameConfig(true);
-        setPerPatientConfigs({});
-        setSummary(null);
-      };
-
-      return (
-        <div className="min-h-screen bg-gray-50">
-          {/* Header */}
-          <header className="bg-white border-b border-gray-200 sticky top-0 z-40">
-            <div className="max-w-3xl mx-auto px-6 py-4 flex items-center gap-4">
-              <div className="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center text-white text-lg flex-shrink-0">
-                ⚛
-              </div>
-              <div className="flex-1 min-w-0">
-                <h1 className="text-lg font-bold text-gray-900 leading-tight">Virtual Theranostic Trials</h1>
-                <p className="text-xs text-gray-400 leading-tight">Theranostic Digital Twin Pipeline · BC Cancer</p>
-              </div>
-            </div>
-          </header>
-
-          <main className="max-w-3xl mx-auto px-6 py-7">
-            {/* Stepper */}
-            <div className="mb-8">
-              <Stepper current={step} />
-            </div>
-
-            {/* Template load error */}
-            {templateError && (
-              <Alert type="error">
-                <strong>Could not load configuration template:</strong> {templateError}
-                <br />
-                Make sure the server is running inside the activated conda environment (<code>conda activate tdt_env</code>).
-              </Alert>
-            )}
-
-            {/* Step content */}
-            {step === 1 && (
-              <Step1Config
-                config={config}
-                setConfig={setConfig}
-                flags={flags}
-                setFlags={setFlags}
-                mode={mode}
-                setMode={setMode}
-                descriptions={fieldDescs}
-                onNext={next}
-              />
-            )}
-
-            {step === 2 && (
-              <Step2CTUpload
-                ctDir={ctDir}
-                setCtDir={setCtDir}
-                patients={patients}
-                setPatients={setPatients}
-                onNext={next}
-              />
-            )}
-
-            {step === 3 && (
-              <Step3Preview
-                patients={patients}
-                onNext={patients.length <= 1 ? () => setStep(5) : next}
-              />
-            )}
-
-            {step === 4 && (
-              <Step4PerPatient
-                patients={patients}
-                config={config}
-                flags={flags}
-                mode={mode}
-                descriptions={fieldDescs}
-                sameConfig={sameConfig}
-                setSameConfig={setSameConfig}
-                perPatientConfigs={perPatientConfigs}
-                setPerPatientConfigs={setPerPatientConfigs}
-                onNext={next}
-              />
-            )}
-
-            {step === 5 && (
-              <Step5Run
-                config={config}
-                flags={flags}
-                mode={mode}
-                ctDir={ctDir}
-                patients={patients}
-                sameConfig={sameConfig}
-                perPatientConfigs={perPatientConfigs}
-                onDone={(s) => { setSummary(s); if (s.status === 'done') next(); }}
-              />
-            )}
-
-            {step === 6 && (
-              <Step6Summary
-                summary={summary}
-                patients={patients}
-                flags={flags}
-                config={config}
-                onRestart={restart}
-              />
-            )}
-          </main>
+        <div className="border-t border-slate-100 pt-4 flex items-center gap-4 flex-wrap">
+          <span className="text-sm font-semibold text-slate-700 flex-shrink-0">Run Mode</span>
+          <div className="flex gap-2">
+            {['PRODUCTION','DEBUG'].map(m=>(
+              <button key={m} onClick={()=>setMode(m)}
+                className={`px-5 py-1.5 rounded-lg text-sm font-semibold border transition-colors
+                  ${mode===m?(m==='PRODUCTION'?'bg-emerald-600 text-white border-emerald-600':'bg-amber-500 text-white border-amber-500'):'bg-white text-slate-600 border-slate-300 hover:border-slate-400'}`}>
+                {m}
+              </button>
+            ))}
+          </div>
+          <span className="text-xs text-slate-400">{mode==='DEBUG'?'Reduced iterations — faster testing':'Full production-quality simulation'}</span>
         </div>
-      );
-    }
+      </div>
 
-    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
-  </script>
+      {/* Per-patient config */}
+      {dirsCreated&&configMeta&&(
+        <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+          <div className="flex items-center justify-between mb-1">
+            <h3 className="font-semibold text-slate-800">Per-Patient Configuration</h3>
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input type="checkbox" checked={applyToAll} onChange={e=>setApplyToAll(e.target.checked)} className="w-4 h-4 accent-blue-600"/>
+              <span className="text-slate-600 text-sm">Sync all patients</span>
+            </label>
+          </div>
+          <p className="text-xs text-slate-400 mb-4">Changes auto-save to each config.json. Phase 2 ROI pickers and lesion specs are constrained to Phase 1 selection.</p>
+          <div className="space-y-2">
+            {patients.map((p,i)=>{
+              const cfg=patientConfigs[p.name]||configMeta.template;
+              const cardOpen=!!openCards[p.name];
+              const shape=patientShapes[p.name]||null;
+              // Phase 1 segmentation roi_subset is the source of truth for all ROI constraints
+              const p1RoiSubset=cfg?.phase_1?.segmentation_stage?.roi_subset??null;
+              return(
+                <div key={p.name} className="border border-slate-200 rounded-xl overflow-hidden">
+                  <button onClick={()=>setOpenCards(prev=>({...prev,[p.name]:!prev[p.name]}))}
+                    className="w-full flex items-center justify-between px-4 py-3 bg-slate-50 hover:bg-slate-100 transition-colors text-left">
+                    <span className="font-semibold text-slate-700 text-sm">CT_{i+1} — {p.name}</span>
+                    <span className="text-slate-400 text-xs">{cardOpen?'▲':'▼'}</span>
+                  </button>
+                  {cardOpen&&(
+                    <div className="p-4 space-y-3">
+                      {['phase_1','phase_2','phase_3'].map(pk=>cfg[pk]?(
+                        <PhaseSection key={pk} phaseKey={pk} phaseData={cfg[pk]}
+                          patientName={p.name} onChange={handleConfigChange}
+                          descriptions={configMeta.field_descriptions||{}}
+                          pipelineOptions={configMeta.pipeline_options||{}}
+                          roiChoices={roiChoices}
+                          // Pass p1RoiSubset for ALL phases — PhaseSection skips it for segmentation_stage
+                          phase1RoiSubset={p1RoiSubset}
+                          patientShape={shape}/>
+                      ):null)}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <div className="mt-6 flex justify-end">
+        <button onClick={onNext} disabled={!dirsCreated}
+          className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 rounded-xl font-semibold text-base transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm">
+          Continue to Run →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Config Summary Card (per patient) ───────────────────────────────────────
+function ConfigSummaryCard({patient,cfg,flags,projectDir}){
+  const ph1=cfg?.phase_1;const ph2=cfg?.phase_2;const ph3=cfg?.phase_3;
+  const tac=ph1?.pbpk_tac_stage;
+  const synth=ph1?.synthetic_lesions_stage;
+  const simind=ph2?.simind_stage;
+  const og=ph2?.opengate_stage;
+  const pp=ph3?.spect_postprocess_stage;
+
+  const kv=(label,val)=>{
+    if(val===undefined||val===null)return null;
+    const display=Array.isArray(val)?(val.length?val.join(', '):'—'):String(val);
+    return(
+      <div className="flex gap-2 text-xs py-0.5">
+        <span className="text-slate-400 w-36 shrink-0">{label}</span>
+        <span className="text-slate-700 font-medium break-all">{display}</span>
+      </div>
+    );
+  };
+
+  const Section=({title,children})=>(
+    <div className="mb-3">
+      <p className="text-[10px] uppercase tracking-widest text-slate-400 font-semibold mb-1">{title}</p>
+      <div className="bg-slate-50 rounded-xl px-3 py-2 space-y-0.5">{children}</div>
+    </div>
+  );
+
+  const Badge=({label,color})=>{
+    const c={blue:'bg-blue-100 text-blue-700',purple:'bg-purple-100 text-purple-700',
+              teal:'bg-teal-100 text-teal-700',orange:'bg-orange-100 text-orange-700'}[color]||'bg-slate-100 text-slate-600';
+    return <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${c}`}>{label}</span>;
+  };
+
+  return(
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <span className="font-semibold text-slate-800 text-base">{patient.name}</span>
+        {projectDir&&<span className="text-[10px] terminal-font text-slate-400 truncate max-w-xs">{projectDir}</span>}
+      </div>
+      <div className="flex flex-wrap gap-1.5 mb-4">
+        {flags.spect&&<Badge label="SPECT Simulation" color="blue"/>}
+        {flags.dosimetry&&<Badge label="Dosimetry" color="purple"/>}
+        {flags.postprocess&&<Badge label="Post-Processing" color="teal"/>}
+        {flags.synthetic_lesions&&<Badge label="Synthetic Lesions" color="orange"/>}
+      </div>
+
+      {tac&&(
+        <Section title="PBPK TAC (Phase 1)">
+          {kv('Model type', tac.ModelType||tac.model_type)}
+          {kv('Isotope', tac.Isotope||tac.isotope)}
+          {kv('ROI subset', tac.roi_subset)}
+        </Section>
+      )}
+      {flags.synthetic_lesions&&synth&&(
+        <Section title="Synthetic Lesions (Phase 1)">
+          {kv('Organ specs', synth.specs?Object.keys(synth.specs).join(', '):'—')}
+        </Section>
+      )}
+      {flags.spect&&simind&&(
+        <Section title="SIMIND Simulation (Phase 2)">
+          {kv('Collimator', simind.Collimator||simind.collimator)}
+          {kv('Projections', simind.NumProjections||simind.num_projections)}
+          {kv('ROI subset', simind.roi_subset)}
+        </Section>
+      )}
+      {flags.dosimetry&&og&&(
+        <Section title="OpenGATE Dosimetry (Phase 2)">
+          {kv('ROI subset', og.roi_subset)}
+        </Section>
+      )}
+      {flags.postprocess&&pp&&(
+        <Section title="Post-Processing (Phase 3)">
+          {kv('Algorithm', pp.ReconstructionAlgorithm||pp.reconstruction_algorithm)}
+          {kv('Subsets', pp.Subsets||pp.num_subsets)}
+          {kv('Iterations', pp.Iterations||pp.num_iterations)}
+          {kv('Apply TAC', pp.apply_tac?'Yes':'No')}
+          {kv('Apply Noise', pp.apply_poisson_noise?'Yes':'No')}
+          {kv('Apply Reconstruction', pp.apply_reconstruction?'Yes':'No')}
+        </Section>
+      )}
+    </div>
+  );
+}
+
+// ─── Page 4 ───────────────────────────────────────────────────────────────────
+function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,onBack}){
+  const [status,setStatus]=useState('idle'); // idle | starting | launched | error
+  const [errorMsg,setErrorMsg]=useState('');
+  const [validation,setValidation]=useState(null);
+
+  // Pre-run validation
+  useEffect(()=>{
+    const issues=[];
+    if(!projectName.trim()) issues.push('Project name is empty');
+    if(!patients.length)    issues.push('No patients selected');
+    patients.forEach(p=>{
+      if(!projectDirs[p.name]) issues.push(`Missing output directory for "${p.name}"`);
+      const cfg=patientConfigs?.[p.name];
+      if(!cfg) return;
+      // FrameStartTimes / FrameDurations
+      const fst=cfg?.phase_3?.spect_postprocess_stage?.FrameStartTimes;
+      const fd =cfg?.phase_3?.spect_postprocess_stage?.FrameDurations;
+      if(Array.isArray(fst)&&Array.isArray(fd)){
+        if(fst.length!==fd.length) issues.push(`[${p.name}] FrameStartTimes (${fst.length}) ≠ FrameDurations (${fd.length})`);
+        fst.forEach((v,i)=>{if(typeof v!=='number'||isNaN(v)) issues.push(`[${p.name}] FrameStartTimes[${i}] must be a number`);});
+        fd.forEach((v,i)=>{ if(typeof v!=='number'||isNaN(v)) issues.push(`[${p.name}] FrameDurations[${i}] must be a number`);});
+      }
+      // Synthetic lesions: at least 1 spec required
+      if(flags.synthetic_lesions){
+        const specs=cfg?.phase_1?.synthetic_lesions_stage?.specs;
+        if(!specs||typeof specs!=='object'||Object.keys(specs).length===0)
+          issues.push(`[${p.name}] Synthetic Lesions is ON but no organ specs are configured — add at least one spec in Phase 1`);
+      }
+      // Post-processing + SPECT: at least one option enabled
+      if(flags.postprocess&&flags.spect){
+        const pp=cfg?.phase_3?.spect_postprocess_stage;
+        if(pp&&!pp.apply_tac&&!pp.apply_poisson_noise&&!pp.apply_reconstruction)
+          issues.push(`[${p.name}] Post-Processing + SPECT: enable at least one of Apply TAC, Apply Noise, or Apply Reconstruction`);
+      }
+      // Dosimetry: at least one ROI in opengate
+      if(flags.dosimetry){
+        const roi=cfg?.phase_2?.opengate_stage?.roi_subset;
+        if(!Array.isArray(roi)||roi.length===0)
+          issues.push(`[${p.name}] Dosimetry is ON but no ROIs are selected in the OpenGATE stage`);
+      }
+    });
+    setValidation({ok:!issues.length,issues});
+  },[patientConfigs,flags,patients,projectName,projectDirs]);
+
+  const startRun=async()=>{
+    setStatus('starting');setErrorMsg('');
+    try{
+      const res=await apiFetch('/api/run',{method:'POST',body:JSON.stringify({project_name:projectName,patients,project_dirs:projectDirs,flags,mode})});
+      if(!res.ok){const err=await res.json();setErrorMsg(err.detail||'Unknown server error');setStatus('error');return;}
+      setStatus('launched');
+    }catch(e){setErrorMsg(e.message);setStatus('error');}
+  };
+
+  const canRun=validation?.ok&&status==='idle';
+
+  // ── Launched screen ────────────────────────────────────────────────────────
+  if(status==='launched'){
+    return(
+      <div className="max-w-lg mx-auto px-6 py-24 text-center">
+        <h2 className="text-2xl font-bold text-slate-900 mb-3">Pipeline Started</h2>
+        <p className="text-slate-500 mb-8 leading-relaxed">
+          The pipeline is now running in the terminal where you launched{' '}
+          <code className="bg-slate-100 px-1.5 py-0.5 rounded text-sm font-mono">python run_server.py</code>.
+          Monitor progress there.
+        </p>
+        <div className="bg-slate-100 border border-slate-200 rounded-2xl px-6 py-5 mb-8 text-left">
+          <p className="text-slate-700 font-semibold mb-2 text-sm">Output directories</p>
+          {patients.map(p=>(
+            <div key={p.name} className="text-xs terminal-font text-slate-500 break-all mb-1">
+              <span className="font-semibold text-slate-600">{p.name}:</span> {projectDirs[p.name]||'—'}
+            </div>
+          ))}
+        </div>
+        <p className="text-slate-500 text-sm">You can close this tab — the pipeline will continue running.</p>
+      </div>
+    );
+  }
+
+  // ── Main review + run screen ───────────────────────────────────────────────
+  return(
+    <div className="max-w-4xl mx-auto px-6 py-8">
+      <div className="flex items-center gap-3 mb-6">
+        <button onClick={onBack}
+          className="text-slate-400 hover:text-slate-600 text-sm flex items-center gap-1">
+          ← Back
+        </button>
+        <h2 className="text-2xl font-bold text-slate-900">Review & Run</h2>
+      </div>
+
+      {/* Validation panel */}
+      {validation&&(
+        <div className={`rounded-2xl p-4 mb-6 border ${validation.ok?'bg-emerald-50 border-emerald-200':'bg-red-50 border-red-200'}`}>
+          <p className={`font-semibold mb-2 ${validation.ok?'text-emerald-800':'text-red-700'}`}>
+            {validation.ok?'✓ All checks passed — ready to run':'✗ Fix these issues before running'}
+          </p>
+          {validation.ok?(
+            <div className="text-sm text-emerald-700 space-y-0.5">
+              <p>· {patients.length} patient{patients.length!==1?'s':''} queued</p>
+              <p>· Mode: <span className="font-semibold">{mode}</span></p>
+              <p>· Logging: <span className="font-semibold">{flags.logging_on?'On':'Off'}</span></p>
+            </div>
+          ):(
+            <ul className="space-y-1">{validation.issues.map((iss,i)=><li key={i} className="text-sm text-red-700">· {iss}</li>)}</ul>
+          )}
+        </div>
+      )}
+
+      {/* Per-patient config summary */}
+      <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-widest mb-3">Configuration Summary</h3>
+      <div className="space-y-4 mb-8">
+        {patients.map(p=>(
+          <ConfigSummaryCard key={p.name} patient={p} cfg={patientConfigs?.[p.name]}
+            flags={flags} projectDir={projectDirs[p.name]}/>
+        ))}
+      </div>
+
+      {/* Error from API */}
+      {status==='error'&&errorMsg&&(
+        <div className="mb-4 bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-sm text-red-700">
+          <span className="font-semibold">Server error: </span>{errorMsg}
+        </div>
+      )}
+
+      {/* Run button */}
+      <button onClick={startRun} disabled={!canRun||status==='starting'}
+        className="bg-emerald-600 hover:bg-emerald-700 text-white px-10 py-3.5 rounded-xl font-semibold text-base transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm">
+        {status==='starting'?<><span className="spin">⟳</span>&nbsp;Starting…</>:'▶  Run Pipeline'}
+      </button>
+      <p className="text-xs text-slate-400 mt-2">
+        The pipeline will run in your terminal. You can close this tab once started.
+      </p>
+    </div>
+  );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+function App(){
+  const [step,setStep]=useState(1);
+  const [patients,setPatients]=useState([]);
+  const [patientShapes,setPatientShapes]=useState({});
+  const [projectName,setProjectName]=useState('');
+  const [projectDirs,setProjectDirs]=useState({});
+  const [patientConfigs,setPatientConfigs]=useState({});
+  const [mode,setMode]=useState('PRODUCTION');
+  const [flags,setFlags]=useState({spect:true,dosimetry:true,postprocess:true,synthetic_lesions:false,logging_on:true});
+
+  return(
+    <div className="min-h-screen bg-slate-50">
+      <StepBar step={step}/>
+      <div className="pb-16">
+        {step===1&&<Page1Welcome onNext={()=>setStep(2)}/>}
+        {step===2&&<Page2CTInput patients={patients} setPatients={setPatients}
+          patientShapes={patientShapes} setPatientShapes={setPatientShapes}
+          onNext={()=>setStep(3)} onBack={()=>setStep(1)}/>}
+        {step===3&&<Page3Configure patients={patients}
+          projectName={projectName} setProjectName={setProjectName}
+          projectDirs={projectDirs} setProjectDirs={setProjectDirs}
+          patientConfigs={patientConfigs} setPatientConfigs={setPatientConfigs}
+          flags={flags} setFlags={setFlags} mode={mode} setMode={setMode}
+          patientShapes={patientShapes}
+          onNext={()=>setStep(4)} onBack={()=>setStep(2)}/>}
+        {step===4&&<Page4Run patients={patients} projectName={projectName}
+          projectDirs={projectDirs} flags={flags} mode={mode}
+          patientConfigs={patientConfigs}
+          onBack={()=>setStep(3)}/>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
 </body>
 </html>

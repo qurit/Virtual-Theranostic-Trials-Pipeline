@@ -74,18 +74,37 @@ _WEB_DEPS = [
 
 
 def _ensure_deps() -> None:
-    """Install web UI dependencies if not already satisfied (no-op when up to date)."""
-    import subprocess as _sp
+    """Ensure web UI dependencies are importable.
+
+    Checks importability directly — never parses pip output.
+    If a key package is missing, installs all deps then re-execs once so
+    the fresh process can import them.  If everything is already present,
+    pip is never invoked at all.
+    """
     print("Checking web UI dependencies…", flush=True)
+    try:
+        import uvicorn      # noqa: F401
+        import fastapi      # noqa: F401
+        import multipart    # noqa: F401
+        import PIL          # noqa: F401
+        import nibabel      # noqa: F401
+        import pydicom      # noqa: F401
+        print("Dependencies OK.", flush=True)
+        return
+    except ImportError:
+        pass
+
+    print("Installing missing dependencies…", flush=True)
+    import subprocess as _sp
     result = _sp.run(
-        [sys.executable, "-m", "pip", "install", "--quiet"] + _WEB_DEPS,
-        capture_output=True, text=True,
+        [sys.executable, "-m", "pip", "install"] + _WEB_DEPS,
     )
     if result.returncode != 0:
-        print("[WARNING] Some dependencies could not be installed:")
-        print(result.stderr.strip())
-    else:
-        print("Dependencies OK.", flush=True)
+        print("[ERROR] Failed to install dependencies. Run manually:")
+        print(f"  pip install {' '.join(_WEB_DEPS)}")
+        sys.exit(1)
+    # Re-exec once so this process sees the newly installed packages.
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def main() -> None:
@@ -112,6 +131,12 @@ def main() -> None:
 
     try:
         import uvicorn
+    except ImportError:
+        print("[ERROR] uvicorn is not installed.")
+        print("  Run:  pip install 'uvicorn[standard]' fastapi")
+        sys.exit(1)
+
+    try:
         uvicorn.run(
             "web.server:app",
             host=args.host,
@@ -119,10 +144,6 @@ def main() -> None:
             reload=False,
             log_level="warning",
         )
-    except ImportError:
-        print("[ERROR] uvicorn is not installed.")
-        print("  Run:  pip install 'uvicorn[standard]' fastapi")
-        sys.exit(1)
     except KeyboardInterrupt:
         print("\nServer stopped.")
 

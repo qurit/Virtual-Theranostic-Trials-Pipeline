@@ -1,0 +1,66 @@
+{
+  // ---------------------------------------------------------------------------
+  // pipeline_options.json — Developer-controlled dropdown option lists
+  // ---------------------------------------------------------------------------
+  // Each array defines the set of values shown as a dropdown in the web UI.
+  // Extend these lists as your site gains additional collimator calibrations,
+  // isotope models, or reconstruction configurations.
+  //
+  // Comments are supported here because the server parses this file through
+  // json_minify before calling json.loads.
+  //
+  // Sections follow the pipeline phase structure for easy navigation.
+  // ---------------------------------------------------------------------------
+
+  // ==========================================================================
+  // PHASE 1 — Digital Twin & Ground Truth
+  // ==========================================================================
+
+  // ── phase_1.pbpk_tac_stage ─────────────────────────────────────────────────
+  // Pharmacokinetic model type (PyCNO).  Extend when new tumour-biology models
+  // are added to the PyCNO library.
+  "model_type": ["PSMA"],
+
+  // Radionuclide used for PBPK pharmacokinetic modelling.
+  // Each entry must correspond to a PyCNO-supported isotope and a compatible
+  // SIMIND / OpenGATE isotope definition on your system.
+  "isotope": ["lu177"],
+
+  // ==========================================================================
+  // PHASE 2 — Simulations
+  // ==========================================================================
+
+  // ── phase_2.simind_stage ───────────────────────────────────────────────────
+  // Collimator code passed to SIMIND.  Must exactly match the name of a
+  // collimator definition file (*.col) installed in your SIMIND directory.
+  // Common examples:
+  //   "si-me"   → Siemens Symbia medium-energy parallel-hole
+  //   "ge-megp" → GE Discovery MEGP parallel-hole
+  "collimator": ["si-me"],
+
+  // Number of SPECT angular projection views acquired in a full rotation.
+  // More projections improve angular sampling at the cost of longer
+  // simulated acquisition time.  Typical clinical range: 60–128.
+  "num_projections": [32, 60, 64, 72, 96, 120, 128],
+
+  // ==========================================================================
+  // PHASE 3 — Post-Processing
+  // ==========================================================================
+
+  // ── phase_3.spect_postprocess_stage ────────────────────────────────────────
+  // Iterative SPECT reconstruction algorithm.
+  // Currently only OSEM with Triple-Energy-Window (TEW) scatter correction
+  // is implemented in PyTomography.  Additional algorithms can be added when
+  // the post-processing stage is extended.
+  "reconstruction_algorithm": ["OSEM"],
+
+  // Number of ordered subsets used in each OSEM iteration.
+  // More subsets speed up convergence per iteration but may reduce stability.
+  // The product (Subsets × Iterations) governs total "equivalent iterations".
+  "num_subsets": [4, 8, 12, 16, 20, 24],
+
+  // Number of OSEM reconstruction iterations.
+  // More iterations approach a closer solution but can amplify noise when
+  // combined with high subset counts.  Typical clinical range: 2–8.
+  "num_iterations": [2, 4, 6, 8, 10, 12]
+}

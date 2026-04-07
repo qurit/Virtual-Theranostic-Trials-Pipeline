@@ -71,9 +71,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import opengate as gate
 import SimpleITK as sitk
 from json_minify import json_minify
+
+# opengate is imported lazily inside run() so that importing this module does not
+# crash the process on systems where opengate_core is unavailable (e.g. wrong OS
+# version).  All module-level references below use the global `gate` name which is
+# populated before any method that needs it is called.
+gate = None  # type: ignore[assignment]
 
 _LU177_Z = 71
 _LU177_A = 177
@@ -129,12 +134,10 @@ class OpenGateSimulationStage:
         self.save_material_label_image: bool = bool(self.stage_cfg.get("save_material_label_image", True))
         self.write_mhd_outputs: bool = bool(self.stage_cfg.get("write_mhd_outputs", False))
 
-        # Optional in-plane downsampling for Monte Carlo acceleration
-        self.xy_dim: Optional[int] = self.stage_cfg.get("xy_dim", None)
-        if self.xy_dim is not None:
-            self.xy_dim = int(self.xy_dim)
-            if self.xy_dim <= 0:
-                raise ValueError("xy_dim must be a positive integer")
+        # Optional downsampling — supports xyz_dim=[x,y,z] tuple or legacy xy_dim scalar
+        _xyz = self.stage_cfg.get("xyz_dim", None)
+        _xy  = self.stage_cfg.get("xy_dim", None)
+        self.xy_dim = _xyz if _xyz is not None else _xy  # kept as-is (list or int or None)
 
         # Optional dose-actor grid override in mm (x, y, z)
         output_spacing = self.stage_cfg.get("output_dose_spacing_mm", None)
@@ -323,13 +326,22 @@ class OpenGateSimulationStage:
         sx, sy, sz = img.GetSize()
         spx, spy, spz = img.GetSpacing()
 
-        if sx <= self.xy_dim and sy <= self.xy_dim:
-            return None
+        if isinstance(self.xy_dim, (list, tuple)):
+            # xyz_dim = [x, y, z] — explicit per-axis target voxel counts
+            nx = max(1, int(self.xy_dim[0]))
+            ny = max(1, int(self.xy_dim[1]))
+            nz = max(1, int(self.xy_dim[2]))
+        else:
+            # Legacy scalar: isotropic in-plane scale
+            if sx <= self.xy_dim and sy <= self.xy_dim:
+                return None
+            scale = min(self.xy_dim / sx, self.xy_dim / sy)
+            nx = max(1, round(sx * scale))
+            ny = max(1, round(sy * scale))
+            nz = max(1, round(sz * scale))
 
-        scale = min(self.xy_dim / sx, self.xy_dim / sy)
-        nx = max(1, round(sx * scale))
-        ny = max(1, round(sy * scale))
-        nz = max(1, round(sz * scale))
+        if nx >= sx and ny >= sy and nz >= sz:
+            return None  # target is same or larger — skip resampling
         return (nx, ny, nz), (spx * sx / nx, spy * sy / ny, spz * sz / nz)
 
     @staticmethod
@@ -655,7 +667,7 @@ class OpenGateSimulationStage:
             "simulated_roi_names": list(roi_names),
             "roi_voxel_counts": {k: int(v) for k, v in roi_counts.items()},
             "downsampling": {
-                "xy_dim": self.xy_dim,
+                "xyz_dim": self.xy_dim,
                 "was_resampled": was_resampled,
                 "sim_ct_path": sim_ct_path,
                 "sim_seg_path": sim_seg_path,
@@ -718,6 +730,12 @@ class OpenGateSimulationStage:
         -------
         context : Context-like
         """
+        # Lazy import: opengate is only available on compatible platforms.
+        # Importing it here (rather than at module level) lets the rest of the
+        # pipeline load even when opengate_core cannot be dlopen'd.
+        global gate
+        import opengate as gate  # noqa: F811
+
         native_ct = sitk.ReadImage(str(self.ct_nii_path))
         native_seg = sitk.ReadImage(str(self.tdt_roi_seg_path))
 

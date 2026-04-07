@@ -18,7 +18,7 @@ The **Virtual Theranostic Trialss (VTT) Pipeline** is a quantitative software fr
 - **Monte Carlo SPECT simulation + reconstruction** (SIMIND/PyTomography) to produce quantitative images
 - **Monte Carlo dosimetry simulation** (OpenGATE/Geant4) to generate organ-level dose maps
 
-Because uptake and dose can vary substantially between patients, TDTs support personalized evaluation of therapy strategies by enabling controlled, repeatable experiments across anatomy, kinetics, and imaging physics. A key objective is demonstrating agreement with patient measurements to support reliability and validation; longer-term, this work supports **Virtual Theranostic Trials (VTTs)** and patient-specific dosimetry prediction.
+Because uptake and dose can vary substantially between patients, VTT support personalized evaluation of therapy strategies by enabling controlled, repeatable experiments across anatomy, kinetics, and imaging physics. A key objective is demonstrating agreement with patient measurements to support reliability and validation; longer-term, this work supports **Virtual Theranostic Trials (VTTs)** and patient-specific dosimetry prediction.
 
 ![VTT Pipeline Overview](figures/pipeline_overview.png)
 
@@ -49,7 +49,7 @@ Because uptake and dose can vary substantially between patients, TDTs support pe
 
 ```bash
 conda env create -f environment.yml
-conda activate TDT_env
+conda activate vtt_env
 ```
 
 > This environment includes all required Python dependencies (TotalSegmentator, PyTomography, OpenGATE, PyCNO, etc.).
@@ -91,7 +91,7 @@ Then edit `inputs/config.json`.
 #### Must update (most users)
 - `phase_2.simind_stage.SIMINDDirectory` — path to your SIMIND install.
 - `phase_1.segmentation_stage.roi_subset` — list of ROIs to segment.
-- `phase_1.segmentation_stage.label_map_path` — path to `tdt_map.json` label map file.
+- `phase_1.segmentation_stage.label_map_path` — path to `vtt_map.json` label map file.
 - `phase_1.pbpk_tac_stage.isotope` — isotope for PBPK TAC generation (e.g. `"lu177"`). The TAC is simulated for 10x the isotope half-life.
 - `phase_2.simind_stage.roi_subset` — list of ROIs for SIMIND simulation.
 - `phase_2.opengate_stage.roi_subset` — list of ROIs for OpenGATE dosimetry.
@@ -181,10 +181,10 @@ Each CT input generates an output folder under `<output_folder_title>_CT_<index>
 ### Example Structure
 
 ```
-tdt_test_run_CT_0/
+test_run_CT_0/
   digital_twin/                              <- Phase 1
     ct.nii.gz                                <- standardized CT handoff
-    digital_twin.nii.gz                      <- unified TDT multilabel segmentation handoff
+    digital_twin.nii.gz                      <- unified VTT multilabel segmentation handoff
     segmentation_stage/
     synthetic_lesions_stage/                  <- (if synthetic lesions enabled)
     pbpk_tac_stage/
@@ -251,7 +251,7 @@ In addition to the CLI, the pipeline ships with a browser-based interface that w
 The web UI requires a few extra packages not included in the base conda environment:
 
 ```bash
-conda activate tdt_env
+conda activate vtt_env
 pip install "fastapi>=0.111" "uvicorn[standard]>=0.30" python-multipart pillow nibabel pydicom
 ```
 

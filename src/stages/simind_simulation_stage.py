@@ -241,23 +241,35 @@ class _SimindPreprocessor:
         Parameters
         ----------
         nii_obj : nib.Nifti1Image
-        resize : Optional[int]  target in-plane dimension (square xy assumed after transpose)
+        resize : Optional[int | tuple[int,int,int]]
+            If int: isotropic scale derived from that in-plane target (legacy behaviour).
+            If (x, y, z) tuple: resize each axis independently.
+            None: no resize.
         transpose_tuple : tuple[int,int,int]
         zoom_order : int  0 = nearest (seg), 1 = linear (CT)
 
         Returns
         -------
-        (array_zyx, scale_factor)
+        (array_zyx, mean_xy_scale_factor)
         """
         arr = np.array(nii_obj.get_fdata(dtype=np.float32))
-        arr = np.transpose(arr, transpose_tuple)[:, ::-1, :]
+        arr = np.transpose(arr, transpose_tuple)[:, ::-1, :]  # now (z, y, x)
 
         scale = 1.0
         if resize is not None:
-            if arr.shape[1] != arr.shape[2]:
-                raise ValueError("Resize parameter requires square in-plane dimensions (x=y).")
-            scale = resize / arr.shape[1]
-            arr = zoom(arr, (scale, scale, scale), order=zoom_order)
+            if isinstance(resize, (list, tuple)):
+                # xyz_dim = [x, y, z]  →  target shape (z, y, x)
+                tx, ty, tz = int(resize[0]), int(resize[1]), int(resize[2])
+                sz, sy, sx = arr.shape
+                scale_z = tz / sz if sz > 0 else 1.0
+                scale_y = ty / sy if sy > 0 else 1.0
+                scale_x = tx / sx if sx > 0 else 1.0
+                arr = zoom(arr, (scale_z, scale_y, scale_x), order=zoom_order)
+                scale = (scale_x + scale_y) / 2.0  # representative in-plane scale for spacing
+            else:
+                # Legacy scalar: isotropic in-plane resize
+                scale = resize / arr.shape[1]
+                arr = zoom(arr, (scale, scale, scale), order=zoom_order)
 
         return arr, scale
 
@@ -415,8 +427,9 @@ class SimindSimulationStage:
         self.detector_width: float = self.stage_cfg["DetectorWidth"]
         self.detector_length: float = self.stage_cfg["DetectorLength"]
 
-        # Preprocessing parameters (merged from preprocess_simind_stage) 
-        self.resize: Optional[int] = self.stage_cfg.get("xy_dim")                     
+        # Preprocessing parameters — supports xyz_dim (list/tuple) or legacy xy_dim (int)
+        xyz = self.stage_cfg.get("xyz_dim")
+        self.resize = xyz if xyz is not None else self.stage_cfg.get("xy_dim")
 
         # SIMIND ROI subset (independent from phase_1 roi_subset) 
         simind_roi_subset = self.stage_cfg.get("roi_subset")                           
@@ -799,7 +812,7 @@ class SimindSimulationStage:
             "energy_window_width": self.energy_window_width,
             "num_cores": self.num_cores,
             "simind_roi_subset": list(self.simind_roi_subset),                         
-            "xy_dim": self.resize,                                                     
+            "xyz_dim": self.resize,
             "roi_list": roi_list,
             "geometry": geometry,
             "total_num_voxels": total_num_voxels,
@@ -828,7 +841,7 @@ class SimindSimulationStage:
         """
         # --- Step 1: Run preprocessing (merged from SimindPreprocessStage) --- 
         if self.debug: 
-            print(f"[SimindSimulationStage] Running preprocessing with xy_dim={self.resize}") 
+            print(f"[SimindSimulationStage] Running preprocessing with xyz_dim={self.resize}")
 
         preprocessor = _SimindPreprocessor( 
             ct_nii_path=self.context.ct_nii_path, 
