@@ -1,8 +1,13 @@
 """
-Launch the Virtual Theranostic Trials web UI.
+Entry point for the Virtual Theranostic Trials web UI server.
 
-Usage:
-    python run_server.py [--port PORT] [--no-browser]
+Checks and installs required web dependencies, frees the target port if
+already in use, then launches the FastAPI application via uvicorn.  An
+OS browser window is opened automatically unless --no-browser is passed.
+
+Usage
+-----
+    python run_server.py [--host HOST] [--port PORT] [--no-browser]
 """
 from __future__ import annotations
 
@@ -22,8 +27,9 @@ if str(REPO_ROOT) not in sys.path:
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the server launcher."""
     p = argparse.ArgumentParser(description="Launch the VTT web UI server.")
-    p.add_argument("--port", type=int, default=8765, help="Port to listen on (default: 8765).")
+    p.add_argument("--port", type=int, default=8766, help="Port to listen on (default: 8766).")
     p.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1).")
     p.add_argument("--no-browser", action="store_true", help="Do not auto-open the browser.")
     return p.parse_args()
@@ -57,7 +63,7 @@ def _free_port(port: int) -> None:
             try:
                 os.kill(int(pid), signal.SIGKILL)
             except ProcessLookupError:
-                pass  # already gone — that's fine
+                pass  
         time.sleep(0.2)   # give the OS a moment to release the port
     except Exception:
         pass   # lsof not available or nothing to kill — uvicorn will report the error
@@ -108,6 +114,7 @@ def _ensure_deps() -> None:
 
 
 def main() -> None:
+    """Resolve dependencies, free the port, and start the uvicorn server."""
     args = _parse_args()
     url = f"http://{args.host}:{args.port}"
 

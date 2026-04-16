@@ -1,10 +1,11 @@
 """
-Synthetic Lesions Stage for the TDT pipeline.
+Synthetic lesion generation for the VTT pipeline.
 
 Goal
 ----
-Generate synthetic spherical lesions inside user-specified organ ROIs (from the unified TDT ROI seg),
-then insert them into the unified segmentation as the "synthetic_lesion" label (from tdt_map.json).
+Generate synthetic spherical lesions inside user-specified organ ROIs from the
+unified label map, then write them back into that segmentation as the
+``synthetic_lesion`` label.
 
 Key behavior
 ------------
@@ -16,7 +17,6 @@ Sampling:
 - prob="uniform": uniform candidate sampling
 - prob="gaussian": Gaussian weights centered at ROI centroid
 - prob="user_defined": user provides centers_zyx explicitly (validated)
-- prob="tom": TODO (not implemented; raises)
 
 Outputs
 -------
@@ -36,9 +36,9 @@ Writes into:
 - Stage metadata / debug:
     work_dir/<file_prefix>_metadata.json
 
-Most important side-effect
---------------------------
-OVERWRITES `context.tdt_roi_seg_path` on disk so that:
+Primary side effect
+-------------------
+Overwrites `context.tdt_roi_seg_path` on disk so that:
 - organ voxels remain their organ label
 - lesion voxels become label = TDT_Pipeline["synthetic_lesion"] (e.g. 8)
 
@@ -50,10 +50,8 @@ Incoming `context` must provide:
     - "file_prefix": str
     - "specs": dict | None
 - context.config["phase_1"]["segmentation_stage"]["roi_subset"]
-- context.config["phase_1"]["segmentation_stage"]["label_map_path"]                  
+- context.config["phase_1"]["segmentation_stage"]["label_map_path"]
 - context.tdt_roi_seg_path: str (unified multilabel seg produced by TdtRoiUnifyStage)
-
-Maintainer / contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
@@ -139,7 +137,7 @@ class SyntheticLesionsStage:
         self.tdt_name2id = self._load_tdt_label_map()
         if "synthetic_lesion" not in self.tdt_name2id:
             raise ValueError(
-                "tdt_map.json missing 'synthetic_lesion' in TDT_Pipeline. "
+                "The label map is missing 'synthetic_lesion' in TDT_Pipeline. "
                 "Add it (e.g. \"8\": \"synthetic_lesion\")."
             )
         self.synthetic_lesion_id: int = int(self.tdt_name2id["synthetic_lesion"])
@@ -290,7 +288,7 @@ class SyntheticLesionsStage:
         spacing_zyx_mm : (3,) float voxel spacing in mm
         prob : {"uniform","gaussian","user_defined","tom"}
         sigma_mm : float, required if prob=="gaussian"
-        tom_map_zyx : optional TOM probability map (TODO)
+        tom_map_zyx : optional TOM probability map (not yet implemented)
 
         Returns
         -------
@@ -483,7 +481,7 @@ class SyntheticLesionsStage:
             if cand.shape[0] == 0:
                 raise RuntimeError(
                     f"No valid candidate centers for radius={r:.3f} mm (after margin). "
-                    f"Try smaller radii or smaller margin_mm."
+                    "Try smaller radii or smaller margin_mm."
                 )
 
             w = SyntheticLesionsStage._candidate_weights(
@@ -521,7 +519,7 @@ class SyntheticLesionsStage:
             if not placed:
                 raise RuntimeError(
                     f"Failed to place lesion {i}/{len(radii_mm)} (r={r:.3f} mm) after {max_attempts_per_lesion} attempts. "
-                    f"Try reducing radii, margin_mm, or switching prob='uniform'."
+                    "Try reducing radii, margin_mm, or switching prob='uniform'."
                 )
 
         return centers, placed_r
@@ -920,6 +918,25 @@ class SyntheticLesionsStage:
                 "work_dir": None,
                 "metadata_path": None,
             }
+            return self.context
+
+        # Skip if outputs from a previous run already exist.
+        if os.path.exists(self.metadata_path):
+            self.logger.info("Synthetic lesions already exist, skipping generation.")
+            with open(self.metadata_path, encoding="utf-8") as _f:
+                _meta = json.load(_f)
+            self.context.synthetic_lesions_outdir = self.lesions_outdir
+            self.context.synthetic_lesions_results = {}
+            self.context.synthetic_lesions_backup_seg_path = _meta.get("backup_seg_path")
+            self.context.synthetic_lesions_global_binary_path = _meta.get("global_binary_path")
+            self.context.synthetic_lesions_global_labels_path = _meta.get("global_labels_path")
+            self.context.tdt_roi_seg_path = self.tdt_roi_seg_path
+            self.context.extras["synthetic_lesions_stage"] = {
+                "output_dir": self.output_dir,
+                "work_dir": self.work_dir,
+                "metadata_path": self.metadata_path,
+            }
+            self._ensure_synthetic_lesion_in_roi_subset()
             return self.context
 
         os.makedirs(self.lesions_outdir, exist_ok=True)

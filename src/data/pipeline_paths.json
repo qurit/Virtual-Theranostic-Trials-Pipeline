@@ -1,7 +1,7 @@
 {
   "input_paths": {
-    "label_map_path": "/Users/peteryazdi/Desktop/BC_Cancer/TDT_Main/Theranostic-Virtual-Patient-Pipeline/src/data/vtt_map.json",
-    "SIMINDDirectory": "/Users/peteryazdi/Desktop/BC_Cancer/TDT_Main/simind "
+    "label_map_path": "/home/jhubadmin/Theranostic-Virtual-Patient-Pipeline/src/data/vtt_map.json",
+    "SIMINDDirectory": "/home/jhubadmin/simind/simind"
   },
   "phase_1": {
     "sub_dir_name": "digital_twin",

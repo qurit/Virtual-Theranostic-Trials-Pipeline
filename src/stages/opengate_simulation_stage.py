@@ -1,12 +1,10 @@
 """
-OpenGATE dosimetry stage for the Theranostic Digital Twin (TDT) pipeline.
+OpenGATE dosimetry for the VTT pipeline.
 
 This stage runs voxel-source Monte Carlo dose calculations on the phase-1 CT grid
 (using the native CT grid or an optional downsampled simulation grid) with OpenGATE.
 Each requested ROI is simulated independently as a binary voxel source, then the
 resulting dose maps are optionally resampled back to the native CT space and summed.
-
-Now part of Phase 2 (Simulations) with its own independent ROI subset.
 
 Core responsibilities
 ---------------------
@@ -59,8 +57,6 @@ On success, this stage sets:
 - context.dosimetry_sum_dose_path : Optional[str]
 - context.dosimetry_material_label_path : Optional[str]
 - context.extras["opengate_simulation_stage"] : dict
-
-Maintainer / contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
@@ -139,26 +135,22 @@ class OpenGateSimulationStage:
         _xy  = self.stage_cfg.get("xy_dim", None)
         self.xy_dim = _xyz if _xyz is not None else _xy  # kept as-is (list or int or None)
 
-        # Optional dose-actor grid override in mm (x, y, z)
-        output_spacing = self.stage_cfg.get("output_dose_spacing_mm", None)
-        if output_spacing is not None:
-            self.output_dose_spacing_mm: Optional[List[float]] = [float(v) for v in output_spacing]
-            if len(self.output_dose_spacing_mm) != 3 or any(v <= 0 for v in self.output_dose_spacing_mm):
-                raise ValueError("output_dose_spacing_mm must be 3 positive floats [x, y, z]")
-        else:
-            self.output_dose_spacing_mm = None
-
         # OpenGATE execution controls
         gate_cfg = self.stage_cfg.get("gate", {})
         self.requested_total_histories: int = int(gate_cfg.get("total_histories", 100_000))
-        self.requested_num_threads: int = int(gate_cfg.get("num_threads", 1))
+        # num_cpu: 0 = use all available CPUs (same convention as SIMIND).
+        requested_num_cpu: int = int(gate_cfg.get("num_cpu", 1))
         self.start_new_process: bool = bool(gate_cfg.get("start_new_process", True))
         self.random_seed: Any = gate_cfg.get("random_seed", "auto")
 
         if self.requested_total_histories <= 0:
             raise ValueError("gate.total_histories must be > 0")
-        if self.requested_num_threads <= 0:
-            raise ValueError("gate.num_threads must be > 0")
+        if requested_num_cpu < 0:
+            raise ValueError("gate.num_cpu must be >= 0 (0 = use all available CPUs)")
+        if requested_num_cpu == 0:
+            import os as _os
+            requested_num_cpu = _os.cpu_count() or 1
+        self.requested_num_threads: int = requested_num_cpu
 
         # OpenGATE source.n is set per thread, so convert requested total histories
         # into a per-thread count to keep the total under control.
@@ -199,7 +191,7 @@ class OpenGateSimulationStage:
 
         # Validate OpenGATE ROI subset against phase_1 segmented ROIs 
         phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])         
-        invalid_rois = [r for r in opengate_roi_subset if r not in phase1_rois and r != "body"] 
+        invalid_rois = [r for r in opengate_roi_subset if r not in phase1_rois and r != "remaining_body"]
         if invalid_rois:                                                               
             raise ValueError(                                                          
                 f"OpenGATE roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. " 
@@ -207,9 +199,9 @@ class OpenGateSimulationStage:
             )                                                                          
 
         roi_list: List[str] = []
-        if "body" in self.tdt_name2id:
-            roi_list.append("body")
-        for roi_name in opengate_roi_subset:                                           
+        if "remaining_body" in self.tdt_name2id:
+            roi_list.append("remaining_body")
+        for roi_name in opengate_roi_subset:
             if roi_name not in roi_list:
                 roi_list.append(roi_name)
         if not roi_list:
@@ -429,6 +421,44 @@ class OpenGateSimulationStage:
     # source masks
     # ------------------------------------------------------------------
 
+    def _filter_to_requested_rois(self, seg_arr: np.ndarray) -> np.ndarray:
+        """
+        Zero out labels not in the requested ROI subset, then recompute remaining_body.
+
+        remaining_body is always included and represents:
+            body_outline − union(this_stage_roi_masks)
+
+        Because the unified segmentation's remaining_body label was computed using the
+        phase-1 ROI subset, it may be too narrow when this stage's subset is smaller
+        (e.g. phase-1 had kidney+liver+heart but OpenGATE only uses kidney+liver — heart
+        voxels should then be included in remaining_body for OpenGATE).  We correct this
+        by recomputing remaining_body from the full non-background mask.
+        """
+        remaining_body_id = self.tdt_name2id.get("remaining_body")
+
+        roi_ids: set = set()
+        for roi_name in self.requested_roi_subset:
+            if roi_name == "remaining_body":
+                continue
+            lab = self.tdt_name2id.get(roi_name)
+            if lab is not None:
+                roi_ids.add(int(lab))
+
+        body_outline = seg_arr != 0
+
+        out = seg_arr.copy()
+        keep_ids = roi_ids.copy()
+        if remaining_body_id is not None:
+            keep_ids.add(int(remaining_body_id))
+        out[~np.isin(out, list(keep_ids))] = 0
+
+        if remaining_body_id is not None:
+            stage_roi_mask = np.isin(seg_arr, list(roi_ids)) if roi_ids else np.zeros_like(body_outline)
+            remaining_body_mask = body_outline & ~stage_roi_mask
+            out[remaining_body_mask] = int(remaining_body_id)
+
+        return out
+
     def _build_source_masks(
         self,
         sim_ct: sitk.Image,
@@ -436,6 +466,9 @@ class OpenGateSimulationStage:
     ) -> Tuple[Dict[str, str], Dict[str, int], List[str]]:
         """
         Build one binary voxel-source mask per requested ROI on the simulation grid.
+
+        remaining_body is recomputed for this stage's ROI subset before mask extraction,
+        ensuring it covers body_outline − union(stage_rois) rather than the phase-1 value.
 
         Returns
         -------
@@ -445,6 +478,8 @@ class OpenGateSimulationStage:
             Only ROIs with non-zero voxels are returned.
         """
         seg_arr = sitk.GetArrayFromImage(sim_seg).astype(np.int32)
+        seg_arr = self._filter_to_requested_rois(seg_arr)
+
         mask_paths: Dict[str, str] = {}
         counts: Dict[str, int] = {}
         names: List[str] = []
@@ -553,15 +588,8 @@ class OpenGateSimulationStage:
 
         dose = sim.add_actor("DoseActor", "dose")
         dose.attached_to = patient
-        if self.output_dose_spacing_mm is not None:
-            dose.spacing = [float(s) * mm for s in self.output_dose_spacing_mm]
-            dose.size = [
-                max(1, round(size_xyz[i] * spacing_xyz[i] / self.output_dose_spacing_mm[i]))
-                for i in range(3)
-            ]
-        else:
-            dose.size = list(size_xyz)
-            dose.spacing = [float(s) * mm for s in spacing_xyz]
+        dose.size = list(size_xyz)
+        dose.spacing = [float(s) * mm for s in spacing_xyz]
         dose.dose.active = True
         dose.dose.output_filename = "dose_map.mhd"
         dose.dose_uncertainty.active = self.save_uncertainty_map
@@ -677,7 +705,6 @@ class OpenGateSimulationStage:
                 "original_origin": [round(o, 2) for o in self._original_sim_ct_img.GetOrigin()],
             },
             "isotope": self.isotope_name,
-            "output_dose_spacing_mm": self.output_dose_spacing_mm,
             "save_options": {
                 "save_per_roi_dose_maps": self.save_per_roi_dose_maps,
                 "save_summed_dose_map": self.save_summed_dose_map,
@@ -754,7 +781,6 @@ class OpenGateSimulationStage:
 
         needs_upsample = (
             was_resampled
-            or self.output_dose_spacing_mm is not None
             or self._original_sim_ct_img.GetSize() != native_ct.GetSize()
         )
 
@@ -820,14 +846,13 @@ class OpenGateSimulationStage:
                 )
 
             # Save the material label image from the first successful ROI only.
-            if mat_label_path is None and self.save_material_label_image and res["label_mhd_path"]:
-                if os.path.exists(res["label_mhd_path"]):
-                    labels = sitk.GetArrayFromImage(sitk.ReadImage(res["label_mhd_path"])).astype(np.int16)
-                    mat_label_path = self._save_nii(
-                        sim_ct,
-                        labels,
-                        Path(self.work_dir) / f"{self.prefix}_material_labels.nii.gz",
-                    )
+            if mat_label_path is None and self.save_material_label_image and res["label_mhd_path"] and os.path.exists(res["label_mhd_path"]):
+                labels = sitk.GetArrayFromImage(sitk.ReadImage(res["label_mhd_path"])).astype(np.int16)
+                mat_label_path = self._save_nii(
+                    sim_ct,
+                    labels,
+                    Path(self.work_dir) / f"{self.prefix}_material_labels.nii.gz",
+                )
 
             if not self.write_mhd_outputs:
                 self._cleanup_mhd(Path(res["dose_mhd_path"]))

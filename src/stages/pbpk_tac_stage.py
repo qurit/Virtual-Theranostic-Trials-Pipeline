@@ -1,5 +1,5 @@
 """
-PBPK TAC Generation Stage (PyCNO PSMA model) for the TDT pipeline.
+PBPK TAC generation (PyCNO PSMA model) for the VTT pipeline.
 
 This stage generates time-activity curves (TACs) for all segmented ROIs and saves
 them for use by downstream simulation and post-processing stages.
@@ -45,8 +45,6 @@ On success, this stage sets:
 - context.pbpk_vois : list[str]
 - context.pbpk_isotope : str
 - context.pbpk_stop_time_min : float
-
-Maintainer / contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
@@ -113,8 +111,8 @@ class PbpkTacStage:
         self.half_life_min: float = ISOTOPE_HALF_LIVES_MIN[self.isotope]
 
         self.downstream_roi_subset: List[str] = list(context.downstream_roi_subset)
-        if "body" not in self.downstream_roi_subset:
-            self.downstream_roi_subset.insert(0, "body")
+        if "remaining_body" not in self.downstream_roi_subset:
+            self.downstream_roi_subset.insert(0, "remaining_body")
 
         self.height: Optional[float] = None
         self.weight: Optional[float] = None
@@ -124,9 +122,9 @@ class PbpkTacStage:
         self.tac_json_path: str = os.path.join(self.output_dir, f"{self.prefix}_tacs.json")
         self.tac_npz_path: str = os.path.join(self.output_dir, f"{self.prefix}_tacs.npz")
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # helpers
-    # -----------------------------
+    # ------------------------------------------------------------------
 
     def _sample_lognormal_from_mean_sd(self, mean: float, sd: float) -> float:
         """
@@ -157,12 +155,14 @@ class PbpkTacStage:
         if not os.path.isdir(dicom_dir):
             return None, None
 
+        # Walk recursively — DICOM series are often nested several levels deep
+        # (e.g. patient/study/series/*.dcm).  os.listdir only sees the top level.
+        from pathlib import Path as _Path
         candidates: List[str] = []
-        for name in sorted(os.listdir(dicom_dir)):
-            path = os.path.join(dicom_dir, name)
-            if os.path.isfile(path):
-                candidates.append(path)
-            if len(candidates) >= 50:
+        for _fp in sorted(_Path(dicom_dir).rglob("*")):
+            if _fp.is_file():
+                candidates.append(str(_fp))
+            if len(candidates) >= 200:
                 break
 
         for path in candidates:
@@ -303,14 +303,14 @@ class PbpkTacStage:
         Returns None if there is no explicit mapping (caller falls back to "Rest").
         """
         roi_to_voi = {
-            "kidney":          "Kidney",
-            "body":            "Rest",
-            "liver":           "Liver",
-            "prostate":        "Prostate",
-            "heart":           "Heart",
-            "spleen":          "Spleen",
-            "salivary_glands": "SG",
-            "synthetic_lesion":"Tumor1",
+            "kidney":           "Kidney",
+            "remaining_body":   "Rest",
+            "liver":            "Liver",
+            "prostate":         "Prostate",
+            "heart":            "Heart",
+            "spleen":           "Spleen",
+            "salivary_glands":  "SG",
+            "synthetic_lesion": "Tumor1",
         }
         return roi_to_voi.get(roi_name, None)
 
@@ -397,9 +397,9 @@ class PbpkTacStage:
         with open(self.metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=4)
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # main
-    # -----------------------------
+    # ------------------------------------------------------------------
     def run(self) -> Any:
         """
         Execute PBPK TAC generation and save TACs for all segmented ROIs.
@@ -410,7 +410,7 @@ class PbpkTacStage:
         """
         if os.path.exists(self.tac_json_path) and os.path.exists(self.tac_npz_path):
             if self.debug:
-                print(f"[PbpkTacStage] TAC outputs already exist, loading from disk.")
+                print("[PbpkTacStage] TAC outputs already exist, loading from disk.")
             with open(self.tac_json_path, "r", encoding="utf-8") as f:
                 json_data = json.load(f)
             npz_data = np.load(self.tac_npz_path)

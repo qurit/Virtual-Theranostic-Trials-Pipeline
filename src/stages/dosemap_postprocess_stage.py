@@ -1,5 +1,5 @@
 """
-Dosimetry Post-Processing Stage for the TDT pipeline.
+Dosimetry post-processing for the VTT pipeline.
 
 This stage applies PBPK time-activity curves to OpenGATE per-ROI dose maps to produce
 a single total absorbed dose map in absolute units (Gy).
@@ -8,6 +8,8 @@ Core responsibilities
 ---------------------
 - Load per-ROI dose maps from OpenGATE (Gy/decay).
 - Load PBPK TACs from Phase 1.
+- Fold any PBPK organ TACs absent from OpenGATE's roi_subset into remaining_body
+  so that excluded-organ activity is correctly accounted for in the dose weighting.
 - Integrate each ROI's TAC from t=0 to the end of the TAC (which covers 10x the
   isotope half-life, capturing >99.9% of all decays) to get total cumulated activity.
 - Multiply each ROI's dose_per_decay by its own cumulated activity, then sum
@@ -51,8 +53,6 @@ Incoming `context` is expected to provide:
 On success, this stage sets:
 - context.dosemap_postprocess_output_dir : str
 - context.dosemap_postprocess_dose_path : str  (path to single total dose map)
-
-Maintainer / contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
@@ -103,9 +103,9 @@ class DosemapPostprocessStage:
 
         self.prefix: str = self.stage_cfg.get("file_prefix", "dosemap_postprocess")
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # helpers
-    # -----------------------------
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _save_nii(ref: sitk.Image, arr: np.ndarray, path: str) -> str:
@@ -150,6 +150,10 @@ class DosemapPostprocessStage:
         integration_end_min: float,
     ) -> None:
         """Save post-processing metadata."""
+        roi_contribution_paths = {
+            roi: os.path.join(self.work_dir, f"{self.prefix}_{roi}_dose_contribution.nii.gz")
+            for roi in roi_names_used
+        }
         metadata: Dict[str, Any] = {
             "stage": "dosemap_postprocess_stage",
             "stage_output_dir": self.stage_output_dir,
@@ -157,6 +161,7 @@ class DosemapPostprocessStage:
             "dose_input_paths": dict(self.context.dosimetry_raw_dose_paths),
             "roi_names_used": roi_names_used,
             "dose_output_path": dose_path,
+            "roi_contribution_paths": roi_contribution_paths,
             "integration_range_min": [0.0, integration_end_min],
             "integration_range_hr": [0.0, integration_end_min / 60.0],
             "integration_range_days": [0.0, integration_end_min / 60.0 / 24.0],
@@ -167,9 +172,9 @@ class DosemapPostprocessStage:
         with open(self.metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=4)
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # main
-    # -----------------------------
+    # ------------------------------------------------------------------
     def run(self) -> Any:
         """
         Apply per-ROI PBPK TAC weighting to per-ROI dose maps and produce
@@ -191,8 +196,27 @@ class DosemapPostprocessStage:
         ref_ct = sitk.ReadImage(str(self.context.ct_nii_path))
 
         tac_time = self.context.pbpk_tac_time
-        tac_values = self.context.pbpk_tac_values
+        # Work on a local copy so we can safely patch remaining_body.
+        tac_values: Dict[str, np.ndarray] = dict(self.context.pbpk_tac_values)
         integration_end_min = float(tac_time[-1])
+
+        # Aggregate excluded-organ TACs into remaining_body.
+        # OpenGATE's roi_subset may be smaller than Phase 1's roi_subset.  Any organ
+        # that was modelled in PBPK but not present in the OpenGATE dose maps is
+        # geometrically absorbed into OpenGATE's remaining_body mask.  Its cumulated
+        # activity must be folded into remaining_body so the dose weighting is correct.
+        simulation_rois: set = set(raw_dose_paths.keys()) - {"remaining_body"}
+        if "remaining_body" in tac_values:
+            effective_rb = tac_values["remaining_body"].copy().astype(np.float64)
+            for _rn, _rt in self.context.pbpk_tac_values.items():
+                if _rn != "remaining_body" and _rn not in simulation_rois:
+                    effective_rb += np.asarray(_rt, dtype=np.float64)
+                    if self.debug:
+                        print(
+                            f"[DosemapPostprocessStage] Folding excluded ROI '{_rn}' TAC "
+                            "into remaining_body (not in OpenGATE roi_subset)."
+                        )
+            tac_values["remaining_body"] = effective_rb.astype(np.float32)
 
         # Final output path
         output_path = os.path.join(
@@ -203,7 +227,7 @@ class DosemapPostprocessStage:
         # Skip if output already exists
         if os.path.exists(output_path):
             if self.debug:
-                print(f"[DosemapPostprocessStage] Total dose map already exists, skipping.")
+                print("[DosemapPostprocessStage] Total dose map already exists, skipping.")
             self.context.dosemap_postprocess_output_dir = self.stage_output_dir
             self.context.dosemap_postprocess_dose_path = output_path
             self.context.extras["dosemap_postprocess_stage"] = {
@@ -225,7 +249,7 @@ class DosemapPostprocessStage:
                 if self.debug:
                     print(
                         f"[DosemapPostprocessStage] WARNING: ROI '{roi_name}' has a dose map "
-                        f"but no TAC — skipping this ROI in dose weighting."
+                        "but no TAC — skipping this ROI in dose weighting."
                     )
                 continue
 
@@ -262,6 +286,12 @@ class DosemapPostprocessStage:
             else:
                 total_dose += roi_contribution
 
+            # Save per-ROI dose contribution NIfTI for inspection / provenance.
+            roi_contrib_path = os.path.join(
+                self.work_dir, f"{self.prefix}_{roi_name}_dose_contribution.nii.gz"
+            )
+            self._save_nii(ref_ct, roi_contribution.astype(np.float32), roi_contrib_path)
+
             if self.debug:
                 print(
                     f"[DosemapPostprocessStage]   {roi_name}: "
@@ -271,7 +301,7 @@ class DosemapPostprocessStage:
 
         if self.debug:
             print(
-                f"[DosemapPostprocessStage] Total absorbed dose: "
+                "[DosemapPostprocessStage] Total absorbed dose: "
                 f"max={np.max(total_dose):.4e} Gy | "
                 f"TAC integrated from 0 to {integration_end_min:.0f} min "
                 f"({integration_end_min / 60.0 / 24.0:.1f} days)"

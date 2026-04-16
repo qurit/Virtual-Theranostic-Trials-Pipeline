@@ -1,17 +1,9 @@
 """
-Theranostic Digital Twin (TDT) Pipeline Runner.
+Command-line entry point for the Virtual Theranostic Trials pipeline.
 
-This module provides:
-- `TdtPipeline`: an orchestrator that runs all pipeline stages for a single CT input.
-- A CLI entrypoint that iterates through a directory of CT inputs and runs the pipeline.
-
-Notes
------
-- A CT input may be either a NIfTI file (.nii / .nii.gz) or a DICOM directory.
-- The pipeline writes outputs into an output folder derived from the config and CT index.
-- Phases run sequentially; all stage-to-stage communication goes through the `Context` object.
-
-For any questions or issues, please contact: pyazdi@bccrc.ca
+This module defines the per-patient pipeline runner, injects developer-controlled
+paths into the live config, and provides the batch CLI used by both local runs
+and the web UI subprocess launcher.
 """
 
 from __future__ import annotations
@@ -24,8 +16,9 @@ import time
 import shutil
 import argparse
 import copy
-from typing import Any, Dict, Literal
+from typing import Any, Dict, List, Literal, Optional
 
+from src.io.config_paths import inject_pipeline_paths
 from src.io.context import Context
 from src.tests.validate_config import validate_config
 
@@ -34,21 +27,21 @@ from src.stages.synthetic_lesions_stage import SyntheticLesionsStage
 from src.stages.pbpk_tac_stage import PbpkTacStage
 from src.stages.simind_simulation_stage import SimindSimulationStage
 from src.stages.spect_postprocess_stage import SpectPostprocessStage
-#from src.stages.opengate_simulation_stage import OpenGateSimulationStage
+from src.stages.opengate_simulation_stage import OpenGateSimulationStage
 from src.stages.dosemap_postprocess_stage import DosemapPostprocessStage
 
 
 CTInputType = Literal["nii", "dicom"]
 
-# ANSI color codes for DEBUG terminal output 
-_GREEN = "\033[92m"  
-_CYAN = "\033[96m"   
-_YELLOW = "\033[93m" 
-_RESET = "\033[0m"   
-_BOLD = "\033[1m"    
+# ANSI colour codes (DEBUG terminal output only)
+_GREEN  = "\033[92m"
+_CYAN   = "\033[96m"
+_YELLOW = "\033[93m"
+_RESET  = "\033[0m"
+_BOLD   = "\033[1m"
 
 
-def _debug_print(msg: str, phase: str = "", logger: logging.Logger = None) -> None: 
+def _debug_print(msg: str, phase: str = "", logger: Optional[logging.Logger] = None) -> None:
     """Print a colored debug message to terminal and optionally log it.""" 
     colored = f"{_GREEN}[DEBUG]{_RESET} {_CYAN}[{phase}]{_RESET} {msg}" if phase else f"{_GREEN}[DEBUG]{_RESET} {msg}" 
     print(colored) 
@@ -58,7 +51,7 @@ def _debug_print(msg: str, phase: str = "", logger: logging.Logger = None) -> No
 
 class TdtPipeline:
     """
-    Orchestrates the full TDT pipeline for a single CT input.
+    Orchestrates the full VTT pipeline for a single CT input.
 
     Parameters
     ----------
@@ -66,8 +59,8 @@ class TdtPipeline:
         Path to the JSON config file (comments allowed via `json_minify`).
     ct_input : str
         Path to a CT input (either a .nii/.nii.gz file OR a DICOM directory).
-    ct_indx : int
-        Index used for naming (e.g., output folder suffix "_CT_{ct_indx}").
+    ct_index : int
+        Index used for naming (e.g., output folder suffix "_CT_{ct_index}").
     logging_on : bool, default=True
         If True, writes a per-CT log file into the CT output folder.
         The log records launched_via, config path, output folder, and timing.
@@ -89,7 +82,7 @@ class TdtPipeline:
         self,
         config_path: str,
         ct_input: str,
-        ct_indx: int,
+        ct_index: int,
         logging_on: bool = True,
         save_config: bool = False,
         mode: Literal["DEBUG", "PRODUCTION"] = "PRODUCTION",
@@ -101,11 +94,10 @@ class TdtPipeline:
     ) -> None:
         self.config_path: str = config_path
         self.ct_input: str = ct_input
-        self.ct_indx: int = ct_indx
+        self.ct_index: int = ct_index
         self.current_dir_path: str = os.path.abspath(os.path.dirname(__file__))
 
         self.logging_on: bool = logging_on
-        self.save_ct_scan: bool = True       # always enabled; CT copy is always written
         self.save_config: bool = save_config
         self.launched_via: str = launched_via
         self.mode: Literal["DEBUG", "PRODUCTION"] = mode
@@ -121,7 +113,7 @@ class TdtPipeline:
         self.synthetic_lesions_disabled_reason: str | None = None
         self.sub_dir_names: Dict[str, str] = {}
 
-        self.logger: logging.Logger = logging.getLogger(f"TDT_CONFIG_LOGGER_CT_{self.ct_indx}")
+        self.logger: logging.Logger = logging.getLogger(f"VTT_PIPELINE_CT_{self.ct_index}")
         self.logger.setLevel(logging.DEBUG if self.mode == "DEBUG" else logging.INFO)
         self.logger.propagate = False
 
@@ -156,82 +148,21 @@ class TdtPipeline:
         else:
             shutil.copy2(self.ct_input, dst)
 
-    def _inject_computed_paths(self) -> None:
-        """
-        Inject developer-controlled paths and naming fields from
-        ``src/data/pipeline_paths.json`` into the live config so that
-        per-run config files do not need to carry them.
-
-        Fields injected
-        ---------------
-        - ``input_paths.label_map_path``   → phase_1.segmentation_stage.label_map_path
-        - ``input_paths.SIMINDDirectory``  → phase_2.simind_stage.SIMINDDirectory
-        - ``phase_*/sub_dir_name``         → each phase's sub_dir_name
-        - ``phase_*/*/file_prefix``        → each stage's file_prefix
-        - ``phase_1/segmentation_stage/unification_prefix``
-        """
-        repo_root = self.current_dir_path
-        paths_file = os.path.join(repo_root, "src", "data", "pipeline_paths.json")
-
-        pipeline_paths: Dict[str, Any] = {}
-        try:
-            with open(paths_file, encoding="utf-8") as fh:
-                pipeline_paths = json.loads(json_minify(fh.read()))
-        except Exception:
-            pass
-
-        input_paths = pipeline_paths.get("input_paths", {})
-
-        # ── label_map_path ────────────────────────────────────────────────────
-        seg_stage = self.config["phase_1"]["segmentation_stage"]
-        lmp = input_paths.get("label_map_path", "").strip()
-        if not lmp:
-            lmp = os.path.join(repo_root, "src", "data", "tdt_map.json")
-        seg_stage["label_map_path"] = lmp
-
-        # ── SIMINDDirectory ───────────────────────────────────────────────────
-        simind_dir = input_paths.get("SIMINDDirectory", "").strip()
-        simind_stage = self.config["phase_2"]["simind_stage"]
-        if simind_dir:
-            simind_stage["SIMINDDirectory"] = simind_dir
-
-        # ── Sub-directory names and file prefixes from pipeline_paths.json ────
-        # These are developer-controlled naming conventions that should not
-        # appear in user-facing config files.  Inject them here so all stages
-        # find them in context.config regardless of what the user's config contains.
-        _STAGE_FIELDS = ("file_prefix", "unification_prefix", "sub_dir_name")
-        for phase_key in ("phase_1", "phase_2", "phase_3"):
-            pp_phase = pipeline_paths.get(phase_key, {})
-            if not isinstance(pp_phase, dict):
-                continue
-            cfg_phase = self.config.setdefault(phase_key, {})
-            # Top-level sub_dir_name for the phase
-            if "sub_dir_name" in pp_phase:
-                cfg_phase["sub_dir_name"] = pp_phase["sub_dir_name"]
-            # Per-stage fields
-            for stage_key, stage_data in pp_phase.items():
-                if stage_key == "sub_dir_name" or not isinstance(stage_data, dict):
-                    continue
-                cfg_stage = cfg_phase.setdefault(stage_key, {})
-                for field in _STAGE_FIELDS:
-                    if field in stage_data:
-                        cfg_stage[field] = stage_data[field]
-
     def _log_setup(self) -> logging.Logger:
         """
         Configure a per-CT log file handler.
 
-        Writes to: <output_folder_path>/logging_file_CT_<ct_indx>.log
+        Writes to: <output_folder_path>/logging_file_CT_<ct_index>.log
         Avoids adding duplicate handlers if the pipeline is constructed multiple times.
         """
-        log_path = os.path.join(self.output_folder_path, f"logging_file_CT_{self.ct_indx}.log")
+        log_path = os.path.join(self.output_folder_path, f"logging_file_CT_{self.ct_index}.log")
         logger = self.logger
 
         if not any(
             isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == log_path
             for h in logger.handlers
         ):
-            fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+            fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
             fh.setFormatter(
                 logging.Formatter(
                     "%(asctime)s | %(levelname)s | %(message)s",
@@ -268,7 +199,7 @@ class TdtPipeline:
         with open(config_path, encoding="utf-8") as f:
             self.config = json.loads(json_minify(f.read()))
 
-        output_folder_title = f"{self.config['output_folder_title']}_CT_{self.ct_indx}"
+        output_folder_title = f"{self.config['output_folder_title']}_CT_{self.ct_index}"
         self.output_folder_path = os.path.join(self.current_dir_path, output_folder_title)
         os.makedirs(self.output_folder_path, exist_ok=True)
 
@@ -282,16 +213,17 @@ class TdtPipeline:
         else:
             raise FileNotFoundError(f"CT input not found: {self.ct_input}")
 
-        # Inject paths that are no longer stored in the config file.
-        # label_map_path: always the repo-relative tdt_map.json.
-        # SIMINDDirectory: read from pipeline_paths.json (set once by the user there).
-        self._inject_computed_paths()
+        # Inject developer-controlled paths that are no longer stored in user configs.
+        self.config = inject_pipeline_paths(
+            self.config,
+            repo_root=self.current_dir_path,
+            include_input_paths=True,
+        )
 
         if self.save_config:
             self._save_config_copy(config_path)
 
-        if self.save_ct_scan:
-            self._save_ct_scan_copy()
+        self._save_ct_scan_copy()
 
         # Enable synthetic lesions only if the flag is set AND lesion specs are defined in config.
         lesion_specs = self.config["phase_1"]["synthetic_lesions_stage"].get("specs")
@@ -329,7 +261,7 @@ class TdtPipeline:
         context.mode = self.mode
         context.ct_input_path = self.ct_input
         context.ct_input_type = self.ct_input_type
-        context.ct_indx = self.ct_indx
+        context.ct_index = self.ct_index
         context.output_folder_path = self.output_folder_path
         context.synthetic_lesions_enabled = self.run_synthetic_lesions
         context.run_spect = self.run_spect           
@@ -337,19 +269,198 @@ class TdtPipeline:
         context.run_postprocess = self.run_postprocess 
 
         # downstream_roi_subset flows from phase-1 config into all downstream stages.
-        # 'body' is always segmented and auto-added here so downstream stages never
-        # require the user to list it explicitly.
+        # 'remaining_body' (the body outline minus other ROIs) is always auto-added
+        # here so downstream stages never require the user to list it explicitly.
         roi_subset = self.config["phase_1"]["segmentation_stage"]["roi_subset"]
         if isinstance(roi_subset, str):
             roi_subset = [roi_subset]
         normalized_roi_subset = [str(r).strip() for r in roi_subset if str(r).strip()]
-        if "body" not in normalized_roi_subset:
-            normalized_roi_subset.append("body")
+        if "remaining_body" not in normalized_roi_subset:
+            normalized_roi_subset.append("remaining_body")
         context.downstream_roi_subset = normalized_roi_subset
 
-        self.logger.debug("Context initialized for CT_%s", self.ct_indx)
+        self.logger.debug("Context initialized for CT_%s", self.ct_index)
 
-    def _phase_banner(self, phase_num: int, phase_name: str) -> None: 
+    def _read_patient_hw(self) -> Dict[str, Any]:
+        """
+        Extract PatientSize (m) and PatientWeight (kg) from DICOM headers.
+
+        Returns dict with keys: height_m, weight_kg, missing, source.
+        """
+        if self.ct_input_type != "dicom":
+            return {"height_m": None, "weight_kg": None,
+                    "missing": ["height", "weight"], "source": "not_dicom"}
+
+        try:
+            import pydicom
+        except ImportError:
+            return {"height_m": None, "weight_kg": None,
+                    "missing": ["height", "weight"], "source": "pydicom_missing"}
+
+        # Walk recursively — series are often nested several levels deep
+        # (e.g. patient/study/series/*.dcm).
+        candidates: List[str] = []
+        try:
+            from pathlib import Path as _Path
+            for fp in sorted(_Path(self.ct_input).rglob("*")):
+                if fp.is_file():
+                    candidates.append(str(fp))
+                if len(candidates) >= 200:
+                    break
+        except Exception:
+            pass
+
+        height: Optional[float] = None
+        weight: Optional[float] = None
+        for fp in candidates:
+            try:
+                ds = pydicom.dcmread(fp, stop_before_pixels=True, force=True)
+                h = getattr(ds, "PatientSize", None)
+                w = getattr(ds, "PatientWeight", None)
+                h = float(h) if h not in (None, "", " ") else None
+                w = float(w) if w not in (None, "", " ") else None
+                if h is not None and h <= 0:
+                    h = None
+                if w is not None and w <= 0:
+                    w = None
+                if h is not None:
+                    height = h
+                if w is not None:
+                    weight = w
+                if height is not None and weight is not None:
+                    break
+            except Exception:
+                continue
+
+        missing = (["height"] if height is None else []) + (["weight"] if weight is None else [])
+        return {"height_m": height, "weight_kg": weight,
+                "missing": missing, "source": "dicom"}
+
+    def _patient_banner(self) -> None:
+        """
+        Print a per-patient summary banner to stdout and append it to the log.
+
+        Shows patient index/name, height/weight, and a config summary covering
+        every phase that will run.  Printed in both PRODUCTION and DEBUG modes
+        (DEBUG adds ANSI colour).
+        """
+        cfg = self.config
+        avail = os.cpu_count() or 1
+        w = 68
+        lines: List[str] = []
+
+        def add(text: str = "") -> None:
+            lines.append(text)
+
+        ct_name = os.path.basename(self.ct_input.rstrip("/\\"))
+        ct_type_str = "DICOM directory" if self.ct_input_type == "dicom" else "NIfTI"
+
+        border = "═" * w
+        add(f"╔{border}╗")
+        add(f"║  {'Patient  CT_' + str(self.ct_index) + '  ·  ' + ct_name:<{w - 4}}  ║")
+        add(f"╚{border}╝")
+
+        add(f"  Input      : {self.ct_input}  ({ct_type_str})")
+        add(f"  Output     : {self.output_folder_path}")
+
+        # ── Height / weight ────────────────────────────────────────────
+        hw = self._read_patient_hw()
+        if hw["source"] == "not_dicom":
+            add("  Height/Wt  : not available  (NIfTI input — no DICOM tags)")
+        elif hw["source"] in ("no_files", "pydicom_missing"):
+            add("  Height/Wt  : not available  (could not read DICOM files)")
+        else:
+            h_str = f"{hw['height_m']:.2f} m" if hw["height_m"] is not None else "not found"
+            w_str = f"{hw['weight_kg']:.1f} kg" if hw["weight_kg"] is not None else "not found"
+            add(f"  Height     : {h_str:<14}  Weight : {w_str}")
+            if hw["missing"]:
+                add(f"  Missing    : {', '.join(hw['missing'])}  (tag absent in DICOM headers)")
+
+        add("  " + "─" * (w - 2))
+
+        # ── Phase 1 ────────────────────────────────────────────────────
+        seg_cfg   = cfg.get("phase_1", {}).get("segmentation_stage", {})
+        pbpk_cfg  = cfg.get("phase_1", {}).get("pbpk_tac_stage", {})
+        les_cfg   = cfg.get("phase_1", {}).get("synthetic_lesions_stage", {})
+
+        roi_list = seg_cfg.get("roi_subset", [])
+        roi_str  = ", ".join(roi_list) if roi_list else "—"
+        add(f"  Phase 1  ·  Digital Twin & Ground Truth")
+        add(f"    ROI subset   : {roi_str}")
+        add(f"    PBPK model   : {pbpk_cfg.get('model_type', '?')}  ·  isotope : {pbpk_cfg.get('isotope', '?')}")
+
+        if self.run_synthetic_lesions:
+            specs = les_cfg.get("specs") or {}
+            organs = ", ".join(specs.keys()) if specs else "none"
+            add(f"    Syn. lesions : ON  ({organs})")
+        else:
+            add(f"    Syn. lesions : OFF")
+
+        # ── Phase 2 ────────────────────────────────────────────────────
+        add(f"  Phase 2  ·  Simulations")
+        if self.run_spect:
+            s = cfg.get("phase_2", {}).get("simind_stage", {})
+            nc   = s.get("num_cpu", 0)
+            eff  = avail if nc == 0 else min(nc, avail)
+            cpu_note = f"all {avail}" if nc == 0 else str(eff)
+            add(f"    SPECT        : collimator={s.get('Collimator','?')}  "
+                f"photons={s.get('NumPhotons','?')}  "
+                f"proj={s.get('NumProjections','?')}  "
+                f"CPUs={cpu_note}")
+            add(f"                   ROIs : {', '.join(s.get('roi_subset', roi_list))}")
+        else:
+            add(f"    SPECT        : skipped")
+
+        if self.run_dosimetry:
+            g  = cfg.get("phase_2", {}).get("opengate_stage", {})
+            gc = g.get("gate", {})
+            nc2  = gc.get("num_cpu", 0)
+            eff2 = avail if nc2 == 0 else min(nc2, avail)
+            cpu_note2 = f"all {avail}" if nc2 == 0 else str(eff2)
+            add(f"    Dosimetry    : histories={gc.get('total_histories','?')}  "
+                f"CPUs={cpu_note2}  "
+                f"seed={gc.get('random_seed','?')}")
+            add(f"                   ROIs : {', '.join(g.get('roi_subset', roi_list))}")
+        else:
+            add(f"    Dosimetry    : skipped")
+
+        # ── Phase 3 ────────────────────────────────────────────────────
+        add(f"  Phase 3  ·  Post-Processing")
+        if self.run_postprocess and self.run_spect:
+            sp = cfg.get("phase_3", {}).get("spect_postprocess_stage", {})
+            add(f"    SPECT recon  : {sp.get('ReconstructionAlgorithm','OSEM')}  "
+                f"iter={sp.get('Iterations','?')}  "
+                f"subsets={sp.get('Subsets','?')}  "
+                f"noise={'ON' if sp.get('apply_poisson_noise') else 'OFF'}")
+        elif self.run_postprocess:
+            add(f"    SPECT recon  : skipped  (no SPECT simulation)")
+        else:
+            add(f"    SPECT recon  : skipped")
+
+        if self.run_postprocess and self.run_dosimetry:
+            dp = cfg.get("phase_3", {}).get("dosemap_postprocess_stage", {})
+            add(f"    Dose map     : TAC-weighted  "
+                f"apply_tac={'ON' if dp.get('apply_tac', True) else 'OFF'}")
+        elif self.run_postprocess:
+            add(f"    Dose map     : skipped  (no dosimetry simulation)")
+        else:
+            add(f"    Dose map     : skipped")
+
+        add("  " + "─" * (w - 2))
+
+        # Print with colour in DEBUG mode, plain in PRODUCTION
+        if self.mode == "DEBUG":
+            print(f"{_BOLD}{_CYAN}", end="")
+        for line in lines:
+            print(line)
+        if self.mode == "DEBUG":
+            print(_RESET, end="")
+
+        # Always write the plain text to the log
+        for line in lines:
+            self.logger.info(line)
+
+    def _phase_banner(self, phase_num: int, phase_name: str) -> None:
         """Print a phase banner with optional color in DEBUG mode.""" 
         banner = f"-----------------------------Phase {phase_num}: {phase_name}-----------------------------" 
         if self.mode == "DEBUG": 
@@ -372,7 +483,7 @@ class TdtPipeline:
         Phases
         ------
         1. Digital Twin & Ground Truth:
-            1.1  TotalSegmentator segmentation + ROI unification to TDT label space
+            1.1  TotalSegmentator segmentation + ROI unification to the shared label space
             1.2  Synthetic lesion generation (optional)
             1.3  PBPK TAC generation
         2. Simulations:
@@ -390,131 +501,116 @@ class TdtPipeline:
         logger = self.logger
         t_pipeline = time.perf_counter()
 
-        print(f"Starting TDT Pipeline (CT_{self.ct_indx}) | mode={self.mode} | input={self.ct_input}")
-        if self.mode == "DEBUG": 
-            _debug_print(f"run_spect={self.run_spect} | run_dosimetry={self.run_dosimetry} | run_postprocess={self.run_postprocess}", "INIT", logger) 
-            _debug_print(f"synthetic_lesions={self.run_synthetic_lesions}", "INIT", logger) 
+        self._patient_banner()
+
+        if self.mode == "DEBUG":
+            _debug_print(f"run_spect={self.run_spect} | run_dosimetry={self.run_dosimetry} | run_postprocess={self.run_postprocess}", "INIT", logger)
+            _debug_print(f"synthetic_lesions={self.run_synthetic_lesions}", "INIT", logger)
 
         context = self.context
 
         logger.info("Pipeline start | mode=%s", self.mode)
         logger.info("CT input | path=%s | type=%s", self.ct_input, self.ct_input_type)
 
-        # ----------------------------- Phase 1: Digital Twin & Ground Truth ----------------------------- 
-        self._phase_banner(1, "Digital Twin & Ground Truth") 
+        # ── Phase 1: Digital Twin & Ground Truth ──────────────────────────────────
+        self._phase_banner(1, "Digital Twin & Ground Truth")
 
-        logger.info("Stage start: Segmentation + ROI Unification") 
         t_stage = time.perf_counter()
-        print("Running Segmentation + ROI Unification Stage...") 
-        if self.mode == "DEBUG": 
-            _debug_print("Segmentation will run TotalSegmentator tasks then unify to TDT label space", "Phase 1", logger) 
-        context = SegmentationStage(context).run() 
-        print("Segmentation + ROI Unification Stage completed.") 
-        logger.info("Stage end: Segmentation + ROI Unification | elapsed=%.2fs", time.perf_counter() - t_stage) 
+        print("Running Segmentation + ROI Unification Stage...")
+        logger.info("Stage start: Segmentation + ROI Unification")
+        context = SegmentationStage(context).run()
+        print("Segmentation + ROI Unification Stage completed.")
+        logger.info("Stage end: Segmentation + ROI Unification | elapsed=%.2fs", time.perf_counter() - t_stage)
 
         if self.run_synthetic_lesions:
-            logger.info("Stage start: Synthetic Lesions Generation")
             t_stage = time.perf_counter()
             print("Running Synthetic Lesions Generation Stage...")
-            if self.mode == "DEBUG": 
-                _debug_print("Inserting synthetic lesions into unified segmentation", "Phase 1", logger) 
+            logger.info("Stage start: Synthetic Lesions Generation")
             context = SyntheticLesionsStage(context).run()
             print("Synthetic Lesions Generation Stage completed.")
             logger.info("Stage end: Synthetic Lesions Generation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        logger.info("Stage start: PBPK TAC Generation") 
-        t_stage = time.perf_counter() 
-        print("Running PBPK TAC Generation Stage...") 
-        if self.mode == "DEBUG": 
-            _debug_print("Generating TACs for all segmented ROIs via PyCNO PSMA model", "Phase 1", logger) 
-        context = PbpkTacStage(context).run() 
-        print("PBPK TAC Generation Stage completed.") 
-        logger.info("Stage end: PBPK TAC Generation | elapsed=%.2fs", time.perf_counter() - t_stage) 
+        t_stage = time.perf_counter()
+        print("Running PBPK TAC Generation Stage...")
+        logger.info("Stage start: PBPK TAC Generation")
+        context = PbpkTacStage(context).run()
+        print("PBPK TAC Generation Stage completed.")
+        logger.info("Stage end: PBPK TAC Generation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # ----------------------------- Phase 2: Simulations ----------------------------- 
-        if self.run_spect or self.run_dosimetry: 
-            self._phase_banner(2, "Simulations") 
-        else: 
-            print("-----------------------------Phase 2: Simulations (skipped - no --spect or --dosimetry)-----------------------------") 
-            logger.info("Phase 2 skipped: no --spect or --dosimetry flags") 
+        # ── Phase 2: Simulations ───────────────────────────────────────────────
+        if self.run_spect or self.run_dosimetry:
+            self._phase_banner(2, "Simulations")
+        else:
+            print("Phase 2: Simulations (skipped — no --spect or --dosimetry)")
+            logger.info("Phase 2 skipped: no --spect or --dosimetry flags")
 
-        if self.run_spect: 
-            logger.info("Stage start: SIMIND Simulation") 
+        if self.run_spect:
             t_stage = time.perf_counter()
-            print("Running SIMIND Simulation Stage (includes preprocessing)...") 
-            if self.mode == "DEBUG": 
-                _debug_print("SIMIND: preprocessing CT/seg -> binaries, then running Monte Carlo projections", "Phase 2", logger) 
-            context = SimindSimulationStage(context).run() 
-            print("SIMIND Simulation Stage completed.") 
-            logger.info("Stage end: SIMIND Simulation | elapsed=%.2fs", time.perf_counter() - t_stage) 
+            print("Running SIMIND Simulation Stage...")
+            logger.info("Stage start: SIMIND Simulation")
+            context = SimindSimulationStage(context).run()
+            print("SIMIND Simulation Stage completed.")
+            logger.info("Stage end: SIMIND Simulation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        if self.run_dosimetry: 
-            logger.info("Stage start: OpenGATE Simulation") 
+        if self.run_dosimetry:
             t_stage = time.perf_counter()
-            print("Running OpenGATE Simulation Stage...") 
-            if self.mode == "DEBUG": 
-                _debug_print("OpenGATE: running voxel-source Monte Carlo dosimetry per ROI", "Phase 2", logger) 
+            print("Running OpenGATE Simulation Stage...")
+            logger.info("Stage start: OpenGATE Simulation")
             context = OpenGateSimulationStage(context).run()
-            print("OpenGATE Simulation Stage completed.") 
+            print("OpenGATE Simulation Stage completed.")
             logger.info("Stage end: OpenGATE Simulation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # ----------------------------- Phase 3: Post-Processing ----------------------------- 
-        if self.run_postprocess and (self.run_spect or self.run_dosimetry): 
-            self._phase_banner(3, "Post-Processing") 
-        elif self.run_postprocess: 
-            print("-----------------------------Phase 3: Post-Processing (skipped - no simulations ran)-----------------------------") 
-            logger.info("Phase 3 skipped: --postprocess set but no simulations ran") 
-        else: 
-            print("-----------------------------Phase 3: Post-Processing (skipped - no --postprocess)-----------------------------") 
-            logger.info("Phase 3 skipped: no --postprocess flag") 
+        # ── Phase 3: Post-Processing ───────────────────────────────────────────
+        if self.run_postprocess and (self.run_spect or self.run_dosimetry):
+            self._phase_banner(3, "Post-Processing")
+        elif self.run_postprocess:
+            print("Phase 3: Post-Processing (skipped — no simulations ran)")
+            logger.info("Phase 3 skipped: --postprocess set but no simulations ran")
+        else:
+            print("Phase 3: Post-Processing (skipped — no --postprocess)")
+            logger.info("Phase 3 skipped: no --postprocess flag")
 
-        if self.run_postprocess and self.run_spect: 
-            logger.info("Stage start: SPECT Post-Processing") 
-            t_stage = time.perf_counter() 
-            print("Running SPECT Post-Processing Stage...") 
-            if self.mode == "DEBUG": 
-                _debug_print("Applying TAC weighting, Poisson noise, and OSEM+TEW reconstruction", "Phase 3", logger) 
-            context = SpectPostprocessStage(context).run() 
-            print("SPECT Post-Processing Stage completed.") 
-            logger.info("Stage end: SPECT Post-Processing | elapsed=%.2fs", time.perf_counter() - t_stage) 
+        if self.run_postprocess and self.run_spect:
+            t_stage = time.perf_counter()
+            print("Running SPECT Post-Processing Stage...")
+            logger.info("Stage start: SPECT Post-Processing")
+            context = SpectPostprocessStage(context).run()
+            print("SPECT Post-Processing Stage completed.")
+            logger.info("Stage end: SPECT Post-Processing | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        if self.run_postprocess and self.run_dosimetry: 
-            logger.info("Stage start: Dosimetry Post-Processing") 
-            t_stage = time.perf_counter() 
-            print("Running Dosimetry Post-Processing Stage...") 
-            if self.mode == "DEBUG": 
-                _debug_print("Applying TAC-weighted cumulated activity to dose maps", "Phase 3", logger) 
-            context = DosemapPostprocessStage(context).run() 
-            print("Dosimetry Post-Processing Stage completed.") 
-            logger.info("Stage end: Dosimetry Post-Processing | elapsed=%.2fs", time.perf_counter() - t_stage) 
+        if self.run_postprocess and self.run_dosimetry:
+            t_stage = time.perf_counter()
+            print("Running Dosimetry Post-Processing Stage...")
+            logger.info("Stage start: Dosimetry Post-Processing")
+            context = DosemapPostprocessStage(context).run()
+            print("Dosimetry Post-Processing Stage completed.")
+            logger.info("Stage end: Dosimetry Post-Processing | elapsed=%.2fs", time.perf_counter() - t_stage)
 
-        # ----------------------------- PRODUCTION cleanup ----------------------------- 
-        if self.mode == "PRODUCTION": 
-            # Clean up SIMIND work_dir after post-processing is done 
-            simind_work = getattr(context, "simind_work_dir", None) 
-            if simind_work and os.path.exists(simind_work): 
-                # Only clean if postprocess is done or not requested 
-                if not self.run_postprocess or not self.run_spect: 
-                    self._cleanup_work_dir(simind_work) 
-                elif self.run_postprocess and self.run_spect: 
-                    # Post-process already ran, safe to clean 
-                    self._cleanup_work_dir(simind_work) 
+        # ── PRODUCTION cleanup ─────────────────────────────────────────────────
+        if self.mode == "PRODUCTION":
+            simind_work = getattr(context, "simind_work_dir", None)
+            if simind_work and os.path.exists(simind_work):
+                self._cleanup_work_dir(simind_work)
 
         logger.info("Pipeline end | total_elapsed=%.2fs", time.perf_counter() - t_pipeline)
-        print("TDT Pipeline completed successfully.")
+        print("VTT pipeline completed successfully.")
         return context
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build the CLI argument parser for the TDT pipeline."""
+    """Build the CLI argument parser for the VTT pipeline."""
     parser = argparse.ArgumentParser(
-        description="Theranostic Digital Twin (TDT) Pipeline Runner"
+        description="Virtual Theranostic Trials pipeline runner"
     )
 
     parser.add_argument("--config_file", required=True, type=str,
                         help="Path to JSON config file.")
-    parser.add_argument("--input_ct_dir", required=True, type=str,
-                        help="Directory containing CT inputs (NIfTI files or DICOM folders).")
+
+    ct_group = parser.add_mutually_exclusive_group(required=True)
+    ct_group.add_argument("--input_ct_dir", type=str,
+                          help="Directory containing CT inputs (NIfTI files or DICOM folders).")
+    ct_group.add_argument("--input_ct", type=str,
+                          help="Direct path to a single CT input (NIfTI file or DICOM directory).")
 
     parser.add_argument(
         "--mode",
@@ -574,29 +670,117 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _print_startup_banner(
+    args: Any,
+    items: List[str],
+    cfg: Dict[str, Any],
+    log_path: Optional[str] = None,
+) -> None:
+    """Print a formatted startup banner to stdout and optionally append it to a log file."""
+    import datetime
+
+    avail = os.cpu_count() or 1
+    w = 68
+    border = "═" * w
+    lines: List[str] = []
+
+    def add(text: str = "") -> None:
+        lines.append(text)
+
+    add(f"╔{border}╗")
+    add(f"║  {'Virtual Theranostic Trials  —  VTT Pipeline'.center(w - 4)}  ║")
+    add(f"║  {'BC Cancer  ·  QURIT Lab'.center(w - 4)}  ║")
+    add(f"╚{border}╝")
+    add()
+    now = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+    add(f"  Started   : {now}")
+    add(f"  Mode      : {args.mode}")
+    add(f"  CT inputs : {len(items)} item(s)")
+    add()
+
+    # Phases to run
+    phase1_tasks = ["segmentation", "PBPK"]
+    if args.synthetic_lesions:
+        phase1_tasks.append("synthetic lesions")
+    add("  Phases to run:")
+    add(f"    ✓  Phase 1  —  {', '.join(phase1_tasks)}")
+    if args.spect:
+        nc = cfg.get("phase_2", {}).get("simind_stage", {}).get("num_cpu", 1)
+        eff = avail if nc == 0 else min(nc, avail)
+        using = f"using all {avail}" if nc == 0 else str(eff)
+        add(f"    ✓  Phase 2  —  SIMIND SPECT  ({using} core(s))")
+    if args.dosimetry:
+        gate_cfg = cfg.get("phase_2", {}).get("opengate_stage", {}).get("gate", {})
+        nc2 = gate_cfg.get("num_cpu", 1)
+        eff2 = avail if nc2 == 0 else min(nc2, avail)
+        using2 = f"using all {avail}" if nc2 == 0 else str(eff2)
+        add(f"    ✓  Phase 2  —  OpenGATE dosimetry  ({using2} thread(s))")
+    if args.postprocess:
+        sims = []
+        if args.spect:     sims.append("SPECT")
+        if args.dosimetry: sims.append("dose map")
+        add(f"    ✓  Phase 3  —  Post-processing  ({', '.join(sims) if sims else 'no simulations'})")
+    add()
+
+    # CPU summary
+    add(f"  CPU available : {avail} core(s)")
+    if args.spect:
+        nc = cfg.get("phase_2", {}).get("simind_stage", {}).get("num_cpu", 1)
+        eff_nc = avail if nc == 0 else min(nc, avail)
+        note = f"num_cpu={nc} → using all {avail}" if nc == 0 else f"num_cpu={nc}"
+        add(f"  SIMIND        : {eff_nc} core(s)  ({note})")
+    if args.dosimetry:
+        gate_cfg2 = cfg.get("phase_2", {}).get("opengate_stage", {}).get("gate", {})
+        nc2 = gate_cfg2.get("num_cpu", 1)
+        eff_nc2 = avail if nc2 == 0 else min(nc2, avail)
+        note2 = f"num_cpu={nc2} → using all {avail}" if nc2 == 0 else f"num_cpu={nc2}"
+        add(f"  OpenGATE      : {eff_nc2} thread(s)  ({note2})")
+    add()
+    add("  Existing stage outputs are skipped automatically on rerun.")
+    add()
+    add("─" * (w + 2))
+    add()
+
+    # Print to stdout
+    for line in lines:
+        print(line)
+
+    # Append to log file if provided
+    if log_path:
+        try:
+            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write("\n".join(lines) + "\n")
+        except Exception:
+            pass  # Never block the run due to logging
+
+
 def main() -> int:
     """
-    CLI entrypoint. Iterates through all CT inputs in `input_ct_dir` and runs the pipeline.
+    CLI entrypoint. Iterates through all CT inputs and runs the pipeline.
+
+    Accepts either --input_ct_dir (directory of CT items) or --input_ct (single CT path).
 
     Returns
     -------
     int
-        Process exit code (0 = all CTs processed; individual failures are logged but don't stop the batch).
+        Process exit code (0 = all CTs processed; individual failures logged but don't stop batch).
     """
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    ct_inputs_dir = os.path.abspath(args.input_ct_dir)
-    if not os.path.isdir(ct_inputs_dir):
-        raise NotADirectoryError(f"input_ct_dir must be a directory: {ct_inputs_dir}")
-
-    # Filter hidden files/dirs; sort for deterministic ordering.
-    items = [n for n in sorted(os.listdir(ct_inputs_dir)) if not n.startswith(".")]
-    print("----------------------------- Starting TDT Pipeline -----------------------------")
-    print("")
-    print(f"Discovered {len(items)} CT item(s) in: {ct_inputs_dir}")
-    print(f"Flags: --spect={args.spect} --dosimetry={args.dosimetry} --postprocess={args.postprocess}") 
-    print("")
+    # Resolve CT input items from either --input_ct or --input_ct_dir.
+    if args.input_ct:
+        ct_path = os.path.abspath(args.input_ct)
+        if not os.path.exists(ct_path):
+            raise FileNotFoundError(f"--input_ct path not found: {ct_path}")
+        ct_inputs_dir = os.path.dirname(ct_path)
+        items = [os.path.basename(ct_path)]
+    else:
+        ct_inputs_dir = os.path.abspath(args.input_ct_dir)
+        if not os.path.isdir(ct_inputs_dir):
+            raise NotADirectoryError(f"input_ct_dir must be a directory: {ct_inputs_dir}")
+        items = [n for n in sorted(os.listdir(ct_inputs_dir)) if not n.startswith(".")]
 
     # Pre-flight: validate config before touching any CT.
     # Inject computed paths first so validation sees the real values.
@@ -604,25 +788,11 @@ def main() -> int:
         with open(args.config_file, encoding="utf-8") as _f:
             _cfg_raw = json.loads(json_minify(_f.read()))
 
-        # Inject paths from pipeline_paths.json (same logic as TdtPipeline._inject_computed_paths)
-        _repo = os.path.abspath(os.path.dirname(__file__))
-        _pp_path = os.path.join(_repo, "src", "data", "pipeline_paths.json")
-        _pp: Dict[str, Any] = {}
-        try:
-            with open(_pp_path, encoding="utf-8") as _ppf:
-                _pp = json.loads(json_minify(_ppf.read()))
-        except Exception:
-            pass
-        _input_paths = _pp.get("input_paths", {})
-
-        _lmp = _input_paths.get("label_map_path", "").strip()
-        if not _lmp:
-            _lmp = os.path.join(_repo, "src", "data", "tdt_map.json")
-        _cfg_raw["phase_1"]["segmentation_stage"]["label_map_path"] = _lmp
-
-        _sdir = _input_paths.get("SIMINDDirectory", "").strip()
-        if _sdir:
-            _cfg_raw["phase_2"]["simind_stage"]["SIMINDDirectory"] = _sdir
+        _cfg_raw = inject_pipeline_paths(
+            _cfg_raw,
+            repo_root=os.path.abspath(os.path.dirname(__file__)),
+            include_input_paths=True,
+        )
 
         validate_config(
             _cfg_raw,
@@ -638,6 +808,9 @@ def main() -> int:
         print(f"\n[ERROR] Config file not found: {_fnf}\n")
         return 1
 
+    _banner_log = os.path.join(os.path.dirname(os.path.abspath(args.config_file)), "pipeline_run.log")
+    _print_startup_banner(args, items, _cfg_raw, log_path=_banner_log)
+
     any_failed = False
     for idx, name in enumerate(items, start=args.ct_index_start):
         ct_path = os.path.join(ct_inputs_dir, name)
@@ -646,7 +819,7 @@ def main() -> int:
             pipeline = TdtPipeline(
                 config_path=args.config_file,
                 ct_input=ct_path,
-                ct_indx=idx,
+                ct_index=idx,
                 logging_on=args.logging_on,
                 save_config=args.save_config,
                 mode=args.mode,

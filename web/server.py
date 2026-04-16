@@ -1,16 +1,28 @@
 """
 FastAPI backend for the Virtual Theranostic Trials web UI.
 
+Serves the single-page web app and exposes the API used to scan CT inputs,
+build per-patient configs, preview CT data, and stream logs from pipeline
+subprocess runs.
+
 Endpoints
 ---------
-GET  /                          Serve the React SPA (index.html)
-GET  /api/config-template       Return parsed config template + field metadata
-POST /api/scan-directory        Scan a local CT input directory → patient list
-POST /api/upload-ct             Accept uploaded directory files → temp path + patient list
-POST /api/preview-ct            Generate axial/coronal/sagittal PNG previews for one CT
-POST /api/run                   Start a pipeline run → run_id
-WS   /ws/{run_id}               Stream live logs for a run
-GET  /api/runs/{run_id}         Poll run status / timing
+GET  /                              Serve the React SPA (index.html)
+GET  /api/system-info               CPU count and other system metadata
+GET  /api/input-paths               Read input_paths section from pipeline_paths.json
+GET  /api/config-template           Return parsed config template + field metadata
+POST /api/scan-directory            Scan a local CT input directory → patient list
+POST /api/upload-ct                 Accept uploaded directory files → temp path + patient list
+POST /api/preview-ct                Generate axial/coronal/sagittal PNG previews for one CT
+POST /api/pick-directory            Open a native OS folder-picker dialog
+POST /api/create-output-dirs        Create per-patient output dirs and write base config.json
+POST /api/save-patient-config       Inject developer fields and save config to an output dir
+GET  /api/load-patient-config       Load existing config.json for rerun auto-fill
+GET  /api/check-completion          Check which pipeline stages have already produced output
+POST /api/run                       Start a pipeline run → run_id
+POST /api/runs/{run_id}/stop        Kill a running pipeline run
+GET  /api/runs/{run_id}             Poll run status / timing
+WS   /ws/{run_id}                   Stream live logs for a run
 """
 from __future__ import annotations
 
@@ -18,21 +30,25 @@ import asyncio
 import base64
 import json
 import os
+import signal
 import shutil
 import sys
 import tempfile
 import time
 import uuid
+from contextlib import asynccontextmanager, suppress
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from starlette.requests import ClientDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from src.io.config_paths import inject_pipeline_paths, load_pipeline_paths, strip_developer_fields
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).parent.parent.resolve()
@@ -40,21 +56,84 @@ WEB_DIR   = Path(__file__).parent
 STATIC_DIR = WEB_DIR / "static"
 CONFIG_TEMPLATE   = REPO_ROOT / "config_template.json"
 MAIN_PY           = REPO_ROOT / "main.py"
-TDT_MAP           = REPO_ROOT / "src" / "data" / "tdt_map.json"
+VTT_MAP           = REPO_ROOT / "src" / "data" / "vtt_map.json"
 PIPELINE_OPTIONS  = REPO_ROOT / "src" / "data" / "pipeline_options.json"
-PIPELINE_PATHS    = REPO_ROOT / "src" / "data" / "pipeline_paths.json"
 
-# ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Virtual Theranostic Trials")
+RUN_TTL_SECONDS = 6 * 60 * 60
+RUN_PRUNE_INTERVAL_SECONDS = 10 * 60
+MAX_FINISHED_RUNS = 200
+UPLOAD_TTL_SECONDS = 7 * 24 * 60 * 60   # delete upload dirs older than 7 days
 
 # In-memory registry: run_id → run dict
-_runs: Dict[str, Dict] = {}
+_runs: Dict[str, Dict[str, Any]] = {}
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def _startup() -> None:
+def _prune_finished_runs(now: float | None = None) -> None:
+    """Drop expired finished runs and cap retained history."""
+    now = time.time() if now is None else now
+    removable_ids: List[str] = []
+    finished_runs: List[tuple[float, str]] = []
+
+    for run_id, run in _runs.items():
+        if run.get("status") not in {"done", "error"}:
+            continue
+
+        end_time = float(run.get("end_time") or run.get("start_time") or now)
+        if now - end_time > RUN_TTL_SECONDS:
+            removable_ids.append(run_id)
+            continue
+
+        finished_runs.append((end_time, run_id))
+
+    for run_id in removable_ids:
+        _runs.pop(run_id, None)
+
+    if len(finished_runs) <= MAX_FINISHED_RUNS:
+        return
+
+    finished_runs.sort(key=lambda item: item[0])
+    overflow = len(finished_runs) - MAX_FINISHED_RUNS
+    for _, run_id in finished_runs[:overflow]:
+        _runs.pop(run_id, None)
+
+
+def _prune_old_uploads(now: float | None = None) -> None:
+    """Delete upload temp dirs that are older than UPLOAD_TTL_SECONDS."""
+    now = time.time() if now is None else now
+    uploads_root = REPO_ROOT / "uploads"
+    if not uploads_root.is_dir():
+        return
+    for entry in uploads_root.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("vtt_ct_upload_"):
+            continue
+        try:
+            age = now - entry.stat().st_mtime
+            if age > UPLOAD_TTL_SECONDS:
+                shutil.rmtree(entry, ignore_errors=True)
+        except Exception:
+            pass
+
+
+async def _run_registry_janitor() -> None:
+    """Periodically prune expired finished runs and stale upload dirs."""
+    while True:
+        await asyncio.sleep(RUN_PRUNE_INTERVAL_SECONDS)
+        _prune_finished_runs()
+        _prune_old_uploads()
+
+# ── App ────────────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    janitor_task = asyncio.create_task(_run_registry_janitor())
+    try:
+        yield
+    finally:
+        janitor_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await janitor_task
+
+app = FastAPI(title="Virtual Theranostic Trials", lifespan=lifespan)
 
 
 # ── Static / SPA ──────────────────────────────────────────────────────────────
@@ -69,46 +148,29 @@ async def serve_index() -> HTMLResponse:
     return HTMLResponse(index.read_text(encoding="utf-8"))
 
 
-# ── Pipeline input paths (SIMINDDirectory, label_map_path) ────────────────────
+# ── System info ───────────────────────────────────────────────────────────────
+@app.get("/api/system-info")
+async def get_system_info() -> Dict:
+    """Return basic system info (e.g. CPU count) for the UI to display."""
+    return {"cpu_count": os.cpu_count() or 1}
+
+
+# ── Pipeline input paths (read-only) ──────────────────────────────────────────
 @app.get("/api/input-paths")
 async def get_input_paths() -> Dict:
     """Return the current input_paths section from pipeline_paths.json."""
     try:
-        from json_minify import json_minify as _jm
-        pp = json.loads(_jm(PIPELINE_PATHS.read_text()))
+        pp = load_pipeline_paths(REPO_ROOT)
         return pp.get("input_paths", {})
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
-class InputPathsUpdate(BaseModel):
-    label_map_path: str = ""
-    SIMINDDirectory: str = ""
-
-
-@app.post("/api/input-paths")
-async def set_input_paths(req: InputPathsUpdate) -> Dict:
-    """Overwrite input_paths in pipeline_paths.json."""
-    try:
-        from json_minify import json_minify as _jm
-        pp = json.loads(_jm(PIPELINE_PATHS.read_text()))
-        pp.setdefault("input_paths", {})
-        pp["input_paths"]["label_map_path"] = req.label_map_path
-        pp["input_paths"]["SIMINDDirectory"] = req.SIMINDDirectory
-        PIPELINE_PATHS.write_text(json.dumps(pp, indent=2))
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
 
 # ── Field descriptions (used by the frontend to render tooltips) ───────────────
 FIELD_DESCRIPTIONS: Dict[str, str] = {
     "output_folder_title": "Name for the output folder created under the repo root. Each CT gets its own subfolder: <title>_CT_<index>/",
-    "sub_dir_name": "Internal subdirectory name for this pipeline phase (advanced)",
-    "file_prefix": "Filename prefix for outputs from this stage (advanced)",
     "roi_subset": "Which organs to segment and include in downstream simulation stages",
-    "unification_prefix": "Prefix for the combined multi-label segmentation file (advanced)",
-    "label_map_path": "Absolute path to tdt_map.json — maps TDT ROI names to integer label IDs",
     "default_seed": "Global random seed for reproducible lesion placement; 0 = non-reproducible",
     "auto_shrink_factor": "If a lesion can't be placed, reduce its radius by this factor (e.g. 0.85 = shrink 15%) and retry",
     "auto_max_shrink_iters": "Maximum number of radius reductions before abandoning placement of a lesion",
@@ -119,7 +181,6 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "VOIs": "PBPK volumes of interest to model. These are PyCNO observable names. Must cover all segmented ROIs",
     "Randomization_Kidney_SG_Para": "Randomize kidney and salivary-gland PBPK parameters via lognormal sampling — simulates patient-to-patient variability",
     "xyz_dim": "Target voxel counts [x, y, z] for downsampling CT/seg before simulation. Each value must be smaller than the corresponding CT dimension. Null = use native CT resolution (no downsampling).",
-    "SIMINDDirectory": "Absolute path to the directory containing the SIMIND executable (e.g. /home/user/simind/simind)",
     "Collimator": "SIMIND collimator code (e.g. 'si-me' = Siemens medium-energy parallel-hole). Must match your SIMIND install",
     "Isotope": "Isotope code for SIMIND collimator lookup (e.g. 'lu177')",
     "NumProjections": "Number of SPECT angular projection views (typical range: 60–128)",
@@ -131,16 +192,14 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "OutputImgSize": "Output projection image size in pixels per side",
     "OutputPixelWidth": "Output pixel pitch in cm (e.g. 0.5 = 5 mm)",
     "OutputSliceWidth": "Output slice thickness in cm",
-    "NumCores": "CPU cores for parallel SIMIND simulation. 0 = auto-detect and use all available cores",
+    "num_cpu": "CPU cores/threads to use (applies to both SIMIND and OpenGATE). 0 = use all available cores on this system.",
     "save_per_roi_dose_maps": "Save a separate dose map NIfTI file for each segmented organ/ROI",
     "save_summed_dose_map": "Save a single NIfTI with the total dose summed across all ROIs",
     "save_uncertainty_map": "Save Monte Carlo statistical uncertainty maps alongside dose maps",
     "save_material_label_image": "Save the Schneider HU→material composition label image used in simulation",
     "write_mhd_outputs": "Also write outputs as MetaImage (.mhd/.raw) in addition to NIfTI",
-    "output_dose_spacing_mm": "Resample dose maps to this isotropic voxel spacing in mm. Null = match CT",
     "variance_reduction": "Enable forced-detection variance reduction to accelerate Monte Carlo (see config comments for Lu-177 caveats)",
     "total_histories": "Total Monte Carlo particle histories for dosimetry (e.g. 1e7). Higher = more accurate, slower",
-    "num_threads": "Number of parallel OpenGATE simulation threads. More threads = faster but needs more RAM",
     "random_seed": "Monte Carlo random seed. 'auto' = unique each run; integer = reproducible",
     "start_new_process": "Launch OpenGATE in a fresh subprocess (recommended for memory isolation)",
     "density_tolerance_gcm3": "HU-to-material grouping tolerance in g/cm³. Smaller = more distinct materials, larger = faster",
@@ -158,10 +217,12 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "Subsets": "Number of OSEM ordered subsets. Higher subsets → faster convergence but may be less stable",
     "n_lesions": "Number of synthetic lesions to place in this organ",
     "prob": "Lesion centre placement distribution: 'uniform' (random in organ), 'gaussian' (centroid-weighted), or 'user_defined'",
+    "specs": "Per-organ synthetic lesion settings. Each configured organ gets its own lesion placement block.",
+    "radii_mm": "Optional manual lesion radii in millimetres. Omit this list to let the stage choose radii automatically.",
+    "user_centers_zyx": "Manual lesion centres in voxel coordinates ordered as [z, y, x]. Used only when prob = 'user_defined'.",
     "sigma_mm": "Standard deviation in mm for Gaussian lesion placement — controls spread from organ centroid",
     "margin_mm": "Minimum gap in mm between the lesion surface and the organ boundary (and other lesions)",
     "seed": "Random seed for this organ's lesion placement. 0 = non-reproducible",
-    "Randomization_Kidney_SG_Para": "If true, kidney and salivary-gland PBPK parameters are randomly sampled from lognormal distributions",
 }
 
 ROI_CHOICES = ["kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"]
@@ -184,12 +245,12 @@ async def get_config_template() -> Dict:
 
     # Strip all developer-controlled fields (sub_dir_name, file_prefix, label_map_path,
     # SIMINDDirectory, etc.) — these come from pipeline_paths.json, not from the user.
-    data = _strip_developer_fields(data)
+    data = strip_developer_fields(data)
 
-    # Load TDT ROI choices from tdt_map.json (TDT_Pipeline section, excluding reserved labels)
-    _RESERVED = {"background", "body", "synthetic_lesion"}
+    # Load ROI choices from the shared label map (TDT_Pipeline section, excluding reserved labels)
+    _RESERVED = {"background", "remaining_body", "synthetic_lesion"}
     try:
-        tdt_raw = TDT_MAP.read_text(encoding="utf-8")
+        tdt_raw = VTT_MAP.read_text(encoding="utf-8")
         tdt_map = json.loads(json_minify(tdt_raw))
         roi_choices = [
             name for name in tdt_map.get("TDT_Pipeline", {}).values()
@@ -266,7 +327,7 @@ def _discover_patients(ct_dir: str) -> List[Dict]:
 @app.post("/api/scan-directory")
 async def scan_directory(req: ScanRequest) -> Dict:
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         patients = await loop.run_in_executor(None, _discover_patients, req.path)
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -291,7 +352,7 @@ async def pick_directory() -> Dict:
     )
     try:
         import subprocess as _sp
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
             lambda: _sp.run(
@@ -319,6 +380,10 @@ async def create_output_dirs(req: CreateDirsRequest) -> Dict:
     Create one output directory per patient under REPO_ROOT:
       {project_name}_CT_1 / {project_name}_CT_2 / …
     Write a base config.json (user-facing fields only) into each dir.
+
+    Returns `existed`: a per-patient flag indicating whether the directory
+    already contained pipeline outputs (subdirectories) before this call.
+    The frontend uses this to warn the user that completed stages will be skipped.
     """
     name = req.project_name.strip()
     if not name:
@@ -330,20 +395,42 @@ async def create_output_dirs(req: CreateDirsRequest) -> Dict:
     except Exception:
         base_cfg = {}
 
-    base_cfg = _strip_developer_fields(base_cfg)
+    base_cfg = strip_developer_fields(base_cfg)
     base_cfg["output_folder_title"] = name
 
+    # Do not pre-populate synthetic lesion specs — they start empty and are added
+    # by the user through the UI only when the synthetic lesions flag is enabled.
+    base_cfg.get("phase_1", {}).get("synthetic_lesions_stage", {}).pop("specs", None)
+
     created: Dict[str, str] = {}
+    existed: Dict[str, bool] = {}
+    existing_configs: Dict[str, Any] = {}   # patient_name → stripped user config (when prior run exists)
+
     for i, patient in enumerate(req.patients, start=1):
         out_dir = REPO_ROOT / f"{name}_CT_{i}"
+        # Check for prior pipeline outputs (any subdirectory) before touching the dir.
+        has_prior = out_dir.exists() and any(
+            e.is_dir() for e in out_dir.iterdir() if not e.name.startswith(".")
+        )
         out_dir.mkdir(parents=True, exist_ok=True)
         cfg_path = out_dir / "config.json"
         if not cfg_path.exists():
-            full_cfg = _inject_paths_into_config(base_cfg)
+            full_cfg = inject_pipeline_paths(base_cfg, repo_root=REPO_ROOT, include_input_paths=False)
             cfg_path.write_text(json.dumps(full_cfg, indent=2))
+        elif has_prior:
+            # Return the existing config so the UI can pre-populate the form.
+            try:
+                from json_minify import json_minify as _jm
+                existing_configs[patient["name"]] = strip_developer_fields(
+                    json.loads(_jm(cfg_path.read_text(encoding="utf-8")))
+                )
+            except Exception:
+                pass
         created[patient["name"]] = str(out_dir)
+        existed[patient["name"]] = has_prior
 
-    return {"dirs": created, "project_name": name}
+    return {"dirs": created, "project_name": name, "existed": existed,
+            "existing_configs": existing_configs}
 
 
 # ── Real-time per-patient config save ─────────────────────────────────────────
@@ -358,9 +445,88 @@ async def save_patient_config(req: SavePatientConfigRequest) -> Dict:
     out_dir = Path(req.output_dir)
     if not out_dir.is_dir():
         raise HTTPException(400, f"Output directory not found: {out_dir}")
-    full_cfg = _inject_paths_into_config(req.config)
+    full_cfg = inject_pipeline_paths(req.config, repo_root=REPO_ROOT, include_input_paths=False)
     (out_dir / "config.json").write_text(json.dumps(full_cfg, indent=2))
     return {"ok": True}
+
+
+# ── Load existing patient config (for rerun auto-fill) ────────────────────────
+@app.get("/api/load-patient-config")
+async def load_patient_config(output_dir: str) -> Dict:
+    """
+    Read config.json from an existing output directory and return the
+    user-facing fields (developer fields stripped).  Used by the UI to
+    auto-populate the config form when rerunning a previous pipeline.
+    """
+    out_dir = Path(output_dir)
+    cfg_path = out_dir / "config.json"
+    if not cfg_path.exists():
+        raise HTTPException(404, f"No config.json found in {output_dir}")
+    try:
+        from json_minify import json_minify as _jm
+        cfg = json.loads(_jm(cfg_path.read_text(encoding="utf-8")))
+    except Exception as e:
+        raise HTTPException(500, f"Could not parse config.json: {e}")
+    return {"config": strip_developer_fields(cfg)}
+
+
+# ── Phase completion check (for rerun warnings) ────────────────────────────────
+@app.get("/api/check-completion")
+async def check_completion(output_dir: str) -> Dict:
+    """
+    Inspect an output directory and return which pipeline phases / sub-stages
+    have already produced output files on disk.
+
+    Used by the UI to warn when a config change would conflict with already-
+    completed work that would be skipped on the next run.
+
+    Returns
+    -------
+    {
+      "phase1_segmentation": bool,
+      "phase1_synthetic_lesions": bool,
+      "phase1_pbpk": bool,
+      "phase2_simind": bool,
+      "phase2_opengate": bool,
+      "phase3_spect": bool,
+      "phase3_dosemap": bool,
+    }
+    """
+    out_dir = Path(output_dir)
+    if not out_dir.is_dir():
+        return {k: False for k in [
+            "phase1_segmentation", "phase1_synthetic_lesions", "phase1_pbpk",
+            "phase2_simind", "phase2_opengate", "phase3_spect", "phase3_dosemap",
+        ]}
+
+    def _any_file(glob_pattern: str) -> bool:
+        return any(True for _ in out_dir.glob(glob_pattern))
+
+    return {
+        # Phase 1 segmentation: unified label map written
+        "phase1_segmentation": _any_file("digital_twin/segmentation_stage/unified_labels*.nii*"),
+        # Phase 1 synthetic lesions stage output
+        "phase1_synthetic_lesions": _any_file("digital_twin/synthetic_lesions_stage/*.nii*"),
+        # Phase 1 PBPK TAC
+        "phase1_pbpk": _any_file("digital_twin/pbpk_tac_stage/*.json"),
+        # Phase 2 SIMIND simulation outputs
+        "phase2_simind": (
+            _any_file("simulations/*.a00")
+            or _any_file("simulations/simind_simulation/**/*.a00")
+        ),
+        # Phase 2 OpenGATE simulation outputs
+        "phase2_opengate": _any_file("simulations/opengate_simulation/**/*.nii*"),
+        # Phase 3 SPECT post-processing
+        "phase3_spect": (
+            _any_file("post_processing/spect_postprocess/*.nii*")
+            or _any_file("post_processing/reconstructed_SPECT_*.nii*")
+        ),
+        # Phase 3 dose-map post-processing
+        "phase3_dosemap": (
+            _any_file("post_processing/*_total_dose.nii*")
+            or _any_file("post_processing/dosemap_postprocess/**/*.nii*")
+        ),
+    }
 
 
 # ── CT file upload ─────────────────────────────────────────────────────────────
@@ -383,29 +549,32 @@ async def upload_ct(request: Request) -> Dict:
     if not files:
         raise HTTPException(400, "No files received.")
 
-    tmp = Path(tempfile.mkdtemp(prefix="vtt_ct_upload_"))
+    # Save uploads to a permanent directory so the path stays valid across reruns.
+    uploads_root = REPO_ROOT / "uploads"
+    uploads_root.mkdir(exist_ok=True)
+    upload_dir = Path(tempfile.mkdtemp(prefix="vtt_ct_upload_", dir=str(uploads_root)))
     try:
         for f in files:
             # Normalise path separators (browser may send \ on Windows)
             rel = (f.filename or "").replace("\\", "/").lstrip("/")
             if not rel:
                 continue
-            dest = tmp / rel
+            dest = upload_dir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(await f.read())
 
         # The top-level component of the first file's path is the dropped folder name
         first_rel = (files[0].filename or "").replace("\\", "/").lstrip("/")
         top = first_rel.split("/")[0] if "/" in first_rel else ""
-        ct_dir = str(tmp / top) if top else str(tmp)
+        ct_dir = str(upload_dir / top) if top else str(upload_dir)
 
         patients = _discover_patients(ct_dir)
-        return {"path": ct_dir, "patients": patients, "count": len(patients), "tmp": True}
+        return {"path": ct_dir, "patients": patients, "count": len(patients)}
     except ValueError as e:
-        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(upload_dir, ignore_errors=True)
         raise HTTPException(400, str(e))
     except Exception as e:
-        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(upload_dir, ignore_errors=True)
         raise HTTPException(500, str(e))
 
 
@@ -413,6 +582,72 @@ async def upload_ct(request: Request) -> Dict:
 class PreviewRequest(BaseModel):
     path: str
     ct_type: str   # "nifti" or "dicom"
+
+
+def _extract_height_weight(path: str, ct_type: str) -> Dict:
+    """
+    Try to read PatientSize (0010,1020) and PatientWeight (0010,1030) from DICOM tags.
+
+    Returns a dict with keys:
+      height_m   : float or None
+      weight_kg  : float or None
+      missing    : list[str]   fields that could not be found
+      source     : "dicom" | "not_dicom" | "no_files"
+    """
+    if ct_type != "dicom":
+        return {"height_m": None, "weight_kg": None,
+                "missing": ["height", "weight"], "source": "not_dicom"}
+
+    import pydicom
+
+    # Walk the directory tree — DICOM series are often nested several levels deep
+    # (e.g. patient/study/series/*.dcm).  os.listdir only sees the top level, so
+    # we use rglob to find actual files regardless of nesting depth.
+    candidates: List[str] = []
+    try:
+        for fp in sorted(Path(path).rglob("*")):
+            if fp.is_file():
+                candidates.append(str(fp))
+            if len(candidates) >= 200:
+                break
+    except Exception:
+        pass
+
+    if not candidates:
+        return {"height_m": None, "weight_kg": None,
+                "missing": ["height", "weight"], "source": "no_files"}
+
+    height: Optional[float] = None
+    weight: Optional[float] = None
+
+    for fp in candidates:
+        try:
+            ds = pydicom.dcmread(fp, stop_before_pixels=True, force=True)
+            h = getattr(ds, "PatientSize", None)
+            w = getattr(ds, "PatientWeight", None)
+            h = float(h) if h not in (None, "", " ") else None
+            w = float(w) if w not in (None, "", " ") else None
+            if h is not None and h <= 0:
+                h = None
+            if w is not None and w <= 0:
+                w = None
+            if h is not None:
+                height = h
+            if w is not None:
+                weight = w
+            if height is not None and weight is not None:
+                break
+        except Exception:
+            continue
+
+    missing = []
+    if height is None:
+        missing.append("height")
+    if weight is None:
+        missing.append("weight")
+
+    return {"height_m": height, "weight_kg": weight,
+            "missing": missing, "source": "dicom"}
 
 
 def _arr_to_png_b64(arr: np.ndarray, max_px: int = 512) -> str:
@@ -484,7 +719,7 @@ def _load_preview_slices(path: str, ct_type: str) -> Dict:
         img = nib.load(path)
         sh = img.shape           # (nx, ny, nz) or (nx, ny, nz, t)
         nx, ny, nz = sh[0], sh[1], sh[2]
-        proxy = img.dataobj      # lazy — only decompresses what you index
+        proxy = img.dataobj      # lazy proxy — decompresses slices on access
 
         try:
             zooms = img.header.get_zooms()[:3]
@@ -509,7 +744,13 @@ def _load_preview_slices(path: str, ct_type: str) -> Dict:
     try:
         import SimpleITK as sitk
         reader = sitk.ImageSeriesReader()
-        fnames = reader.GetGDCMSeriesFileNames(path)
+        # Suppress the C++ ITK/GDCM "No Series can be found" stderr warning that
+        # fires before GetGDCMSeriesFileNames returns an empty list.
+        sitk.ProcessObject.SetGlobalWarningDisplay(False)
+        try:
+            fnames = reader.GetGDCMSeriesFileNames(path)
+        finally:
+            sitk.ProcessObject.SetGlobalWarningDisplay(True)
         if not fnames:
             raise RuntimeError("No DICOM series found")
         nz = len(fnames)
@@ -603,15 +844,20 @@ def _load_preview_slices(path: str, ct_type: str) -> Dict:
 @app.post("/api/preview-ct")
 async def preview_ct(req: PreviewRequest) -> Dict:
     try:
-        loop = asyncio.get_event_loop()
-        slices = await loop.run_in_executor(
-            None, _load_preview_slices, req.path, req.ct_type
+        loop = asyncio.get_running_loop()
+        slices, hw = await asyncio.gather(
+            loop.run_in_executor(None, _load_preview_slices, req.path, req.ct_type),
+            loop.run_in_executor(None, _extract_height_weight, req.path, req.ct_type),
         )
         return {
-            "axial":    _arr_to_png_b64(slices["axial"]),
-            "coronal":  _arr_to_png_b64(slices["coronal"]),
-            "sagittal": _arr_to_png_b64(slices["sagittal"]),
-            "shape":    slices["shape"],
+            "axial":     _arr_to_png_b64(slices["axial"]),
+            "coronal":   _arr_to_png_b64(slices["coronal"]),
+            "sagittal":  _arr_to_png_b64(slices["sagittal"]),
+            "shape":     slices["shape"],
+            "height_m":  hw["height_m"],
+            "weight_kg": hw["weight_kg"],
+            "missing":   hw["missing"],
+            "hw_source": hw["source"],
         }
     except Exception as e:
         raise HTTPException(500, f"Could not load CT preview: {e}")
@@ -639,83 +885,6 @@ def _fmt_duration(seconds: float) -> str:
     parts.append(f"{s} sec")
     return " ".join(parts)
 
-
-# Developer-controlled fields that live in pipeline_paths.json and must NOT
-# appear in user-facing config files shown or edited via the web UI.
-_DEVELOPER_FIELDS = {"sub_dir_name", "file_prefix", "unification_prefix", "label_map_path", "SIMINDDirectory"}
-
-
-def _strip_developer_fields(cfg: dict) -> dict:
-    """Remove developer-controlled keys from a config dict (deep copy, non-destructive)."""
-    import copy as _copy
-    cfg = _copy.deepcopy(cfg)
-
-    def _strip(obj: Any) -> None:
-        if isinstance(obj, dict):
-            for k in list(obj.keys()):
-                if k in _DEVELOPER_FIELDS:
-                    del obj[k]
-                else:
-                    _strip(obj[k])
-
-    _strip(cfg)
-    return cfg
-
-
-def _inject_paths_into_config(cfg: dict) -> dict:
-    """
-    Inject ALL developer-controlled fields from pipeline_paths.json into *cfg*.
-
-    This covers:
-    - input_paths.label_map_path  → phase_1.segmentation_stage.label_map_path
-    - input_paths.SIMINDDirectory → phase_2.simind_stage.SIMINDDirectory
-    - phase_*/sub_dir_name         → each phase's sub_dir_name
-    - phase_*/*/file_prefix        → each stage's file_prefix / unification_prefix
-
-    Returns a new dict with all fields filled in.
-    """
-    import copy as _copy
-    cfg = _copy.deepcopy(cfg)
-
-    try:
-        from json_minify import json_minify as _jm
-        pipeline_paths = json.loads(_jm(PIPELINE_PATHS.read_text(encoding="utf-8")))
-    except Exception:
-        pipeline_paths = {}
-
-    input_paths = pipeline_paths.get("input_paths", {})
-
-    # label_map_path
-    lmp = input_paths.get("label_map_path", "").strip()
-    if not lmp:
-        lmp = str(TDT_MAP)
-    cfg.setdefault("phase_1", {}).setdefault("segmentation_stage", {})["label_map_path"] = lmp
-
-    # SIMINDDirectory
-    sdir = input_paths.get("SIMINDDirectory", "").strip()
-    if sdir:
-        cfg.setdefault("phase_2", {}).setdefault("simind_stage", {})["SIMINDDirectory"] = sdir
-
-    # sub_dir_name and file_prefix from pipeline_paths.json phases
-    _STAGE_FIELDS = ("file_prefix", "unification_prefix", "sub_dir_name")
-    for phase_key in ("phase_1", "phase_2", "phase_3"):
-        pp_phase = pipeline_paths.get(phase_key, {})
-        if not isinstance(pp_phase, dict):
-            continue
-        cfg_phase = cfg.setdefault(phase_key, {})
-        if "sub_dir_name" in pp_phase:
-            cfg_phase["sub_dir_name"] = pp_phase["sub_dir_name"]
-        for stage_key, stage_data in pp_phase.items():
-            if stage_key == "sub_dir_name" or not isinstance(stage_data, dict):
-                continue
-            cfg_stage = cfg_phase.setdefault(stage_key, {})
-            for field in _STAGE_FIELDS:
-                if field in stage_data:
-                    cfg_stage[field] = stage_data[field]
-
-    return cfg
-
-
 @app.post("/api/run")
 async def start_run(req: RunRequest) -> Dict:
     """
@@ -729,10 +898,10 @@ async def start_run(req: RunRequest) -> Dict:
     if not req.patients:
         raise HTTPException(400, "No patients provided.")
 
+    _prune_finished_runs()
     run_id = str(uuid.uuid4())[:8]
-    tmp = Path(tempfile.mkdtemp(prefix=f"vtt_run_{run_id}_"))
 
-    # Build one job per patient
+    # Build one job per patient — pass the CT path directly, no temp dirs or symlinks.
     jobs = []
     for i, patient in enumerate(req.patients, start=1):
         nm = patient["name"]
@@ -740,15 +909,22 @@ async def start_run(req: RunRequest) -> Dict:
         if not out_dir.is_dir():
             raise HTTPException(400, f"Output directory for {nm!r} not found: {out_dir}")
 
-        # Single-patient temp dir with symlink to the original CT
-        pt_dir = tmp / f"ct_{i}"
-        pt_dir.mkdir()
-        src = Path(patient["path"])
-        link = pt_dir / src.name
-        link.symlink_to(src)
+        ct_path = Path(patient["path"])
+        if not ct_path.exists():
+            # Fall back to the CT copy saved in the output folder on a previous run.
+            candidate = out_dir / ct_path.name
+            if candidate.exists():
+                ct_path = candidate
+            else:
+                raise HTTPException(
+                    400,
+                    f"CT source for '{nm}' not found at '{patient['path']}' "
+                    f"and no saved copy exists in '{out_dir}'. "
+                    "Please re-upload or re-scan the CT directory.",
+                )
 
         jobs.append({
-            "ct_dir": str(pt_dir),
+            "ct_path": str(ct_path),
             "config": str(out_dir / "config.json"),
             "ct_index_start": i,
             "patient_name": nm,
@@ -762,7 +938,6 @@ async def start_run(req: RunRequest) -> Dict:
         "logs": [],
         "start_time": time.time(),
         "end_time": None,
-        "tmp_dir": str(tmp),
         "total_patients": len(req.patients),
         "patient_times": {},
         "output_title": req.project_name,
@@ -817,7 +992,7 @@ async def _execute_run(run_id: str) -> None:
                 "-u",
                 str(MAIN_PY),
                 "--config_file", job["config"],
-                "--input_ct_dir", job["ct_dir"],
+                "--input_ct", job["ct_path"],
                 "--mode", run["mode"],
                 "--ct_index_start", str(ct_idx),
                 "--launched_via", "web_ui",
@@ -826,7 +1001,7 @@ async def _execute_run(run_id: str) -> None:
             _emit(f"[VTT] Command: {' '.join(cmd)}\n\n")
 
             env = os.environ.copy()
-            env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -834,6 +1009,7 @@ async def _execute_run(run_id: str) -> None:
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(REPO_ROOT),
                 env=env,
+                start_new_session=True,
             )
             run["proc"] = proc
 
@@ -860,16 +1036,14 @@ async def _execute_run(run_id: str) -> None:
         run["status"] = "error"
     finally:
         run["end_time"] = time.time()
-        # Clean up the temporary run directory (config JSONs, symlinks)
-        tmp = run.get("tmp_dir")
-        if tmp and Path(tmp).exists():
-            shutil.rmtree(tmp, ignore_errors=True)
+        _prune_finished_runs(run["end_time"])
 
 
 # ── WebSocket log streaming ────────────────────────────────────────────────────
 @app.websocket("/ws/{run_id}")
 async def ws_logs(ws: WebSocket, run_id: str) -> None:
     await ws.accept()
+    _prune_finished_runs()
 
     if run_id not in _runs:
         await ws.send_text(json.dumps({"error": "Run not found"}))
@@ -918,6 +1092,7 @@ async def ws_logs(ws: WebSocket, run_id: str) -> None:
 # ── Stop a running run ────────────────────────────────────────────────────────
 @app.post("/api/runs/{run_id}/stop")
 async def stop_run(run_id: str) -> Dict:
+    _prune_finished_runs()
     if run_id not in _runs:
         raise HTTPException(404, "Run not found")
     run = _runs[run_id]
@@ -926,18 +1101,23 @@ async def stop_run(run_id: str) -> Dict:
     proc = run.get("proc")
     if proc and proc.returncode is None:
         try:
-            proc.kill()   # SIGKILL — immediate, no cleanup
-        except ProcessLookupError:
-            pass
+            # Kill the entire process group so SIMIND/OpenGATE grandchildren
+            # are also terminated (start_new_session=True gives them their own pgid).
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            with suppress(Exception):
+                proc.kill()
     run["logs"].append("\n[VTT] Run stopped by user.\n")
     run["status"] = "error"
     run["end_time"] = time.time()
+    _prune_finished_runs(run["end_time"])
     return {"status": "stopped"}
 
 
 # ── Run status (for polling fallback) ─────────────────────────────────────────
 @app.get("/api/runs/{run_id}")
 async def get_run_status(run_id: str) -> Dict:
+    _prune_finished_runs()
     if run_id not in _runs:
         raise HTTPException(404, "Run not found")
     run = _runs[run_id]

@@ -1,9 +1,9 @@
 """
-SIMIND Simulation Stage for the TDT pipeline (includes preprocessing).
+SIMIND simulation for the VTT pipeline.
 
 This stage prepares inputs for SIMIND and runs Monte Carlo SPECT projection simulations.
 
-Preprocessing (merged from preprocessing_simind_stage.py):
+Preprocessing:
 - Converting CT + segmentation NIfTIs into the SIMIND grid convention (z, y, x with y-flip).
 - Optionally resizing to a target in-plane dimension via isotropic zoom.
 - Building ROI masks and a label->name class map from the unified TDT multilabel segmentation.
@@ -15,7 +15,7 @@ Simulation:
 - Copy SIMIND template files into a per-CT work directory.
 - For each ROI:
   - Copy the source map binary into the work directory.
-  - Run SIMIND in parallel using `num_cores` processes (each with a unique /rr: seed).
+  - Run SIMIND in parallel using `num_cpu` processes (each with a unique /rr: seed).
   - Aggregate per-core projection totals into a single per-organ file per energy window.
 - Run a Jaszczak-based calibration (if not already present) to produce `calib.res`.
 - Sum per-organ projections into total projections per energy window.
@@ -24,7 +24,7 @@ Simulation:
 Expected Context interface
 --------------------------
 Incoming `context` is expected to provide:
-- context.config["phase_2"]["simind_stage"] : dict (including roi_subset, xy_dim)
+- context.config["phase_2"]["simind_stage"] : dict (including roi_subset, xyz_dim)
 - context.config["phase_1"]["segmentation_stage"]["label_map_path"] : str
 - context.subdir_paths["phase_2"] : str
 - context.mode : str  ("DEBUG" or "PRODUCTION")
@@ -40,12 +40,10 @@ On success, this stage sets:
 - context.simind_work_dir, context.simind_metadata_path
 - context.simind_calibration_path, context.simind_projection_paths
 - context.simind_summed_projection_paths
-- context.simind_num_cores, context.simind_geometry
+- context.simind_num_cpu, context.simind_geometry
 - context.simind_total_num_voxels, context.simind_scale_factor
 - context.simind_switches_by_organ
 - context.simind_header_dir
-
-Maintainer / contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
@@ -77,10 +75,8 @@ class _SimindPreprocessor:
 
     Resizing
     --------
-    If `xy_dim` is provided, an isotropic scale factor is derived from the in-plane
-    dimension and applied to all three axes via scipy.ndimage.zoom.
-
-    This class was previously the standalone `SimindPreprocessStage`.
+    If a resize target is provided, an isotropic scale factor is derived from
+    the in-plane dimension and applied to all three axes via scipy.ndimage.zoom.
     """
 
     def __init__(                                                                      
@@ -202,28 +198,49 @@ class _SimindPreprocessor:
 
     def _filter_to_requested_rois(self, roi_seg_arr: np.ndarray) -> np.ndarray:
         """
-        Zero out labels not in the requested ROI subset (body label is always kept).
+        Zero out labels not in the requested ROI subset, then recompute remaining_body.
+
+        remaining_body is always included and represents:
+            body_outline − union(this_stage_roi_masks)
+
+        Because the unified segmentation's remaining_body label was computed using the
+        phase-1 ROI subset, it may be too narrow when this stage's subset is smaller
+        (e.g. phase-1 had kidney+liver+heart but SIMIND only uses kidney+liver — heart
+        voxels should then be included in remaining_body for SIMIND).  We correct this
+        by recomputing remaining_body from the full non-background mask.
 
         Raises
         ------
         ValueError  if a requested ROI name is not in the TDT label map.
         """
+        remaining_body_id = self.tdt_name2id.get("remaining_body")
+
         requested = set(self.roi_subset)
-        keep_ids: set = set()
-
-        if "body" in self.tdt_name2id:
-            keep_ids.add(self.tdt_name2id["body"])
-
+        roi_ids: set = set()
         for name in requested:
             lab = self.tdt_name2id.get(name)
             if lab is None:
                 raise ValueError(f"Requested ROI '{name}' not in TDT label map.")
-            keep_ids.add(lab)
+            roi_ids.add(lab)
+        roi_ids.discard(0)
 
-        keep_ids.discard(0)
+        # Body outline = all non-background voxels in the unified segmentation.
+        body_outline = roi_seg_arr != 0
 
         out = roi_seg_arr.copy()
+        # Keep only the requested ROI labels; zero everything else.
+        keep_ids = roi_ids.copy()
+        if remaining_body_id is not None:
+            keep_ids.add(remaining_body_id)
         out[~np.isin(out, list(keep_ids))] = 0
+
+        # Recompute remaining_body for this stage's specific ROI subset:
+        # remaining_body_stage = body_outline AND NOT any_requested_roi
+        if remaining_body_id is not None:
+            stage_roi_mask = np.isin(roi_seg_arr, list(roi_ids))
+            remaining_body_mask = body_outline & ~stage_roi_mask
+            out[remaining_body_mask] = remaining_body_id
+
         return out
 
     @staticmethod
@@ -273,13 +290,22 @@ class _SimindPreprocessor:
 
         return arr, scale
 
-    def _write_binary_roi_maps(self, roi_body_arr: np.ndarray, class_seg: Dict[str, int]) -> Dict[str, str]:
+    def _write_binary_roi_maps(
+        self,
+        roi_body_arr: np.ndarray,
+        class_seg: Dict[str, int],
+        arr_px_spacing_cm: Optional[Tuple[float, float, float]] = None,
+    ) -> Dict[str, str]:
         """
         Write one flat float32 binary 0/1 source map per ROI for SIMIND.
 
+        Also saves a NIfTI copy of each mask (same grid, same spacing) alongside
+        the .bin file so the SIMIND-grid source maps are human-inspectable without
+        special binary readers — mirroring what OpenGATE writes to its work_dir.
+
         Returns
         -------
-        dict[str, str]  {roi_name: path}  (excludes body; body is used only as a mask)
+        dict[str, str]  {roi_name: path}  (.bin paths; NIfTIs are saved as a side-effect)
         """
         out_paths: Dict[str, str] = {}
         for roi_name, lab in class_seg.items():
@@ -287,11 +313,65 @@ class _SimindPreprocessor:
             out_path = os.path.join(self.output_dir, f"{self.prefix}_{roi_name}_act_av.bin")
             roi_mask.tofile(out_path)
             out_paths[roi_name] = out_path
+
+            # NIfTI companion for visual inspection.
+            nii_path = os.path.join(self.output_dir, f"{self.prefix}_{roi_name}_source_mask.nii.gz")
+            affine = np.eye(4)
+            if arr_px_spacing_cm is not None:
+                # spacing is (z, y, x) in cm → convert to mm and embed in affine diagonal
+                sz, sy, sx = [v * 10.0 for v in arr_px_spacing_cm]
+                affine[0, 0] = sx
+                affine[1, 1] = sy
+                affine[2, 2] = sz
+            nib.save(nib.Nifti1Image(roi_mask, affine), nii_path)
+
         return out_paths
 
-    def run(self) -> Dict[str, Any]:                                                   
+    def _load_preprocess_cache(self, meta_path: str) -> Dict[str, Any]:
+        """
+        Reload preprocessing outputs from disk when all binaries already exist.
+
+        Returns the same dict as run() without reprocessing CT/seg.
+        """
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        shape = tuple(meta["shape"])
+        arr_px_spacing_cm = tuple(float(x) * 0.1 for x in meta["zooms_mm"])
+
+        atn_path = os.path.join(self.output_dir, f"{self.prefix}_atn_av.bin")
+        body_path = os.path.join(self.output_dir, f"{self.prefix}_body_seg.bin")
+        roi_body_path = os.path.join(self.output_dir, f"{self.prefix}_roi_body_seg.bin")
+
+        body_seg_arr = np.fromfile(body_path, dtype=np.float32).reshape(shape)
+        roi_body_arr = np.fromfile(roi_body_path, dtype=np.float32).reshape(shape).astype(np.int16)
+
+        id_to_name = {v: k for k, v in self.tdt_name2id.items()}
+        class_seg = self._build_class_map(roi_body_arr, id_to_name)
+        masks = self._build_label_masks(roi_body_arr)
+
+        binary_roi_act_map_paths: Dict[str, str] = {}
+        for roi_name in class_seg:
+            p = os.path.join(self.output_dir, f"{self.prefix}_{roi_name}_act_av.bin")
+            if os.path.exists(p):
+                binary_roi_act_map_paths[roi_name] = p
+
+        return {
+            "body_seg_arr": body_seg_arr,
+            "roi_body_seg_arr": roi_body_arr,
+            "masks": masks,
+            "class_seg": class_seg,
+            "atn_av_path": atn_path,
+            "binary_roi_act_map_paths": binary_roi_act_map_paths,
+            "arr_px_spacing_cm": arr_px_spacing_cm,
+            "arr_shape_new": shape,
+        }
+
+    def run(self) -> Dict[str, Any]:
         """
         Execute preprocessing and return results dict instead of setting context.
+
+        Skips reprocessing if all output binaries and a cache meta file already exist
+        (allowing reruns to skip the expensive CT/seg grid conversion).
 
         Returns
         -------
@@ -306,6 +386,39 @@ class _SimindPreprocessor:
         if not self.roi_subset:
             raise ValueError("No ROI subset provided for SIMIND preprocessing.")
 
+        # Skip reprocessing if all key outputs already exist AND every ROI in the
+        # current roi_subset has its binary source map on disk.  If the roi_subset
+        # was enlarged since the last run, the new organ's map would be missing and
+        # the simulation would silently drop it — so we must re-run preprocessing.
+        meta_path     = os.path.join(self.output_dir, f"{self.prefix}_preprocess_meta.json")
+        atn_path      = os.path.join(self.output_dir, f"{self.prefix}_atn_av.bin")
+        body_path     = os.path.join(self.output_dir, f"{self.prefix}_body_seg.bin")
+        roi_body_path = os.path.join(self.output_dir, f"{self.prefix}_roi_body_seg.bin")
+        base_ok = all(os.path.exists(p) for p in (meta_path, atn_path, body_path, roi_body_path))
+        if base_ok:
+            # Also verify that every non-remaining_body ROI has a binary map cached.
+            roi_maps_ok = all(
+                os.path.exists(os.path.join(self.output_dir, f"{self.prefix}_{r}_act_av.bin"))
+                for r in self.roi_subset
+                if r != "remaining_body"
+            )
+            if roi_maps_ok:
+                if self.debug:
+                    print("[SimindPreprocessor] Preprocessing outputs already exist, skipping.")
+                return self._load_preprocess_cache(meta_path)
+            elif self.debug:
+                missing = [
+                    r for r in self.roi_subset
+                    if r != "remaining_body"
+                    and not os.path.exists(
+                        os.path.join(self.output_dir, f"{self.prefix}_{r}_act_av.bin")
+                    )
+                ]
+                print(
+                    f"[SimindPreprocessor] ROI binary maps missing for {missing}; "
+                    "re-running preprocessing."
+                )
+
         ct_nii = nib.load(self.ct_nii_path)
         roi_nii = nib.load(self.tdt_roi_seg_path)
 
@@ -315,11 +428,11 @@ class _SimindPreprocessor:
         roi_arr_full, _ = self._to_simind_grid(roi_nii, resize=self.resize, zoom_order=0)
         roi_arr_full = roi_arr_full.astype(np.int16)
 
-        body_label = self.tdt_name2id.get("body")
+        body_label = self.tdt_name2id.get("remaining_body")
         if body_label is None:
-            raise ValueError("TDT label map does not contain a 'body' label.")
-        if not np.any(roi_arr_full == body_label):
-            raise ValueError("Unified TDT segmentation does not contain any 'body' voxels.")
+            raise ValueError("TDT label map does not contain a 'remaining_body' label.")
+        if not np.any(roi_arr_full != 0):
+            raise ValueError("Unified TDT segmentation is empty (no labelled voxels).")
 
         # Body mask: all non-zero voxels in the unified seg (patient boundary).
         body_mask = (roi_arr_full != 0).astype(np.float32)
@@ -352,30 +465,33 @@ class _SimindPreprocessor:
         body_mask.astype(np.float32).tofile(os.path.join(self.output_dir, f"{self.prefix}_body_seg.bin"))
         roi_body_arr.astype(np.float32).tofile(os.path.join(self.output_dir, f"{self.prefix}_roi_body_seg.bin"))
 
-        binary_roi_act_map_paths = self._write_binary_roi_maps(roi_body_arr, class_seg)
+        binary_roi_act_map_paths = self._write_binary_roi_maps(roi_body_arr, class_seg, arr_px_spacing_cm)
 
-        return {                                                                       
-            "body_seg_arr": body_mask,                                                 
-            "roi_body_seg_arr": roi_body_arr,                                          
-            "masks": masks,                                                            
-            "class_seg": class_seg,                                                    
-            "atn_av_path": atn_av_path,                                                
-            "binary_roi_act_map_paths": binary_roi_act_map_paths,                      
-            "arr_px_spacing_cm": arr_px_spacing_cm,                                    
-            "arr_shape_new": ct_arr.shape,                                             
-        }                                                                              
+        # Save cache so future reruns can skip reprocessing.
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"shape": list(ct_arr.shape), "zooms_mm": [x * 10.0 for x in arr_px_spacing_cm]}, f)
+
+        return {
+            "body_seg_arr": body_mask,
+            "roi_body_seg_arr": roi_body_arr,
+            "masks": masks,
+            "class_seg": class_seg,
+            "atn_av_path": atn_av_path,
+            "binary_roi_act_map_paths": binary_roi_act_map_paths,
+            "arr_px_spacing_cm": arr_px_spacing_cm,
+            "arr_shape_new": ct_arr.shape,
+        }
 
 
 class SimindSimulationStage:
     """
     Run SIMIND simulations (per-organ, parallel cores) and save per-organ projection totals.
-    Includes preprocessing (previously separate stage).
 
     Parameters
     ----------
     context : Context-like
         Pipeline context containing config and phase-1 outputs.
-    """
+"""
 
     def __init__(self, context: Any) -> None:
         context.require("subdir_paths", "config", "ct_nii_path", "tdt_roi_seg_path")   
@@ -441,7 +557,7 @@ class SimindSimulationStage:
 
         # Validate SIMIND ROI subset against phase_1 segmented ROIs 
         phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])         
-        invalid_rois = [r for r in self.simind_roi_subset if r not in phase1_rois and r != "body"] 
+        invalid_rois = [r for r in self.simind_roi_subset if r not in phase1_rois and r != "remaining_body"] 
         if invalid_rois:                                                               
             raise ValueError(                                                          
                 f"SIMIND roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. " 
@@ -459,14 +575,14 @@ class SimindSimulationStage:
         }                                                                              
 
         # CPU count: 0 or invalid -> use all available cores
-        num_cores = self.stage_cfg["NumCores"]
+        _cfg_num_cpu = self.stage_cfg.get("num_cpu", 1)
         max_cores = os.cpu_count() or 1
-        if isinstance(num_cores, bool) or not isinstance(num_cores, int) or num_cores < 0 or num_cores > max_cores:
-            self.num_cores = max_cores
-        elif num_cores == 0:
-            self.num_cores = max_cores
+        if isinstance(_cfg_num_cpu, bool) or not isinstance(_cfg_num_cpu, int) or _cfg_num_cpu < 0:
+            self.num_cpu = max_cores
+        elif _cfg_num_cpu == 0:
+            self.num_cpu = max_cores
         else:
-            self.num_cores = num_cores
+            self.num_cpu = min(_cfg_num_cpu, max_cores)
 
         # SIMIND executable (supports .exe suffix on Windows)
         simind_exe = os.path.join(self.simind_dir, "simind")
@@ -477,9 +593,9 @@ class SimindSimulationStage:
         if not os.path.exists(self.simind_exe):
             raise FileNotFoundError(f"SIMIND executable not found: {self.simind_exe}")
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # helpers
-    # -----------------------------
+    # ------------------------------------------------------------------
 
     def _set_simind_environment(self) -> None:
         """
@@ -567,11 +683,11 @@ class SimindSimulationStage:
             f"{self.simind_exe} jaszak calib"
             f"/fi:{self.isotope}"
             f"/cc:{self.collimator}"
-            f"/29:1"
-            f"/15:5"
-            f"/fa:11"
-            f"/fa:15"
-            f"/fa:14"
+            "/29:1"
+            "/15:5"
+            "/fa:11"
+            "/fa:15"
+            "/fa:14"
         )
         subprocess.run(cmd, shell=True, cwd=self.output_dir, stdout=subprocess.DEVNULL)
 
@@ -619,7 +735,7 @@ class SimindSimulationStage:
         ------------
         /fd  attenuation map filename
         /fs  activity source map filename
-        /nn  photons per voxel (scaled by num_cores)
+        /nn  photons per voxel (scaled by num_cpu)
         /cc  collimator
         /fi  isotope
         /02,/05  input half-length (z extent)
@@ -638,7 +754,7 @@ class SimindSimulationStage:
         return (
             f"/fd:{atn_name}"
             f"/fs:{act_name}"
-            f"/in:x22,3x"
+            "/in:x22,3x"
             f"/nn:{scale_factor}"
             f"/cc:{self.collimator}"
             f"/fi:{self.isotope}"
@@ -646,8 +762,8 @@ class SimindSimulationStage:
             f"/05:{geometry['input_half_length']}"
             f"/08:{geometry['detector_length_cm']:.2f}"
             f"/10:{geometry['detector_width_cm']:.2f}"
-            f"/14:-7"
-            f"/15:-7"
+            "/14:-7"
+            "/15:-7"
             f"/20:{-1 * self.energy_window_width}"
             f"/21:{-1 * self.energy_window_width}"
             f"/28:{self.output_pixel_width}"
@@ -669,7 +785,7 @@ class SimindSimulationStage:
         statistically independent. Core 0 outputs to stdout; others are silenced.
         """
         processes: List[subprocess.Popen] = []
-        for j in range(self.num_cores):
+        for j in range(self.num_cpu):
             cmd = (
                 f"{self.simind_exe} {self.prefix} {self.prefix}_{organ_name}_{j} "
                 + simind_switches
@@ -683,7 +799,7 @@ class SimindSimulationStage:
 
     def _aggregate_core_totals_for_organ(self, organ_name: str) -> None:
         """
-        Average projection totals across `num_cores` SIMIND runs and write to work_dir.
+        Average projection totals across `num_cpu` SIMIND runs and write to work_dir.
 
         Reads per-core files:  <work_dir>/<prefix>_<organ>_<j>_tot_w{1,2,3}.a00
         Writes averaged totals: <work_dir>/<prefix>_<organ>_tot_w{1,2,3}.a00
@@ -693,7 +809,7 @@ class SimindSimulationStage:
         """
         xtot_w1 = xtot_w2 = xtot_w3 = 0.0
 
-        for j in range(self.num_cores):
+        for j in range(self.num_cpu):
             p1 = os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_{j}_tot_w1.a00")
             p2 = os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_{j}_tot_w2.a00")
             p3 = os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_{j}_tot_w3.a00")
@@ -710,9 +826,9 @@ class SimindSimulationStage:
                         pass
 
         # Average across cores
-        xtot_w1 /= self.num_cores
-        xtot_w2 /= self.num_cores
-        xtot_w3 /= self.num_cores
+        xtot_w1 /= self.num_cpu
+        xtot_w2 /= self.num_cpu
+        xtot_w3 /= self.num_cpu
 
         organ_paths = self._get_projection_paths_for_organ(organ_name)
         np.asarray(xtot_w1, dtype=np.float32).tofile(organ_paths["w1"])
@@ -789,7 +905,7 @@ class SimindSimulationStage:
     ) -> None:
         """Save stage-specific metadata for debugging / provenance."""
         metadata: Dict[str, Any] = {
-            "stage": "simind_stage (includes preprocessing)",                          
+            "stage": "simind_simulation_stage",
             "phase_output_dir": self.phase_output_dir,
             "output_dir": self.output_dir,
             "stage_output_dir": self.stage_output_dir,
@@ -810,7 +926,7 @@ class SimindSimulationStage:
             "output_pixel_width": self.output_pixel_width,
             "output_slice_width": self.output_slice_width,
             "energy_window_width": self.energy_window_width,
-            "num_cores": self.num_cores,
+            "num_cpu": self.num_cpu,
             "simind_roi_subset": list(self.simind_roi_subset),                         
             "xyz_dim": self.resize,
             "roi_list": roi_list,
@@ -828,9 +944,9 @@ class SimindSimulationStage:
         with open(self.metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=4)
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # main
-    # -----------------------------
+    # ------------------------------------------------------------------
     def run(self) -> Any:
         """
         Execute preprocessing + SIMIND simulation for all organs and save projection totals.
@@ -839,39 +955,37 @@ class SimindSimulationStage:
         -------
         context : Context-like
         """
-        # --- Step 1: Run preprocessing (merged from SimindPreprocessStage) --- 
-        if self.debug: 
+        if self.debug:
             print(f"[SimindSimulationStage] Running preprocessing with xyz_dim={self.resize}")
 
-        preprocessor = _SimindPreprocessor( 
-            ct_nii_path=self.context.ct_nii_path, 
-            tdt_roi_seg_path=self.context.tdt_roi_seg_path, 
-            tdt_name2id=self.tdt_name2id, 
-            roi_subset=self.simind_roi_subset, 
-            output_dir=self.preprocess_dir, 
-            prefix=self.prefix, 
-            resize=self.resize, 
-            debug=self.debug, 
-        ) 
-        preprocess_results = preprocessor.run() 
+        preprocessor = _SimindPreprocessor(
+            ct_nii_path=self.context.ct_nii_path,
+            tdt_roi_seg_path=self.context.tdt_roi_seg_path,
+            tdt_name2id=self.tdt_name2id,
+            roi_subset=self.simind_roi_subset,
+            output_dir=self.preprocess_dir,
+            prefix=self.prefix,
+            resize=self.resize,
+            debug=self.debug,
+        )
+        preprocess_results = preprocessor.run()
 
-        # Set context fields from preprocessing results 
-        self.context.body_seg_arr = preprocess_results["body_seg_arr"] 
-        self.context.roi_body_seg_arr = preprocess_results["roi_body_seg_arr"] 
-        self.context.mask_roi_body = preprocess_results["masks"] 
-        self.context.class_seg = preprocess_results["class_seg"] 
-        self.context.atn_av_path = preprocess_results["atn_av_path"] 
-        self.context.binary_roi_act_map_paths = preprocess_results["binary_roi_act_map_paths"] 
-        self.context.arr_px_spacing_cm = preprocess_results["arr_px_spacing_cm"] 
-        self.context.arr_shape_new = preprocess_results["arr_shape_new"] 
+        self.context.body_seg_arr = preprocess_results["body_seg_arr"]
+        self.context.roi_body_seg_arr = preprocess_results["roi_body_seg_arr"]
+        self.context.mask_roi_body = preprocess_results["masks"]
+        self.context.class_seg = preprocess_results["class_seg"]
+        self.context.atn_av_path = preprocess_results["atn_av_path"]
+        self.context.binary_roi_act_map_paths = preprocess_results["binary_roi_act_map_paths"]
+        self.context.arr_px_spacing_cm = preprocess_results["arr_px_spacing_cm"]
+        self.context.arr_shape_new = preprocess_results["arr_shape_new"]
 
-        # --- Step 2: Run SIMIND simulation --- 
-        class_seg = preprocess_results["class_seg"]                                    
-        arr_shape = preprocess_results["arr_shape_new"]                                
-        arr_px_spacing_cm = preprocess_results["arr_px_spacing_cm"]                    
-        organ_act_paths = preprocess_results["binary_roi_act_map_paths"]               
-        masks = preprocess_results["masks"]                                            
-        atn_av_path = preprocess_results["atn_av_path"]                                
+        class_seg = preprocess_results["class_seg"]
+        arr_shape = preprocess_results["arr_shape_new"]
+        arr_px_spacing_cm = preprocess_results["arr_px_spacing_cm"]
+        organ_act_paths = preprocess_results["binary_roi_act_map_paths"]
+        masks = preprocess_results["masks"]
+        atn_av_path = preprocess_results["atn_av_path"]
+
 
         if not os.path.exists(atn_av_path):
             raise FileNotFoundError(f"Attenuation map not found: {atn_av_path}")
@@ -887,20 +1001,20 @@ class SimindSimulationStage:
         self._copy_templates()
 
         # Copy attenuation map into work_dir (SIMIND resolves input paths relative to cwd).
+        # Always refresh so work_dir stays in sync with current preprocessing outputs.
         atn_work_name = f"{self.prefix}_atn_av.bin"
         atn_work_path = os.path.join(self.work_dir, atn_work_name)
-        if not os.path.exists(atn_work_path):
-            shutil.copyfile(atn_av_path, atn_work_path)
+        shutil.copyfile(atn_av_path, atn_work_path)
 
         # Scale factor: photons per source voxel per core.
         total_num_voxels = int(np.sum([np.sum(mask) for mask in masks.values()]))
         if total_num_voxels <= 0:
             raise ValueError("Total source voxels is zero; cannot compute SIMIND scale factor.")
 
-        scale_factor = float(self.num_photons / total_num_voxels / self.num_cores)
+        scale_factor = float(self.num_photons / total_num_voxels / self.num_cpu)
         if scale_factor < 1:
-            print(f"Not enough photons for this patient/num_cores. Requested: {self.num_photons}")
-            print(f"Increasing to: {total_num_voxels * self.num_cores}")
+            print(f"Not enough photons for this patient/num_cpu. Requested: {self.num_photons}")
+            print(f"Increasing to: {total_num_voxels * self.num_cpu}")
             scale_factor = 1.0
 
         simind_switches_by_organ: Dict[str, str] = {}
@@ -935,12 +1049,8 @@ class SimindSimulationStage:
             self._aggregate_core_totals_for_organ(organ_name)
 
         self._run_jaszczak_calibration()
-
-        # Copy headers to survive PRODUCTION cleanup 
-        self._copy_headers_to_header_dir(roi_list)                                     
-
-        # Sum per-organ projections into total projections 
-        summed_projection_paths = self._sum_projections_across_organs(roi_list)         
+        self._copy_headers_to_header_dir(roi_list)
+        summed_projection_paths = self._sum_projections_across_organs(roi_list)
 
         self._save_stage_metadata(
             simind_projection_paths=simind_projection_paths,
@@ -962,7 +1072,7 @@ class SimindSimulationStage:
         self.context.simind_calibration_path = self.calibration_path
         self.context.simind_projection_paths = simind_projection_paths
         self.context.simind_summed_projection_paths = summed_projection_paths           
-        self.context.simind_num_cores = self.num_cores
+        self.context.simind_num_cpu = self.num_cpu
         self.context.simind_geometry = geometry
         self.context.simind_total_num_voxels = total_num_voxels
         self.context.simind_scale_factor = scale_factor

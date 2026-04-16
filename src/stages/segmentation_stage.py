@@ -1,12 +1,9 @@
 """
-TotalSegmentator-based segmentation + ROI unification stage for the TDT pipeline.
+TotalSegmentator-based segmentation and ROI unification for the VTT pipeline.
 
-This stage:
-- Standardizes the CT input into a NIfTI file in the phase output directory.
-- Runs TotalSegmentator for the required task(s) based on a user-facing ROI list.
-- Writes multilabel output masks (NIfTI) for each task and stores paths + plan in `context`.
-- Combines the TotalSegmentator outputs (body, total, head_glands_cavities)
-  into a single multilabel NIfTI volume in the TDT pipeline label space.
+This stage standardizes the CT input to NIfTI, runs the required
+TotalSegmentator tasks for the requested ROI set, and combines the resulting
+masks into a single multilabel volume in the shared VTT label space.
 
 Expected Context interface
 --------------------------
@@ -25,8 +22,6 @@ On success, this stage sets:
 - context.head_glands_cavities_ml_path : Optional[str]  (None if not required)
 - context.totseg_plan : dict  (which tasks ran, which roi_subsets were passed to TotalSegmentator)
 - context.tdt_roi_seg_path : str  (path to unified multilabel NIfTI handoff)
-
-Maintainer / contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
@@ -51,8 +46,9 @@ torch.GradScaler = _GradScaler
 
 
 # User-facing ROI names supported by this pipeline stage.
+# "remaining_body" is NOT listed here — it is auto-added by the pipeline and
+# is never shown or selected by the user.
 TDT_ALLOWED_ROIS = {
-    "body",
     "kidney",
     "liver",
     "prostate",
@@ -62,19 +58,20 @@ TDT_ALLOWED_ROIS = {
 }
 
 # Maps each TDT ROI name to the TotalSegmentator (task, roi_subset) it requires.
+# "remaining_body" maps to the TotalSegmentator "body" task (patient outline).
 TDT_TO_TOTSEG = {
-    "kidney":         ("total", ["kidney_left", "kidney_right"]),
-    "liver":          ("total", ["liver"]),
-    "prostate":       ("total", ["prostate"]),
-    "spleen":         ("total", ["spleen"]),
-    "heart":          ("total", ["heart"]),
-    "salivary_glands":("head_glands_cavities", [
+    "kidney":          ("total", ["kidney_left", "kidney_right"]),
+    "liver":           ("total", ["liver"]),
+    "prostate":        ("total", ["prostate"]),
+    "spleen":          ("total", ["spleen"]),
+    "heart":           ("total", ["heart"]),
+    "salivary_glands": ("head_glands_cavities", [
         "parotid_gland_left",
         "parotid_gland_right",
         "submandibular_gland_left",
         "submandibular_gland_right",
     ]),
-    "body":           ("body", []),
+    "remaining_body":  ("body", []),
 }
 
 CTInputType = Literal["nii", "dicom"]
@@ -152,9 +149,9 @@ class SegmentationStage:
             name: int(lab) for lab, name in ts_map_json["TDT_Pipeline"].items() 
         } 
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # helpers — segmentation
-    # -----------------------------
+    # ------------------------------------------------------------------
 
     def _standardize_ct_to_nifti(self) -> None:
         """
@@ -265,9 +262,9 @@ class SegmentationStage:
             os.path.exists(self.total_ml_path),
         )
 
-    # -----------------------------
-    # helpers — unification (merged from TdtRoiUnifyStage)
-    # -----------------------------
+    # ------------------------------------------------------------------
+    # helpers — ROI unification
+    # ------------------------------------------------------------------
 
     @staticmethod                                                                      
     def _load_int_seg(path: str) -> np.ndarray:                                        
@@ -315,7 +312,7 @@ class SegmentationStage:
         np.ndarray  (uint8, TDT label IDs)
         """
         roi_unified = np.zeros(body_seg.shape, dtype=np.uint8)
-        roi_unified[body_seg > 0] = self.tdt_name2id["body"]
+        roi_unified[body_seg > 0] = self.tdt_name2id["remaining_body"]
 
         requested = set(plan["tdt_roi_subset"])                                        
 
@@ -360,7 +357,7 @@ class SegmentationStage:
         # Skip if unified output already exists 
         if os.path.exists(self.final_output_path) and os.path.exists(self.stage_output_path): 
             if self.debug: 
-                print(f"[SegmentationStage] Unified output already exists, skipping unification.") 
+                print("[SegmentationStage] Unified output already exists, skipping unification.")
             return 
 
         self._assert_unification_inputs_exist(plan)                                    
@@ -418,9 +415,9 @@ class SegmentationStage:
         with open(self.metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=4)
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # main
-    # -----------------------------
+    # ------------------------------------------------------------------
     def run(self) -> Any:
         """
         Run the TotalSegmentator stage + ROI unification.
@@ -468,8 +465,7 @@ class SegmentationStage:
         if plan["run_head_glands_cavities"] and not head_done:
             raise FileNotFoundError(f"Head glands seg not found: {self.head_glands_cavities_ml_path}")
 
-        # Run ROI unification (merged from TdtRoiUnifyStage) 
-        self._run_unification(plan)                                                    
+        self._run_unification(plan)
 
         self._save_stage_metadata(plan)
 

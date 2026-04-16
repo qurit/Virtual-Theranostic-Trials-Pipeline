@@ -1,12 +1,14 @@
 """
-SPECT Post-Processing Stage for the TDT pipeline.
+SPECT post-processing for the VTT pipeline.
 
 This stage combines PBPK TAC weighting of SIMIND projections with OSEM+TEW
 reconstruction using PyTomography.
 
-Core responsibilities (merged from pbpk_stage.py projection weighting + reconstruction_stage.py)
+Core responsibilities
 ---------------------
 - For each ROI present in SIMIND projections, read per-organ TAC from Phase 1 PBPK.
+- Fold any PBPK organ TACs that are absent from SIMIND's roi_subset into the
+  remaining_body TAC so that activity from excluded organs is not lost.
 - Interpolate TAC values at configured frame start times.
 - Build per-frame activity maps and apply TAC-derived activity to SIMIND projections.
 - Optionally apply Poisson noise to projections.
@@ -33,8 +35,6 @@ Incoming `context` is expected to provide:
 - context.pbpk_vois : list[str]
 - context.roi_body_seg_arr, context.mask_roi_body, context.class_seg
 - context.arr_px_spacing_cm
-
-Maintainer / contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
@@ -56,12 +56,9 @@ from pytomography.projectors.SPECT import SPECTSystemMatrix
 from pytomography.transforms.SPECT import SPECTAttenuationTransform, SPECTPSFTransform
 
 
-class SpectPostprocessStage:                                                           
+class SpectPostprocessStage:
     """
     SPECT post-processing: TAC weighting + Poisson noise + OSEM+TEW reconstruction.
-
-    Merges functionality from the original pbpk_stage.py (projection weighting)
-    and reconstruction_stage.py (OSEM reconstruction).
     """
 
     def __init__(self, context: Any) -> None:
@@ -127,9 +124,9 @@ class SpectPostprocessStage:
             self.simind_output_slice_width_cm,
         )
 
-    # -----------------------------
-    # helpers — projection I/O (from pbpk_stage)
-    # -----------------------------
+    # ------------------------------------------------------------------
+    # helpers — projection I/O
+    # ------------------------------------------------------------------
 
     def _voxel_volume_ml(self, arr_px_spacing_cm: Sequence[float]) -> float:           
         """Compute voxel volume in mL from (z, y, x) spacing in cm. (cm^3 == mL)"""
@@ -185,9 +182,9 @@ class SpectPostprocessStage:
         ))
         sitk.WriteImage(img, out_path, True)
 
-    # -----------------------------
-    # helpers — reconstruction (from reconstruction_stage)
-    # -----------------------------
+    # ------------------------------------------------------------------
+    # helpers — reconstruction
+    # ------------------------------------------------------------------
 
     def _get_sensitivity_from_calibration_file(self, calibration_file: str) -> float:
         """
@@ -284,21 +281,21 @@ class SpectPostprocessStage:
         sitk.WriteImage(recon_atn_img, recon_atn_path, imageIO="NiftiImageIO")
         return recon_atn_img, recon_atn_path
 
-    # -----------------------------
-    # helpers — TAC application (from pbpk_stage)
-    # -----------------------------
+    # ------------------------------------------------------------------
+    # helpers — TAC application
+    # ------------------------------------------------------------------
 
     def _roi_to_voi(self, roi_name: str) -> Optional[str]:                             
         """Map a TDT ROI name to its PyCNO VOI observable name."""
         roi_to_voi = {
-            "kidney":          "Kidney",
-            "body":            "Rest",
-            "liver":           "Liver",
-            "prostate":        "Prostate",
-            "heart":           "Heart",
-            "spleen":          "Spleen",
-            "salivary_glands": "SG",
-            "synthetic_lesion":"Tumor1",
+            "kidney":           "Kidney",
+            "remaining_body":   "Rest",
+            "liver":            "Liver",
+            "prostate":         "Prostate",
+            "heart":            "Heart",
+            "spleen":           "Spleen",
+            "salivary_glands":  "SG",
+            "synthetic_lesion": "Tumor1",
         }
         return roi_to_voi.get(roi_name, None)
 
@@ -344,9 +341,9 @@ class SpectPostprocessStage:
         with open(self.metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=4)
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # main
-    # -----------------------------
+    # ------------------------------------------------------------------
     def run(self) -> Any:
         """
         Execute SPECT post-processing: TAC weighting + optional reconstruction.
@@ -382,9 +379,30 @@ class SpectPostprocessStage:
             photopeak_h, lower_h, upper_h
         )
 
-        # Get TAC data from Phase 1 
-        tac_time = self.context.pbpk_tac_time                                         
-        tac_values = self.context.pbpk_tac_values                                     
+        # Get TAC data from Phase 1
+        tac_time = self.context.pbpk_tac_time
+        # Work on a local copy so we can safely patch remaining_body without
+        # mutating context for other stages.
+        tac_values: Dict[str, np.ndarray] = dict(self.context.pbpk_tac_values)
+
+        # Aggregate excluded-organ TACs into remaining_body.
+        # SIMIND's roi_subset may be smaller than Phase 1's roi_subset.  Any organ
+        # that was modelled explicitly in PBPK but is NOT present in this simulation's
+        # class_seg is geometrically absorbed into SIMIND's remaining_body mask.
+        # Its activity must therefore be folded into the remaining_body TAC so that
+        # the total activity assigned to that mask is correct.
+        simulation_rois: set = set(class_seg.keys()) - {"remaining_body"}
+        if "remaining_body" in tac_values:
+            effective_rb = tac_values["remaining_body"].copy().astype(np.float64)
+            for _rn, _rt in self.context.pbpk_tac_values.items():
+                if _rn != "remaining_body" and _rn not in simulation_rois:
+                    effective_rb += np.asarray(_rt, dtype=np.float64)
+                    if self.debug:
+                        print(
+                            f"[SpectPostprocessStage] Folding excluded ROI '{_rn}' TAC "
+                            "into remaining_body (not in SIMIND roi_subset)."
+                        )
+            tac_values["remaining_body"] = effective_rb.astype(np.float32)
 
         n_frames = len(self.frame_start)
         roi_body_seg_arr = self.context.roi_body_seg_arr                               

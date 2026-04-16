@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Virtual Theranostic Trials</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.27.1/babel.min.js"></script>
   <style>
     body { background: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
     .terminal-font { font-family: 'JetBrains Mono','Fira Code','Cascadia Code','Consolas',monospace; }
@@ -21,7 +21,11 @@
   </style>
 </head>
 <body>
-<div id="root"></div>
+<div id="root">
+  <div style="padding:24px;color:#334155;font-family:system-ui,-apple-system,sans-serif;">
+    Loading web UI…
+  </div>
+</div>
 <script type="text/babel">
 const { useState, useEffect, useRef, useCallback } = React;
 
@@ -42,8 +46,9 @@ const STAGE_LABELS = {
   simind_stage:'SIMIND SPECT Simulation',
   opengate_stage:'OpenGATE Dosimetry',
   spect_postprocess_stage:'SPECT Post-Processing',
-  dosemap_postprocess_stage:'Dose Map Post-Processing',
+  dosemap_postprocess_stage:'Dosimetry Post-Processing',
   gate:'Monte Carlo Engine',source:'Source Definition',physics:'Physics Settings',
+  num_cpu:'CPU Cores / Threads',
 };
 const CLI_FLAGS = [
   {key:'spect',          label:'SPECT Simulation',  desc:'Run SIMIND Monte Carlo SPECT projection simulation (Phase 2)'},
@@ -55,10 +60,11 @@ const CLI_FLAGS = [
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
 // Maps each stage key to the flag that gates it (stage hidden + cleared when flag is OFF)
 const STAGE_FLAG_MAP = {
-  synthetic_lesions_stage: 'synthetic_lesions',
-  simind_stage:            'spect',
-  opengate_stage:          'dosimetry',
-  spect_postprocess_stage: 'postprocess',
+  synthetic_lesions_stage:    'synthetic_lesions',
+  simind_stage:               'spect',
+  opengate_stage:             'dosimetry',
+  spect_postprocess_stage:    'postprocess',
+  dosemap_postprocess_stage:  'postprocess',
 };
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -141,26 +147,43 @@ function Page1Welcome({onNext}){
 // ─── Page 2 ───────────────────────────────────────────────────────────────────
 function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,onNext,onBack}){
   const [folderPath,setFolderPath]=useState('');
+  const [typedPath,setTypedPath]=useState('');
   const [picking,setPicking]=useState(false);
   const [scanning,setScanning]=useState(false);
   const [error,setError]=useState('');
   const [previews,setPreviews]=useState({});
 
+  // Shared scan logic — calls /api/scan-directory for any resolved path.
+  const scanDirectory=async(path)=>{
+    setScanning(true);setError('');
+    setPatients([]);setPreviews({});setPatientShapes({});
+    try{
+      const sres=await apiFetch('/api/scan-directory',{method:'POST',body:JSON.stringify({path})});
+      if(!sres.ok){const err=await sres.json();setError(err.detail||'Scan failed');setScanning(false);return;}
+      const sdata=await sres.json();
+      setPatients(sdata.patients);
+      sdata.patients.forEach(p=>loadPreview(p));
+    }catch(e){setError('Error: '+e.message);}
+    setScanning(false);
+  };
+  // Open native OS folder picker, then scan the returned path.
   const pickAndScan=async()=>{
     setPicking(true);setError('');
     try{
       const res=await apiFetch('/api/pick-directory',{method:'POST',body:'{}'});
       const data=await res.json();
       if(data.cancelled||!data.path){setPicking(false);return;}
-      setFolderPath(data.path);setPicking(false);setScanning(true);
-      setPatients([]);setPreviews({});setPatientShapes({});
-      const sres=await apiFetch('/api/scan-directory',{method:'POST',body:JSON.stringify({path:data.path})});
-      if(!sres.ok){const err=await sres.json();setError(err.detail||'Scan failed');setScanning(false);return;}
-      const sdata=await sres.json();
-      setPatients(sdata.patients);
-      sdata.patients.forEach(p=>loadPreview(p));
-    }catch(e){setError('Error: '+e.message);}
-    setPicking(false);setScanning(false);
+      setFolderPath(data.path);
+      setPicking(false);
+      await scanDirectory(data.path);
+    }catch(e){setError('Error: '+e.message);setPicking(false);}
+  };
+  // Scan a path typed directly into the text input.
+  const scanTyped=async()=>{
+    const p=typedPath.trim();
+    if(!p)return;
+    setFolderPath(p);
+    await scanDirectory(p);
   };
   const loadPreview=async(patient)=>{
     setPreviews(prev=>({...prev,[patient.name]:{loading:true}}));
@@ -180,11 +203,29 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,onNex
         <h2 className="text-2xl font-bold text-slate-900">Select CT Input Folder</h2>
       </div>
       <p className="text-slate-500 text-sm mb-6">Each top-level item is one patient — a DICOM subfolder or a <code className="bg-slate-100 px-1 rounded">.nii/.nii.gz</code> file.</p>
-      <div className="flex items-center gap-4 mb-6">
-        <button onClick={pickAndScan} disabled={busy}
-          className="flex items-center gap-2 bg-white border-2 border-blue-500 hover:bg-blue-50 text-blue-600 px-6 py-3 rounded-xl font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm">
-          {picking?<><span className="spin">⟳</span>&nbsp;Opening picker…</>:scanning?<><span className="spin">⟳</span>&nbsp;Scanning…</>:<>📁&nbsp;Choose CT Folder</>}
-        </button>
+      <div className="mb-6">
+        <div className="flex items-center gap-4 mb-3">
+          <button onClick={pickAndScan} disabled={busy}
+            className="flex items-center gap-2 bg-white border-2 border-blue-500 hover:bg-blue-50 text-blue-600 px-6 py-3 rounded-xl font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm">
+            {picking?<><span className="spin">⟳</span>&nbsp;Opening picker…</>:scanning?<><span className="spin">⟳</span>&nbsp;Scanning…</>:<>📁&nbsp;Choose CT Folder</>}
+          </button>
+        </div>
+        <div className="flex items-center gap-3 mb-3">
+          <div className="flex-1 border-t border-slate-200"/>
+          <span className="text-xs text-slate-400 uppercase tracking-wide px-2">or enter absolute path</span>
+          <div className="flex-1 border-t border-slate-200"/>
+        </div>
+        <div className="flex items-center gap-3 mb-3">
+          <input type="text" placeholder="/absolute/path/to/ct/folder"
+            value={typedPath} onChange={e=>setTypedPath(e.target.value)}
+            onKeyDown={e=>{if(e.key==='Enter'&&!busy&&typedPath.trim())scanTyped();}}
+            disabled={busy}
+            className="flex-1 px-3 py-2.5 text-sm border border-slate-300 rounded-xl terminal-font focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:opacity-50"/>
+          <button onClick={scanTyped} disabled={busy||!typedPath.trim()}
+            className="flex-shrink-0 bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl font-semibold text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm">
+            {scanning&&!picking?<><span className="spin">⟳</span>&nbsp;Scanning…</>:'Scan →'}
+          </button>
+        </div>
         {folderPath&&!busy&&(
           <div className="flex items-center gap-2 text-sm text-slate-500 min-w-0">
             <span className="text-emerald-500 flex-shrink-0">✓</span>
@@ -210,23 +251,43 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,onNex
                   {preview.loading&&<div className="flex items-center gap-2 text-sm text-slate-400 py-4"><span className="spin">⟳</span> Generating previews…</div>}
                   {preview.error&&<p className="text-sm text-red-500 py-2">{preview.error}</p>}
                   {!preview.loading&&!preview.error&&preview.axial&&(
-                    <div className="flex gap-3 items-start">
-                      {['axial','coronal','sagittal'].map(view=>(
-                        <div key={view} className="flex-1 min-w-0">
-                          <p className="text-[11px] text-slate-400 text-center mb-1 capitalize font-medium">{view}</p>
-                          <div className="h-44 bg-black rounded-lg border border-slate-200 flex items-center justify-center overflow-hidden">
-                            <img src={`data:image/png;base64,${preview[view]}`} alt={view}
-                              style={{maxWidth:'100%',maxHeight:'100%',objectFit:'contain',display:'block'}}/>
+                    <>
+                      <div className="flex gap-3 items-start">
+                        {['axial','coronal','sagittal'].map(view=>(
+                          <div key={view} className="flex-1 min-w-0">
+                            <p className="text-[11px] text-slate-400 text-center mb-1 capitalize font-medium">{view}</p>
+                            <div className="h-44 bg-black rounded-lg border border-slate-200 flex items-center justify-center overflow-hidden">
+                              <img src={`data:image/png;base64,${preview[view]}`} alt={view}
+                                style={{maxWidth:'100%',maxHeight:'100%',objectFit:'contain',display:'block'}}/>
+                            </div>
                           </div>
-                        </div>
-                      ))}
-                      {preview.shape&&(
-                        <div className="flex-shrink-0 w-20 flex flex-col justify-center text-xs text-slate-400 pt-5 space-y-0.5">
-                          <p className="font-semibold text-slate-600 text-[11px]">CT Shape</p>
-                          <p>X: {preview.shape[0]}</p><p>Y: {preview.shape[1]}</p><p>Z: {preview.shape[2]}</p>
-                        </div>
-                      )}
-                    </div>
+                        ))}
+                        {preview.shape&&(
+                          <div className="flex-shrink-0 w-20 flex flex-col justify-center text-xs text-slate-400 pt-5 space-y-0.5">
+                            <p className="font-semibold text-slate-600 text-[11px]">CT Shape</p>
+                            <p>X: {preview.shape[0]}</p><p>Y: {preview.shape[1]}</p><p>Z: {preview.shape[2]}</p>
+                          </div>
+                        )}
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-500 border-t border-slate-100 pt-2">
+                        <span>
+                          <span className="font-medium text-slate-600">Type: </span>
+                          {p.type==='dicom'?'DICOM directory':'NIfTI'}
+                        </span>
+                        <span>
+                          <span className="font-medium text-slate-600">Height: </span>
+                          {preview.height_m!=null
+                            ? `${preview.height_m.toFixed(2)} m`
+                            : <span className="text-slate-400 italic">{preview.hw_source==='not_dicom'?'n/a (NIfTI)':'not found in headers'}</span>}
+                        </span>
+                        <span>
+                          <span className="font-medium text-slate-600">Weight: </span>
+                          {preview.weight_kg!=null
+                            ? `${preview.weight_kg.toFixed(1)} kg`
+                            : <span className="text-slate-400 italic">{preview.hw_source==='not_dicom'?'n/a (NIfTI)':'not found in headers'}</span>}
+                        </span>
+                      </div>
+                    </>
                   )}
                 </div>
               );
@@ -365,6 +426,7 @@ function UserDefinedInputs({nLesions,centers,radii,onUpdateCenters,onUpdateRadii
     onUpdateRadii(newRows.map(r=>parseFloat(r.r)||5));
   };
   const [local,setLocal]=useState(rows);
+  useEffect(()=>{setLocal(rows);},[nLesions,centers,radii]);
   const set=(i,f,v)=>{const nr=local.map((r,ri)=>ri===i?{...r,[f]:v}:r);setLocal(nr);commit(nr);};
   return(
     <div className="mt-1 overflow-x-auto">
@@ -400,37 +462,119 @@ function UserDefinedInputs({nLesions,centers,radii,onUpdateCenters,onUpdateRadii
   );
 }
 
+// Radii-only inputs for uniform/gaussian manual radii mode
+function RadiiInputs({nLesions,radii,onUpdateRadii}){
+  const rows=Array.from({length:nLesions},(_,i)=>({r:radii[i]!=null?String(radii[i]):'5'}));
+  const [local,setLocal]=useState(rows);
+  useEffect(()=>{setLocal(rows);},[nLesions,radii]);
+  const commit=nr=>onUpdateRadii(nr.map(r=>parseFloat(r.r)||5));
+  const set=(i,v)=>{const nr=local.map((r,ri)=>ri===i?{...r,r:v}:r);setLocal(nr);commit(nr);};
+  return(
+    <div className="mt-1 pl-1">
+      {local.map((row,i)=>(
+        <div key={i} className="flex items-center gap-2 py-0.5">
+          <span className="text-[10px] text-slate-400 w-4 text-right">{i+1}</span>
+          <input type="number" value={row.r} onChange={e=>set(i,e.target.value)} min="0" step="0.5"
+            className="w-20 px-1.5 py-0.5 border border-slate-200 rounded text-xs text-right focus:outline-none focus:ring-1 focus:ring-blue-400"/>
+          <span className="text-[10px] text-slate-400">mm</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SpecRoiCard({roi,spec,onUpdateSpec,onRemove}){
   const [open,setOpen]=useState(true);
   const [numErrs,setNumErrs]=useState({});
+  const prob=spec.prob||'uniform';
+  const hasManualRadii=Array.isArray(spec.radii_mm);
+  const nLesions=Math.max(1,Number(spec.n_lesions||1));
+  const [nLesionsInput,setNLesionsInput]=useState(String(nLesions));
+
+  useEffect(()=>{
+    setNLesionsInput(String(nLesions));
+  },[nLesions]);
+
   const setField=(field,val)=>{
     let newSpec={...spec,[field]:val};
-    // When prob changes, initialize/clean optional fields
     if(field==='prob'){
       if(val==='user_defined'){
-        const n=spec.n_lesions||1;
+        const n=nLesions;
         newSpec.user_centers_zyx=Array.from({length:n},()=>[0,0,0]);
         newSpec.radii_mm=Array.from({length:n},()=>5.0);
         delete newSpec.sigma_mm;
       } else if(val==='gaussian'){
-        delete newSpec.user_centers_zyx;delete newSpec.radii_mm;
+        delete newSpec.user_centers_zyx;
+        // preserve manual radii if already set when switching between uniform/gaussian
         if(!newSpec.sigma_mm) newSpec.sigma_mm=10.0;
       } else {
-        delete newSpec.user_centers_zyx;delete newSpec.radii_mm;delete newSpec.sigma_mm;
+        delete newSpec.user_centers_zyx;
+        delete newSpec.sigma_mm;
+        // preserve manual radii if already set
       }
     }
-    // When n_lesions changes for user_defined, resize coord arrays
-    if(field==='n_lesions'&&spec.prob==='user_defined'){
-      const c=[...(spec.user_centers_zyx||[])];
-      const r=[...(spec.radii_mm||[])];
-      while(c.length<val)c.push([0,0,0]);c.length=val;
-      while(r.length<val)r.push(5.0);r.length=val;
-      newSpec.user_centers_zyx=c;newSpec.radii_mm=r;
+    // When n_lesions changes, resize all length-N arrays
+    if(field==='n_lesions'){
+      const n=Math.max(1,Number(val||1));
+      if(prob==='user_defined'){
+        const c=[...(spec.user_centers_zyx||[])];
+        const r=[...(spec.radii_mm||[])];
+        while(c.length<n)c.push([0,0,0]);c.length=n;
+        while(r.length<n)r.push(5.0);r.length=n;
+        newSpec.user_centers_zyx=c;newSpec.radii_mm=r;
+      } else if(hasManualRadii){
+        const r=[...(spec.radii_mm||[])];
+        while(r.length<n)r.push(5.0);r.length=n;
+        newSpec.radii_mm=r;
+      }
+      newSpec.n_lesions=n;
     }
     onUpdateSpec(newSpec);
   };
+
+  const toggleAutoRadii=(isAutoChecked)=>{
+    if(isAutoChecked){
+      const s={...spec};delete s.radii_mm;onUpdateSpec(s);
+    } else {
+      onUpdateSpec({...spec,radii_mm:Array.from({length:nLesions},()=>5.0)});
+    }
+  };
+
   const numField=(label,field,step,isInt)=>{
     const val=spec[field]??0;const err=numErrs[field]||'';
+    if(field==='n_lesions'){
+      return(
+        <div key={field} className="flex items-center justify-between py-1.5 border-b border-slate-50 last:border-0 gap-2">
+          <span className="text-xs font-medium text-slate-600 flex-shrink-0">{label}</span>
+          <div className="flex flex-col items-end gap-0.5">
+            <input type="number" value={nLesionsInput} step={step||1} min="1"
+              onChange={e=>{
+                const v=e.target.value;
+                setNLesionsInput(v);
+                if(v===''){
+                  setNumErrs(prev=>({...prev,[field]:'Must be an integer > 0'}));
+                  return;
+                }
+                const parsed=Number(v);
+                if(!Number.isInteger(parsed)||parsed<=0){
+                  setNumErrs(prev=>({...prev,[field]:'Must be an integer > 0'}));
+                  return;
+                }
+                setNumErrs(prev=>({...prev,[field]:''}));
+                setField(field,parsed);
+              }}
+              onBlur={()=>{
+                if(numErrs[field]||nLesionsInput===''){
+                  setNLesionsInput(String(nLesions));
+                  setNumErrs(prev=>({...prev,[field]:''}));
+                }
+              }}
+              className={`w-24 px-2 py-0.5 text-xs border rounded text-right focus:outline-none focus:ring-1 ${err?'border-red-400 bg-red-50':'border-slate-200 focus:ring-blue-400'}`}/>
+            {err&&<span className="text-[9px] text-red-500">{err}</span>}
+          </div>
+        </div>
+      );
+    }
     return(
       <div key={field} className="flex items-center justify-between py-1.5 border-b border-slate-50 last:border-0 gap-2">
         <span className="text-xs font-medium text-slate-600 flex-shrink-0">{label}</span>
@@ -444,6 +588,7 @@ function SpecRoiCard({roi,spec,onUpdateSpec,onRemove}){
       </div>
     );
   };
+
   return(
     <div className="border border-slate-200 rounded-lg mb-1.5 overflow-hidden">
       <div className="flex items-center bg-slate-50 px-3 py-1.5">
@@ -455,19 +600,41 @@ function SpecRoiCard({roi,spec,onUpdateSpec,onRemove}){
           {numField('n_lesions','n_lesions',1,true)}
           <div className="flex items-center justify-between py-1.5 border-b border-slate-50 gap-2">
             <span className="text-xs font-medium text-slate-600">prob</span>
-            <select value={spec.prob||'uniform'} onChange={e=>setField('prob',e.target.value)}
+            <select value={prob} onChange={e=>setField('prob',e.target.value)}
               className="px-2 py-0.5 text-xs border border-slate-200 rounded focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white">
               {PROB_OPTIONS.map(o=><option key={o} value={o}>{o}</option>)}
             </select>
           </div>
-          {spec.prob==='gaussian'&&numField('sigma_mm','sigma_mm',1,false)}
-          {spec.prob==='user_defined'&&(
+          {prob==='gaussian'&&numField('sigma_mm','sigma_mm',1,false)}
+          {prob==='user_defined'&&(
             <UserDefinedInputs
-              nLesions={spec.n_lesions||1}
+              nLesions={nLesions}
               centers={spec.user_centers_zyx||[]}
               radii={spec.radii_mm||[]}
               onUpdateCenters={v=>onUpdateSpec({...spec,user_centers_zyx:v})}
               onUpdateRadii={v=>onUpdateSpec({...spec,radii_mm:v})}/>
+          )}
+          {(prob==='uniform'||prob==='gaussian')&&(
+            <div>
+              <div className="flex items-center justify-between py-1.5 border-b border-slate-50 gap-2">
+                <span className="text-xs font-medium text-slate-600">radii_mm</span>
+                <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                  <input type="checkbox" checked={!hasManualRadii} onChange={e=>toggleAutoRadii(e.target.checked)}
+                    className="rounded accent-blue-600"/>
+                  <span className="text-[10px] text-slate-500">auto</span>
+                </label>
+              </div>
+              {!hasManualRadii&&(
+                <p className="text-[10px] text-slate-500 mt-1">Auto radius on. Uncheck to enter manual radii.</p>
+              )}
+              {hasManualRadii&&(
+                <div className="py-1 border-b border-slate-50">
+                  <p className="text-[10px] text-slate-500 mb-1">Manual radii on. Auto radius is disabled.</p>
+                  <RadiiInputs nLesions={nLesions} radii={spec.radii_mm}
+                    onUpdateRadii={v=>onUpdateSpec({...spec,radii_mm:v})}/>
+                </div>
+              )}
+            </div>
           )}
           {numField('margin_mm','margin_mm',0.1,false)}
           {numField('seed','seed',1,true)}
@@ -592,9 +759,62 @@ function FrameTimesSection({frameStartTimes,frameDurations,basePath,patientName,
   );
 }
 
+// ─── NumCpuField ──────────────────────────────────────────────────────────────
+function NumCpuField({value,onChange,desc,systemCpuCount}){
+  const [raw,setRaw]=useState(String(value??0));
+  const [err,setErr]=useState('');
+  const [showDesc,setShowDesc]=useState(false);
+  const total=systemCpuCount;
+
+  function validate(s){
+    if(s===''||s===null||s===undefined) return 'Required';
+    if(s.includes('.')&&parseFloat(s)!==parseInt(s,10)) return 'Must be a whole number (no decimals)';
+    const n=parseInt(s,10);
+    if(isNaN(n)) return 'Must be a whole number';
+    if(n<0) return 'Must be 0 or greater (0 = use all available)';
+    if(total&&n>total) return `${n} exceeds system total (${total} cores) — use 0 to use all`;
+    return '';
+  }
+
+  function commit(s){
+    const e=validate(s);
+    setErr(e);
+    if(!e){
+      const n=parseInt(s,10);
+      onChange(n);
+    }
+  }
+
+  const helpText=total
+    ?(raw==='0'||parseInt(raw,10)===0?`Will use all ${total} available cores`:`System has ${total} cores total — set to 0 to use all`)
+    :'0 = use all available cores';
+
+  return(
+    <div className="py-2 border-b border-slate-100 last:border-0">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          <span className="text-sm font-medium text-slate-700">num_cpu</span>
+          {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
+        </div>
+        <div className="flex flex-col items-end gap-0.5">
+          <input type="number" min="0" step="1" value={raw}
+            onChange={e=>{setRaw(e.target.value);setErr(validate(e.target.value));}}
+            onBlur={e=>commit(e.target.value)}
+            className={`w-32 px-2 py-1 text-sm border rounded-lg text-right focus:outline-none focus:ring-2 ${err?'border-red-400 focus:ring-red-300 bg-red-50':'border-slate-300 focus:ring-blue-400'}`}/>
+          {err
+            ?<span className="text-xs text-red-500">{err}</span>
+            :<span className="text-xs text-slate-400">{helpText}</span>}
+        </div>
+      </div>
+      {showDesc&&<p className="text-xs text-slate-400 pt-1 leading-relaxed">{desc}</p>}
+    </div>
+  );
+}
+
 // ─── FieldRenderer ────────────────────────────────────────────────────────────
-function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape}){
+function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape,systemCpuCount,lesionSpecs}){
   const desc=descriptions[fieldKey]||'';
+  const opts=pipelineOptions&&pipelineOptions[fieldKey];
   const [showDesc,setShowDesc]=useState(false);
   const [numErr,setNumErr]=useState('');
   const call=v=>onChange(patientName,path,v);
@@ -611,7 +831,16 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
 
   if(fieldKey==='xyz_dim') return<XyzDimFieldInner value={value} onChange={call} desc={desc} patientShape={patientShape}/>;
   if(fieldKey==='random_seed') return<RandomSeedField value={value} onChange={call} desc={desc}/>;
+  if(fieldKey==='num_cpu') return<NumCpuField value={value} onChange={call} desc={desc} systemCpuCount={systemCpuCount}/>;
   if(typeof value==='boolean') return<><LabelRow><input type="checkbox" checked={value} onChange={e=>call(e.target.checked)} className="w-4 h-4 accent-blue-600 flex-shrink-0"/></LabelRow><DescLine/></>;
+  if(typeof value==='number'&&opts&&Array.isArray(opts)) return(
+    <><LabelRow>
+      <select value={value} onChange={e=>call(parseFloat(e.target.value))}
+        className="px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white">
+        {opts.map(o=><option key={o} value={o}>{o}</option>)}
+      </select>
+    </LabelRow><DescLine/></>
+  );
   if(typeof value==='number') return(
     <><LabelRow>
       <div className="flex flex-col items-end gap-0.5">
@@ -625,7 +854,6 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
   );
   if(value===null) return<><LabelRow><NullField call={call}/></LabelRow><DescLine/></>;
   if(typeof value==='string'){
-    const opts=pipelineOptions&&pipelineOptions[fieldKey];
     if(opts&&Array.isArray(opts)) return(
       <><LabelRow>
         <select value={value} onChange={e=>call(e.target.value)}
@@ -638,7 +866,11 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
   }
   if(Array.isArray(value)){
     if(fieldKey==='roi_subset'&&roiChoices&&roiChoices.length>0){
-      const choices=roiChoices.filter(r=>r!=='body');
+      const choices=roiChoices.filter(r=>r!=='remaining_body');
+      // ROIs with synthetic lesion specs (from phase 1 config)
+      const roisWithLesions=lesionSpecs&&typeof lesionSpecs==='object'?new Set(Object.keys(lesionSpecs)):new Set();
+      // Selected ROIs that also have lesions (for the info banner)
+      const selectedWithLesions=value.filter(r=>roisWithLesions.has(r));
       return(
         <div className="py-2 border-b border-slate-100 last:border-0">
           <div className="flex items-center gap-1.5 mb-2">
@@ -648,15 +880,24 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
           <DescLine/>
           {choices.length===0&&<p className="text-xs text-slate-400 italic">No ROIs available — constrained by Phase 1 selection</p>}
           <div className="flex flex-wrap gap-1.5">
-            {choices.map(roi=>(
-              <label key={roi} className={`px-2 py-0.5 rounded-full text-xs cursor-pointer border select-none transition-colors
-                ${value.includes(roi)?'bg-blue-100 border-blue-400 text-blue-700':'bg-slate-100 border-slate-300 text-slate-500 hover:border-slate-400'}`}>
-                <input type="checkbox" checked={value.includes(roi)}
-                  onChange={e=>call(e.target.checked?[...value,roi]:value.filter(r=>r!==roi))} className="hidden"/>
-                {roi}
-              </label>
-            ))}
+            {choices.map(roi=>{
+              const hasLesion=roisWithLesions.has(roi);
+              return(
+                <label key={roi} className={`px-2 py-0.5 rounded-full text-xs cursor-pointer border select-none transition-colors flex items-center gap-1
+                  ${value.includes(roi)?'bg-blue-100 border-blue-400 text-blue-700':'bg-slate-100 border-slate-300 text-slate-500 hover:border-slate-400'}`}>
+                  <input type="checkbox" checked={value.includes(roi)}
+                    onChange={e=>call(e.target.checked?[...value,roi]:value.filter(r=>r!==roi))} className="hidden"/>
+                  {roi}
+                  {hasLesion&&<span title="This ROI has synthetic lesions" className="text-[9px] bg-purple-200 text-purple-700 rounded px-1 font-bold leading-tight">lesion</span>}
+                </label>
+              );
+            })}
           </div>
+          {selectedWithLesions.length>0&&(
+            <p className="text-[11px] text-purple-700 bg-purple-50 rounded px-2 py-1 mt-1.5">
+              ⚠ Synthetic lesions auto-included for: {selectedWithLesions.join(', ')}
+            </p>
+          )}
         </div>
       );
     }
@@ -672,7 +913,7 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
 }
 
 // ─── StageSection ─────────────────────────────────────────────────────────────
-function StageSection({stageKey,stageData,basePath,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape}){
+function StageSection({stageKey,stageData,basePath,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape,systemCpuCount,lesionSpecs}){
   const [open,setOpen]=useState(false);
   const isSpectPost=stageKey==='spect_postprocess_stage';
   const isSynLesion=stageKey==='synthetic_lesions_stage';
@@ -702,7 +943,8 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
                     {sub.map(([sk,sv])=>(
                       <FieldRenderer key={sk} fieldKey={sk} value={sv} path={[...fPath,sk]}
                         patientName={patientName} onChange={onChange} descriptions={descriptions}
-                        pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}/>
+                        pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}
+                        systemCpuCount={systemCpuCount} lesionSpecs={lesionSpecs}/>
                     ))}
                   </div>
                 </div>
@@ -710,7 +952,8 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
             }
             return<FieldRenderer key={k} fieldKey={k} value={v} path={fPath}
               patientName={patientName} onChange={onChange} descriptions={descriptions}
-              pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}/>;
+              pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}
+              systemCpuCount={systemCpuCount} lesionSpecs={lesionSpecs}/>;
           })}
           {isSynLesion&&'specs' in stageData&&(
             <SpecsEditor value={stageData.specs}
@@ -729,13 +972,15 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
 }
 
 // ─── PhaseSection ─────────────────────────────────────────────────────────────
-function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,phase1RoiSubset,patientShape,flags}){
+function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,phase1RoiSubset,patientShape,flags,systemCpuCount,lesionSpecs}){
   const [open,setOpen]=useState(false);
   const stages=Object.entries(phaseData).filter(([k,v])=>{
     if(k==='sub_dir_name'||typeof v!=='object'||v===null) return false;
     // Hide stages whose controlling flag is OFF
     const flagKey=STAGE_FLAG_MAP[k];
     if(flagKey&&!flags?.[flagKey]) return false;
+    // dosemap_postprocess_stage additionally requires dosimetry to be on
+    if(k==='dosemap_postprocess_stage'&&!flags?.dosimetry) return false;
     return true;
   });
   // Constrain to phase_1 selection for all non-segmentation stages
@@ -757,7 +1002,8 @@ function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipe
               descriptions={descriptions} pipelineOptions={pipelineOptions}
               // segmentation_stage sees full choices; everything else is constrained
               roiChoices={sk==='segmentation_stage'?roiChoices:constrained}
-              patientShape={patientShape}/>
+              patientShape={patientShape} systemCpuCount={systemCpuCount}
+              lesionSpecs={lesionSpecs}/>
           ))}
         </div>
       )}
@@ -768,13 +1014,16 @@ function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipe
 // ─── Page 3 ───────────────────────────────────────────────────────────────────
 function Page3Configure({patients,projectName,setProjectName,projectDirs,setProjectDirs,
                          patientConfigs,setPatientConfigs,flags,setFlags,mode,setMode,
-                         patientShapes,onNext,onBack}){
+                         patientShapes,systemCpuCount,onNext,onBack}){
   const [dirsCreated,setDirsCreated]=useState(Object.keys(projectDirs).length>0);
   const [creating,setCreating]=useState(false);
   const [createError,setCreateError]=useState('');
   const [configMeta,setConfigMeta]=useState(null);
   const [applyToAll,setApplyToAll]=useState(false);
   const [openCards,setOpenCards]=useState({});
+  const [existedDirs,setExistedDirs]=useState({});        // {patient_name: bool}
+  const [completionStatus,setCompletionStatus]=useState({}); // {patient_name: {phase1_segmentation:bool,...}}
+  const [phaseWarnings,setPhaseWarnings]=useState({});    // {patient_name: Set<string>}
   const saveTimers=useRef({});
 
   useEffect(()=>{
@@ -795,9 +1044,56 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
       if(!res.ok){const err=await res.json();setCreateError(err.detail||'Failed');setCreating(false);return;}
       const data=await res.json();
       setProjectDirs(data.dirs);setDirsCreated(true);
-      setPatientConfigs(prev=>{const u={...prev};Object.keys(u).forEach(nm=>{u[nm]={...u[nm],output_folder_title:projectName.trim()};});return u;});
+      const existed=data.existed||{};
+      setExistedDirs(existed);
+      // Auto-fill config from existing run for patients with prior outputs
+      const existingCfgs=data.existing_configs||{};
+      setPatientConfigs(prev=>{
+        const u={...prev};
+        patients.forEach(p=>{
+          const nm=p.name;
+          if(existed[nm]&&existingCfgs[nm]){
+            // Use the saved config from the previous run; keep output_folder_title in sync
+            u[nm]={...existingCfgs[nm],output_folder_title:projectName.trim()};
+          } else {
+            u[nm]={...(u[nm]||{}),output_folder_title:projectName.trim()};
+          }
+        });
+        return u;
+      });
+      // Fetch per-patient completion status for existed patients
+      const statusMap={};
+      await Promise.all(patients.filter(p=>existed[p.name]).map(async p=>{
+        const dir=data.dirs[p.name];
+        if(!dir) return;
+        try{
+          const sr=await apiFetch(`/api/check-completion?output_dir=${encodeURIComponent(dir)}`);
+          if(sr.ok) statusMap[p.name]=await sr.json();
+        }catch(_){}
+      }));
+      setCompletionStatus(statusMap);
     }catch(e){setCreateError('Error: '+e.message);}
     setCreating(false);
+  };
+
+  // Map a config path array to the completion-status key it affects.
+  const _pathToCompletionKey=(path)=>{
+    if(!path||path.length<2) return null;
+    const [ph,st]=path;
+    if(ph==='phase_1'){
+      if(st==='segmentation_stage') return 'phase1_segmentation';
+      if(st==='synthetic_lesions_stage') return 'phase1_synthetic_lesions';
+      if(st==='pbpk_tac_stage') return 'phase1_pbpk';
+    }
+    if(ph==='phase_2'){
+      if(st==='simind_stage') return 'phase2_simind';
+      if(st==='opengate_stage') return 'phase2_opengate';
+    }
+    if(ph==='phase_3'){
+      if(st==='spect_postprocess_stage') return 'phase3_spect';
+      if(st==='dosemap_postprocess_stage') return 'phase3_dosemap';
+    }
+    return null;
   };
 
   const handleConfigChange=useCallback((patientName,path,value)=>{
@@ -805,6 +1101,11 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
       const tmpl=configMeta?.template||{};
       const updated={...prev};
       updated[patientName]=deepSet(updated[patientName]||tmpl,path,value);
+      // Warn if the changed field belongs to a phase that already has output on disk
+      const cKey=_pathToCompletionKey(path);
+      if(cKey&&completionStatus[patientName]?.[cKey]){
+        setPhaseWarnings(w=>{const nw={...w};const s=new Set(nw[patientName]||[]);s.add(cKey);nw[patientName]=s;return nw;});
+      }
       const isP1Roi=path[0]==='phase_1'&&path[path.length-1]==='roi_subset';
       if(isP1Roi){
         const p1Set=new Set(value);
@@ -838,7 +1139,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
       saveTimers.current[patientName]=setTimeout(()=>{saveOne(patientName);toSync.forEach(p=>saveOne(p.name));},500);
       return updated;
     });
-  },[patients,projectDirs,applyToAll,configMeta]);
+  },[patients,projectDirs,applyToAll,configMeta,completionStatus]);
 
   const handleFlagChange=(key,checked)=>{
     setFlags(prev=>({...prev,[key]:checked}));
@@ -859,7 +1160,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
     }
   };
 
-  const roiChoices=(configMeta?.roi_choices||[]).filter(r=>r!=='body');
+  const roiChoices=(configMeta?.roi_choices||[]).filter(r=>r!=='remaining_body');
 
   return(
     <div className="max-w-4xl mx-auto px-6 py-8">
@@ -929,6 +1230,12 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
             </label>
           </div>
           <p className="text-xs text-slate-400 mb-4">Changes auto-save to each config.json. Phase 2 ROI pickers and lesion specs are constrained to Phase 1 selection.</p>
+          {Object.values(existedDirs).some(Boolean)&&(
+            <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5 mb-4 text-xs text-amber-800">
+              <span className="flex-shrink-0 mt-0.5">⚠</span>
+              <span>Prior pipeline outputs detected for one or more patients. Completed stages will be skipped automatically; only stages without existing outputs will re-run.</span>
+            </div>
+          )}
           <div className="space-y-2">
             {patients.map((p,i)=>{
               const cfg=patientConfigs[p.name]||configMeta.template;
@@ -936,15 +1243,39 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
               const shape=patientShapes[p.name]||null;
               // Phase 1 segmentation roi_subset is the source of truth for all ROI constraints
               const p1RoiSubset=cfg?.phase_1?.segmentation_stage?.roi_subset??null;
+              const hasPrior=!!existedDirs[p.name];
               return(
                 <div key={p.name} className="border border-slate-200 rounded-xl overflow-hidden">
                   <button onClick={()=>setOpenCards(prev=>({...prev,[p.name]:!prev[p.name]}))}
                     className="w-full flex items-center justify-between px-4 py-3 bg-slate-50 hover:bg-slate-100 transition-colors text-left">
-                    <span className="font-semibold text-slate-700 text-sm">CT_{i+1} — {p.name}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-slate-700 text-sm">CT_{i+1} — {p.name}</span>
+                      {hasPrior&&<span className="text-[10px] font-semibold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">prior outputs</span>}
+                    </div>
                     <span className="text-slate-400 text-xs">{cardOpen?'▲':'▼'}</span>
                   </button>
                   {cardOpen&&(
                     <div className="p-4 space-y-3">
+                      {/* Auto-fill banner */}
+                      {hasPrior&&existedDirs[p.name]&&Object.keys(completionStatus[p.name]||{}).some(k=>completionStatus[p.name][k])&&(
+                        <div className="flex items-start gap-2 bg-blue-50 border border-blue-200 rounded-xl px-3 py-2 text-xs text-blue-800">
+                          <span className="flex-shrink-0 mt-0.5">ℹ</span>
+                          <span>Config auto-filled from previous run. Completed stages will be skipped; only stages without existing outputs will re-run.</span>
+                        </div>
+                      )}
+                      {/* Config-change warnings for completed phases */}
+                      {phaseWarnings[p.name]&&phaseWarnings[p.name].size>0&&(
+                        <div className="flex items-start gap-2 bg-orange-50 border border-orange-300 rounded-xl px-3 py-2 text-xs text-orange-900">
+                          <span className="flex-shrink-0 mt-0.5">⚠</span>
+                          <div className="flex-1">
+                            <span className="font-semibold">Changed params for already-completed stages: </span>
+                            <span>{[...phaseWarnings[p.name]].join(', ')}</span>
+                            <span>. Those stages will be skipped on rerun. Delete the relevant output folders to force them to re-execute.</span>
+                          </div>
+                          <button className="flex-shrink-0 text-orange-500 hover:text-orange-700 font-bold leading-none"
+                            onClick={()=>setPhaseWarnings(w=>{const nw={...w};delete nw[p.name];return nw;})}>✕</button>
+                        </div>
+                      )}
                       {['phase_1','phase_2','phase_3'].map(pk=>cfg[pk]?(
                         <PhaseSection key={pk} phaseKey={pk} phaseData={cfg[pk]}
                           patientName={p.name} onChange={handleConfigChange}
@@ -953,7 +1284,9 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
                           roiChoices={roiChoices}
                           phase1RoiSubset={p1RoiSubset}
                           patientShape={shape}
-                          flags={flags}/>
+                          flags={flags}
+                          systemCpuCount={systemCpuCount}
+                          lesionSpecs={cfg?.phase_1?.synthetic_lesions_stage?.specs||null}/>
                       ):null)}
                     </div>
                   )}
@@ -1210,6 +1543,11 @@ function App(){
   const [patientConfigs,setPatientConfigs]=useState({});
   const [mode,setMode]=useState('PRODUCTION');
   const [flags,setFlags]=useState({spect:true,dosimetry:true,postprocess:true,synthetic_lesions:false,logging_on:true});
+  const [systemCpuCount,setSystemCpuCount]=useState(null);
+
+  useEffect(()=>{
+    apiFetch('/api/system-info').then(r=>r.json()).then(d=>setSystemCpuCount(d.cpu_count||null)).catch(()=>{});
+  },[]);
 
   return(
     <div className="min-h-screen bg-slate-50">
@@ -1224,7 +1562,7 @@ function App(){
           projectDirs={projectDirs} setProjectDirs={setProjectDirs}
           patientConfigs={patientConfigs} setPatientConfigs={setPatientConfigs}
           flags={flags} setFlags={setFlags} mode={mode} setMode={setMode}
-          patientShapes={patientShapes}
+          patientShapes={patientShapes} systemCpuCount={systemCpuCount}
           onNext={()=>setStep(4)} onBack={()=>setStep(2)}/>}
         {step===4&&<Page4Run patients={patients} projectName={projectName}
           projectDirs={projectDirs} flags={flags} mode={mode}

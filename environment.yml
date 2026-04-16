@@ -1,4 +1,4 @@
-name: vtt_env
+name: vtt
 channels:
   - conda-forge
   - defaults

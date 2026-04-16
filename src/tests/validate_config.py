@@ -9,11 +9,11 @@ discovering issues one run at a time.
 Checks performed
 ----------------
 - ``output_folder_title``   — non-empty string
-- ``label_map_path``        — non-empty string; file must exist on disk
+- ``label_map_path``        — validated only when explicitly present in the config
 - ``roi_subset`` (seg.)     — non-empty list of strings
 - ``pbpk_tac_stage.isotope``— string; must be in pipeline_options.json allowed list
 - ``pbpk_tac_stage.VOIs``   — non-empty list
-- Synthetic-lesion numerics — only when ``--synthetic_lesions`` is set
+- Synthetic-lesion specs   — validated when ``--synthetic_lesions`` is set
 - ``SIMINDDirectory``       — read from ``pipeline_paths.json`` input_paths; path must exist (``--spect`` only)
 - SIMIND ``roi_subset``     — subset of segmentation ``roi_subset``
 - SIMIND ``Collimator``     — string; must be in allowed list
@@ -21,7 +21,7 @@ Checks performed
 - SIMIND numeric fields     — ``NumPhotons``, ``NumProjections``, etc. must be numbers
 - ``xyz_dim``               — null or a list of 3 positive ints
 - OpenGATE ``roi_subset``   — subset of segmentation ``roi_subset``
-- OpenGATE gate numerics    — ``total_histories``, ``num_threads`` must be numbers
+- OpenGATE gate numerics    — ``total_histories``, ``num_cpu`` must be numbers
 - ``FrameStartTimes`` /
   ``FrameDurations``        — same length; all elements must be numbers
 - SPECT reconstruction
@@ -33,23 +33,18 @@ Import and call ``validate_config`` from your run script::
 
     from src.tests.validate_config import validate_config
     validate_config(config, run_spect=True, run_dosimetry=False, ...)
-
-For questions or issues, contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any, Dict, List
 
-# json_minify strips // comments from JSONC-style files before json.loads
-try:
-    from json_minify import json_minify
-except ImportError:
-    def json_minify(text: str) -> str:  # type: ignore[misc]
-        """Fallback no-op when json_minify is not installed."""
-        return text
+from json_minify import json_minify
+
+from src.io.config_paths import get_pipeline_input_paths
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +173,137 @@ def validate_config(
                     f"got {type(v).__name__}: {v!r}"
                 )
 
+    def _is_finite_number(val: Any) -> bool:
+        """Return True for finite ints/floats and False for bools or non-numbers."""
+        return (
+            not isinstance(val, bool)
+            and isinstance(val, (int, float))
+            and math.isfinite(float(val))
+        )
+
+    def _is_integer_like(val: Any) -> bool:
+        """Return True for integer-valued numeric coordinates."""
+        return _is_finite_number(val) and float(val).is_integer()
+
+    def _check_synthetic_lesion_specs(specs: Any, allowed_rois: List[str]) -> None:
+        """Validate per-ROI synthetic lesion specs against stage expectations."""
+        if specs in (None, {}):
+            return
+        if not isinstance(specs, dict):
+            _err(
+                "'phase_1.synthetic_lesions_stage.specs' must be a dict keyed by ROI name"
+            )
+            return
+
+        allowed_probabilities = {"uniform", "gaussian", "user_defined"}
+        allowed_roi_names = {roi for roi in allowed_rois if isinstance(roi, str)}
+
+        for roi_name, spec in specs.items():
+            prefix = f"phase_1.synthetic_lesions_stage.specs.{roi_name}"
+
+            if not isinstance(roi_name, str) or not roi_name.strip():
+                _err(
+                    f"ROI key {roi_name!r} in 'phase_1.synthetic_lesions_stage.specs' "
+                    "must be a non-empty string"
+                )
+                continue
+            if roi_name == "synthetic_lesion":
+                _err(
+                    "'phase_1.synthetic_lesions_stage.specs.synthetic_lesion' is not allowed"
+                )
+            if roi_name not in allowed_roi_names:
+                _err(
+                    f"'{prefix}' is defined for ROI {roi_name!r}, but that ROI is not present in "
+                    "'phase_1.segmentation_stage.roi_subset'"
+                )
+
+            if not isinstance(spec, dict):
+                _err(f"'{prefix}' must be a dict")
+                continue
+
+            n_lesions = spec.get("n_lesions")
+            if isinstance(n_lesions, bool) or not isinstance(n_lesions, int) or n_lesions <= 0:
+                _err(f"'{prefix}.n_lesions' must be an integer > 0, got {n_lesions!r}")
+                n_lesions = None
+
+            prob = spec.get("prob", "uniform")
+            if not isinstance(prob, str):
+                _err(f"'{prefix}.prob' must be a string, got {type(prob).__name__}: {prob!r}")
+                prob_l = ""
+            else:
+                prob_l = prob.lower()
+                if prob_l not in allowed_probabilities:
+                    _err(
+                        f"'{prefix}.prob' must be one of {sorted(allowed_probabilities)}, got {prob!r}"
+                    )
+
+            sigma_mm = spec.get("sigma_mm")
+            if prob_l == "gaussian":
+                if sigma_mm is None:
+                    _err(f"'{prefix}.sigma_mm' is required when prob='gaussian'")
+                elif not _is_finite_number(sigma_mm) or float(sigma_mm) <= 0:
+                    _err(f"'{prefix}.sigma_mm' must be a finite number > 0, got {sigma_mm!r}")
+            elif sigma_mm is not None and (not _is_finite_number(sigma_mm) or float(sigma_mm) <= 0):
+                _err(
+                    f"'{prefix}.sigma_mm' must be a finite number > 0 when provided, got {sigma_mm!r}"
+                )
+
+            margin_mm = spec.get("margin_mm")
+            if margin_mm is not None and (not _is_finite_number(margin_mm) or float(margin_mm) < 0):
+                _err(f"'{prefix}.margin_mm' must be a finite number >= 0, got {margin_mm!r}")
+
+            seed = spec.get("seed")
+            if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+                _err(f"'{prefix}.seed' must be an integer when provided, got {seed!r}")
+
+            radii_present = "radii_mm" in spec and spec.get("radii_mm") is not None
+            radii_mm = spec.get("radii_mm")
+            if radii_present:
+                if not isinstance(radii_mm, list):
+                    _err(f"'{prefix}.radii_mm' must be a list when provided")
+                else:
+                    if n_lesions is not None and len(radii_mm) != n_lesions:
+                        _err(
+                            f"'{prefix}.radii_mm' length must match n_lesions "
+                            f"({n_lesions}), got {len(radii_mm)}"
+                        )
+                    for i, radius in enumerate(radii_mm):
+                        if not _is_finite_number(radius) or float(radius) <= 0:
+                            _err(
+                                f"'{prefix}.radii_mm[{i}]' must be a finite number > 0, "
+                                f"got {radius!r}"
+                            )
+            elif prob_l == "user_defined":
+                _err(f"'{prefix}.radii_mm' is required when prob='user_defined'")
+
+            centers = spec.get("user_centers_zyx")
+            if prob_l == "user_defined":
+                if not isinstance(centers, list):
+                    _err(f"'{prefix}.user_centers_zyx' must be a list when prob='user_defined'")
+                else:
+                    if n_lesions is not None and len(centers) != n_lesions:
+                        _err(
+                            f"'{prefix}.user_centers_zyx' length must match n_lesions "
+                            f"({n_lesions}), got {len(centers)}"
+                        )
+                    for i, center in enumerate(centers):
+                        if not isinstance(center, (list, tuple)) or len(center) != 3:
+                            _err(
+                                f"'{prefix}.user_centers_zyx[{i}]' must be a [z, y, x] triplet, "
+                                f"got {center!r}"
+                            )
+                            continue
+                        for axis, coord in zip(("z", "y", "x"), center):
+                            if not _is_integer_like(coord):
+                                _err(
+                                    f"'{prefix}.user_centers_zyx[{i}].{axis}' must be an integer-valued "
+                                    f"coordinate, got {coord!r}"
+                                )
+            elif centers is not None:
+                _err(
+                    f"'{prefix}.user_centers_zyx' is only used when prob='user_defined'"
+                )
+
     # ── Top-level ──────────────────────────────────────────────────────────────
 
     title = config.get("output_folder_title")
@@ -203,7 +329,7 @@ def validate_config(
     lmp = seg.get("label_map_path", "")
     if lmp and not os.path.exists(lmp):
         _err(
-            f"'phase_1.segmentation_stage.label_map_path' does not exist: "
+            "'phase_1.segmentation_stage.label_map_path' does not exist: "
             f"{lmp!r}"
         )
 
@@ -230,7 +356,7 @@ def validate_config(
     isotope_p1 = pbpk.get("isotope")
     if not isinstance(isotope_p1, str):
         _err(
-            f"'phase_1.pbpk_tac_stage.isotope' must be a string, "
+            "'phase_1.pbpk_tac_stage.isotope' must be a string, "
             f"got {type(isotope_p1).__name__}: {isotope_p1!r}"
         )
     elif _allowed.get("isotope") and isotope_p1 not in _allowed["isotope"]:
@@ -259,6 +385,7 @@ def validate_config(
             v = sl.get(num_field)
             if v is not None:
                 _check_number(v, f"phase_1.synthetic_lesions_stage.{num_field}")
+        _check_synthetic_lesion_specs(sl.get("specs"), roi_subset)
 
     # ── Phase 2 ────────────────────────────────────────────────────────────────
 
@@ -272,15 +399,8 @@ def validate_config(
         # src/data/pipeline_paths.json under "input_paths.SIMINDDirectory".
         # Check that source directly; fall back to the config field for any
         # legacy configs that still carry it.
-        _pp_file = os.path.join(repo_root, "src", "data", "pipeline_paths.json")
-        _pp_input_paths: Dict[str, Any] = {}
-        try:
-            with open(_pp_file, encoding="utf-8") as _ppf:
-                _pp_input_paths = json.loads(json_minify(_ppf.read())).get("input_paths", {})
-        except Exception:
-            pass
         simind_dir = (
-            _pp_input_paths.get("SIMINDDirectory", "")
+            get_pipeline_input_paths(repo_root).get("SIMINDDirectory", "")
             or simind.get("SIMINDDirectory", "")
         )
         if not isinstance(simind_dir, str) or not simind_dir.strip():
@@ -291,7 +411,7 @@ def validate_config(
         elif not os.path.exists(simind_dir):
             _err(
                 f"SIMINDDirectory does not exist: {simind_dir!r} "
-                f"(set in src/data/pipeline_paths.json → input_paths.SIMINDDirectory)"
+                "(set in src/data/pipeline_paths.json → input_paths.SIMINDDirectory)"
             )
 
         # roi_subset must be a subset of the segmentation roi_subset
@@ -302,7 +422,7 @@ def validate_config(
             bad = [r for r in simind_rois if r not in roi_subset]
             if bad:
                 _err(
-                    f"'phase_2.simind_stage.roi_subset' contains ROIs not in "
+                    "'phase_2.simind_stage.roi_subset' contains ROIs not in "
                     f"'phase_1.segmentation_stage.roi_subset': {bad}. "
                     "Add them to segmentation roi_subset or remove them here."
                 )
@@ -310,7 +430,7 @@ def validate_config(
         collimator = simind.get("Collimator")
         if not isinstance(collimator, str):
             _err(
-                f"'phase_2.simind_stage.Collimator' must be a string, "
+                "'phase_2.simind_stage.Collimator' must be a string, "
                 f"got {type(collimator).__name__}: {collimator!r}"
             )
         elif _allowed.get("collimator") and collimator not in _allowed["collimator"]:
@@ -322,7 +442,7 @@ def validate_config(
         isotope_simind = simind.get("Isotope")
         if not isinstance(isotope_simind, str):
             _err(
-                f"'phase_2.simind_stage.Isotope' must be a string, "
+                "'phase_2.simind_stage.Isotope' must be a string, "
                 f"got {type(isotope_simind).__name__}: {isotope_simind!r}"
             )
 
@@ -330,10 +450,22 @@ def validate_config(
             "NumProjections", "NumPhotons", "EnergyWindowWidth",
             "DetectorDistance", "DetectorWidth",
             "OutputImgSize", "OutputPixelWidth", "OutputSliceWidth",
+            "num_cpu",
         ):
             v = simind.get(nf)
             if v is not None:
                 _check_number(v, f"phase_2.simind_stage.{nf}")
+
+        simind_num_cpu = simind.get("num_cpu")
+        if (
+            isinstance(simind_num_cpu, (int, float))
+            and not isinstance(simind_num_cpu, bool)
+            and simind_num_cpu < 0
+        ):
+            _err(
+                "'phase_2.simind_stage.num_cpu' must be >= 0 (0 = use all available), "
+                f"got {simind_num_cpu}"
+            )
 
         num_photons = simind.get("NumPhotons")
         if (
@@ -342,7 +474,7 @@ def validate_config(
             and num_photons <= 0
         ):
             _err(
-                f"'phase_2.simind_stage.NumPhotons' must be positive, "
+                "'phase_2.simind_stage.NumPhotons' must be positive, "
                 f"got {num_photons}"
             )
 
@@ -359,13 +491,13 @@ def validate_config(
             bad = [r for r in og_rois if r not in roi_subset]
             if bad:
                 _err(
-                    f"'phase_2.opengate_stage.roi_subset' contains ROIs not in "
+                    "'phase_2.opengate_stage.roi_subset' contains ROIs not in "
                     f"'phase_1.segmentation_stage.roi_subset': {bad}. "
                     "Add them to segmentation roi_subset or remove them here."
                 )
 
         gate = og.get("gate", {})
-        for nf in ("total_histories", "num_threads"):
+        for nf in ("total_histories", "num_cpu"):
             v = gate.get(nf)
             if v is not None:
                 _check_number(v, f"phase_2.opengate_stage.gate.{nf}")
@@ -377,8 +509,19 @@ def validate_config(
             and total_hist <= 0
         ):
             _err(
-                f"'phase_2.opengate_stage.gate.total_histories' must be "
+                "'phase_2.opengate_stage.gate.total_histories' must be "
                 f"positive, got {total_hist}"
+            )
+
+        og_num_cpu = gate.get("num_cpu")
+        if (
+            isinstance(og_num_cpu, (int, float))
+            and not isinstance(og_num_cpu, bool)
+            and og_num_cpu < 0
+        ):
+            _err(
+                "'phase_2.opengate_stage.gate.num_cpu' must be >= 0 (0 = use all available), "
+                f"got {og_num_cpu}"
             )
 
         _check_xyz_dim(og.get("xyz_dim"), "phase_2.opengate_stage.xyz_dim")
@@ -407,7 +550,7 @@ def validate_config(
         if isinstance(frame_starts, list) and isinstance(frame_durs, list):
             if len(frame_starts) != len(frame_durs):
                 _err(
-                    f"'FrameStartTimes' and 'FrameDurations' must have the "
+                    "'FrameStartTimes' and 'FrameDurations' must have the "
                     f"same length (got {len(frame_starts)} vs {len(frame_durs)})"
                 )
             for i, v in enumerate(frame_starts):

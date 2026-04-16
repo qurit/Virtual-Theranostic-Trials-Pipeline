@@ -10,7 +10,7 @@ This pipeline creates patient-specific **theranostic digital twins** by combinin
 
 **Radiopharmaceuticals (RPTs)** couple a targeting molecule with a radionuclide that accumulates in tissues expressing a biomarker (e.g., tumors). As the radionuclide decays, emitted particles can deliver therapy while emitted photons enable quantitative imaging. For example, **¹⁷⁷Lu-PSMA** targets PSMA-expressing prostate cancer and supports post-therapy SPECT imaging.
 
-The **Virtual Theranostic Trialss (VTT) Pipeline** is a quantitative software framework that uses real patient CT data to build end-to-end digital twins for theranostics research. It integrates:
+The **Virtual Theranostic Trials (VTT) Pipeline** is a quantitative software framework that uses real patient CT data to build end-to-end digital twins for theranostics research. It integrates:
 
 - **Patient-specific anatomy** from clinical CT scans
 - **Organ/tumor segmentation** (TotalSegmentator-based workflows)
@@ -49,7 +49,7 @@ Because uptake and dose can vary substantially between patients, VTT support per
 
 ```bash
 conda env create -f environment.yml
-conda activate vtt_env
+conda activate vtt
 ```
 
 > This environment includes all required Python dependencies (TotalSegmentator, PyTomography, OpenGATE, PyCNO, etc.).
@@ -63,9 +63,9 @@ conda activate vtt_env
 https://www.msf.lu.se/en/research/simind-monte-carlo-program/downloads
 ```
 
-#### Step 2 — Point the pipeline config to SIMIND
-In your JSON config, set:
-- `phase_2.simind_stage.SIMINDDirectory` = directory containing the `simind` executable
+#### Step 2 — Point the pipeline to SIMIND in pipeline_paths.json
+In your paths JSON found at src/data/pipeline_paths.json, set:
+- `input_paths.SIMINDDirectory` = directory containing the `simind` executable
 
 (Optional sanity check)
 ```bash
@@ -75,67 +75,103 @@ echo $SMC_DIR
 
 ---
 
-## Usage
+## Running the Pipeline
 
-> This repo is run via `main.py` using a user-editable JSON config and CT inputs placed under `inputs/`.
-> Install required dependencies and external tools (SIMIND) before running.
+Two interfaces are available — both call the same `main.py` entry point and produce identical outputs.
 
-### 1) Create your run config
+| | Web UI | Command Line (CLI) |
+|---|---|---|
+| **Best for** | New users, interactive setup | Scripting, batch runs, remote headless servers |
+| **Config** | Auto-generated form with tooltips | Hand-edited JSON file |
+| **CT input** | Folder picker dialog or absolute path | `--input_ct_dir` flag |
+| **Flags** | Toggle buttons in the browser | CLI flags (`--spect`, `--dosimetry`, …) |
+| **Start** | `python run_server.py` | `python main.py …` |
+
+---
+
+### Web UI
+
+#### Launch
 
 ```bash
-cp inputs/config_default.json inputs/config.json
+conda activate vtt
+python run_server.py
 ```
 
-Then edit `inputs/config.json`.
+The browser opens automatically at **http://localhost:8766**.  
+Pass `--port PORT` to change the port, or `--no-browser` to skip auto-open.
 
-#### Must update (most users)
-- `phase_2.simind_stage.SIMINDDirectory` — path to your SIMIND install.
+#### Step-by-step
+
+| Page | What to do |
+|------|------------|
+| **1-Intro** | Read the pipeline overview and prerequisite checklist, then click **Get Started**. |
+| **2 — CT Input** | Click **Choose CT Folder** to open a native folder picker, or type an absolute path into the text field and click **Scan** (useful on remote/Azure servers where a local desktop picker is unavailable). Patients are detected automatically — DICOM subdirectories and `.nii` / `.nii.gz` files both work. Axial, coronal, and sagittal previews are generated for each CT. |
+| **3 — Configure** | Enter a project name (determines the output folder). Toggle pipeline stages: **SPECT**, **Dosimetry**, **Post-Processing**, **Synthetic Lesions**. Choose **PRODUCTION** or **DEBUG** mode. Expand each patient card to adjust per-patient parameters — every field has a tooltip and changes auto-save. The synthetic lesion editor supports automatic radii, manual per-lesion radii, and fully user-defined centres. If output directories from a previous run are detected, a warning is shown and completed stages are skipped automatically. |
+| **4 — Run** | Review the per-patient configuration summary, then click **Run Pipeline**. |
+
+#### Web UI dependencies
+
+The web UI requires a few packages beyond the base conda environment:
+
+```bash
+pip install "fastapi>=0.111" "uvicorn[standard]>=0.30" python-multipart pillow nibabel pydicom
+```
+
+> `run_server.py` checks for these on startup and installs any that are missing automatically.
+
+---
+
+### Command Line (CLI)
+
+#### 1) Create your run config
+
+```bash
+cp config_template.json inputs/my_config.json
+# edit my_config.json
+```
+
+**Must update (most users)**
 - `phase_1.segmentation_stage.roi_subset` — list of ROIs to segment.
-- `phase_1.segmentation_stage.label_map_path` — path to `vtt_map.json` label map file.
-- `phase_1.pbpk_tac_stage.isotope` — isotope for PBPK TAC generation (e.g. `"lu177"`). The TAC is simulated for 10x the isotope half-life.
 - `phase_2.simind_stage.roi_subset` — list of ROIs for SIMIND simulation.
 - `phase_2.opengate_stage.roi_subset` — list of ROIs for OpenGATE dosimetry.
 - `phase_3.spect_postprocess_stage.FrameStartTimes` and `FrameDurations` — frame timing for SPECT reconstruction.
+- `src/data/pipeline_paths.json` → `input_paths.SIMINDDirectory` — path to your SIMIND install (set once, shared across all runs).
 
-#### Common tweaks (runtime / quality)
-- `phase_2.simind_stage.xy_dim` — in-plane resize for SIMIND inputs (smaller = faster).
+**Common tweaks (runtime / quality)**
 - `phase_2.simind_stage.NumPhotons`, `NumProjections`, `EnergyWindowWidth` — simulation fidelity vs. runtime.
-- `phase_2.simind_stage.NumCores` — CPU cores for parallel SIMIND (`0` = use all available).
+- `phase_2.simind_stage.num_cpu` — CPU cores for parallel SIMIND (`0` = use all available).
 - `phase_3.spect_postprocess_stage.Iterations`, `Subsets` — OSEM reconstruction settings.
-- `phase_2.opengate_stage.xy_dim` — downsample CT/seg before dosimetry simulation (e.g. `128` for fast validation, `null` for native resolution). Output dose maps are upsampled back to native CT space automatically.
+- `phase_2.opengate_stage.xyz_dim` — downsample CT/seg before dosimetry (e.g. `[128,128,128]` for fast validation, `null` for native resolution).
 - `phase_2.opengate_stage.gate.total_histories` — Monte Carlo histories for dosimetry.
-- `phase_2.opengate_stage.gate.num_threads` — OpenGATE threads (up to your CPU count).
+- `phase_2.opengate_stage.gate.num_cpu` — OpenGATE threads (up to your CPU count; `0` = use all available).
 
-### 2) CT Input
+#### 2) CT Input
 
-Place your CT data under `inputs/ct_input/`:
+Place CT data in any directory:
 
 ```bash
 mkdir -p inputs/ct_input
+# add DICOM subfolders and/or .nii / .nii.gz files
 ```
 
-You can put **any mix** of the following inside `inputs/ct_input/`:
-- A **single NIfTI CT** file (`.nii` or `.nii.gz`)
-- One or more **DICOM folders** (each folder containing a CT DICOM series)
-- Multiple CTs (multiple NIfTIs and/or multiple DICOM folders)
+Each top-level item is treated as one patient — a DICOM folder or a NIfTI file.
 
-### 3) Command-line Interface
+#### 3) Flags
 
-**Required arguments:**
-- `--config_file` : Path to your JSON config file
-- `--input_ct_dir` : Directory containing CT inputs
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config_file PATH` | required | Path to your JSON config |
+| `--input_ct_dir PATH` | required | Directory containing CT inputs |
+| `--mode {DEBUG,PRODUCTION}` | `PRODUCTION` | Verbosity and intermediate file cleanup |
+| `--logging_on / --no-logging_on` | on | Write per-CT log file |
+| `--synthetic_lesions` | off | Run synthetic lesion generation (requires `specs` in config) |
+| `--spect` | off | Run SIMIND SPECT projection simulation |
+| `--dosimetry` | off | Run OpenGATE dosimetry simulation |
+| `--postprocess` | off | Run post-processing for whichever simulations ran |
+| `--save_config` | off | Copy config JSON into each CT output folder |
 
-**Optional arguments:**
-- `--mode {DEBUG,PRODUCTION}` : Controls verbosity and intermediate file cleanup (default: PRODUCTION)
-- `--logging_on / --no-logging_on` : Enable/disable per-CT log file writing (default: enabled)
-- `--save_ct_scan / --no-save_ct_scan` : Copy the CT input into the output folder for provenance (default: disabled)
-- `--save_config / --no-save_config` : Copy the config JSON into each CT output folder (default: disabled)
-- `--synthetic_lesions / --no-synthetic_lesions` : Run synthetic lesion generation (default: disabled; requires `phase_1.synthetic_lesions_stage.specs` to be set in config)
-- `--spect / --no-spect` : Run SIMIND SPECT projection simulation (default: disabled)
-- `--dosimetry / --no-dosimetry` : Run OpenGATE dosimetry simulation (default: disabled)
-- `--postprocess / --no-postprocess` : Run post-processing for whichever simulations ran (default: disabled)
-
-### 4) Run
+#### 4) Run
 
 **Phase 1 only (digital twin + TACs):**
 ```bash
@@ -229,67 +265,14 @@ test_run_CT_0/
 
 ```
 src/stages/
-  segmentation_stage.py         <- TotalSegmentator + ROI unification (merged)
+  segmentation_stage.py         <- TotalSegmentator + ROI unification
   synthetic_lesions_stage.py    <- Optional synthetic lesion generation
   pbpk_tac_stage.py             <- PBPK TAC generation (isotope-aware stop time)
-  simind_simulation_stage.py    <- SIMIND preprocessing + Monte Carlo simulation (merged)
+  simind_simulation_stage.py    <- SIMIND preprocessing + Monte Carlo simulation
   opengate_simulation_stage.py  <- OpenGATE voxel-source dosimetry
   spect_postprocess_stage.py    <- TAC weighting + Poisson noise + OSEM reconstruction
   dosemap_postprocess_stage.py  <- Per-ROI TAC-weighted total absorbed dose map
 ```
-
----
-
----
-
-## Web UI
-
-In addition to the CLI, the pipeline ships with a browser-based interface that walks you through the same run in six guided steps.
-
-### Install additional dependencies
-
-The web UI requires a few extra packages not included in the base conda environment:
-
-```bash
-conda activate vtt_env
-pip install "fastapi>=0.111" "uvicorn[standard]>=0.30" python-multipart pillow nibabel pydicom
-```
-
-> `nibabel` and `pydicom` are used only for CT slice previews. If they are already installed as transitive dependencies (e.g. from TotalSegmentator), no action is needed.
-
-### Launch
-
-```bash
-python run_server.py
-```
-
-This starts the server on **http://localhost:8765** and opens the page automatically.
-
-**Options:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port PORT` | `8765` | Port to listen on |
-| `--host HOST` | `127.0.0.1` | Interface to bind |
-| `--no-browser` | — | Don't auto-open the browser |
-
-### Step-by-step flow
-
-| Step | What happens |
-|------|-------------|
-| **1 – Configure** | Auto-generated form from `config_template.json`. Toggle pipeline stages, set ROI subset, adjust simulation parameters. Hover any field label for a description. |
-| **2 – CT Input** | Enter the path to your CT input directory (same folder you'd pass to `--input_ct_dir`). Or drag-and-drop / browse a folder to upload it. The server discovers patients using the same logic as `main.py`. |
-| **3 – Preview** | Axial, coronal, and sagittal middle-slice previews for each detected CT. Errors are shown inline — you can still proceed if a preview fails. |
-| **4 – Per-Patient** | Toggle between a single shared config or independent per-patient configs (pre-filled from Step 1). |
-| **5 – Run** | Launches the pipeline via the same `main.py` entrypoint. Live stdout/stderr streams to the browser via WebSocket. A progress bar tracks patients. |
-| **6 – Summary** | Shows which outputs were generated, total elapsed time (e.g. *2 hrs 14 min 32 sec*), and a per-patient timing breakdown. |
-
-### Notes
-
-- The web UI and CLI share the same code path — `python run_server.py` calls `main.py` under the hood.
-- The existing CLI is completely unaffected; `python run_server.py` is an additional entry point.
-- Output folders are written to the same `<repo_root>/<output_folder_title>_CT_<index>/` locations.
-- The server only binds to `127.0.0.1` by default, so it is not exposed on the network.
 
 ---
 

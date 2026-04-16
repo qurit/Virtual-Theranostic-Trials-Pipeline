@@ -147,9 +147,9 @@
     "18": "soft_palate",
     "19": "hard_palate"
     },
-    "TDT_Pipeline":{// Adjusted classes for TDT pipeline use (only ones possible to use as ROIs) 
+    "TDT_Pipeline":{// Adjusted classes for TDT pipeline use (only ones possible to use as ROIs)
         "0": "background",
-        "1": "body",
+        "1": "remaining_body",
         "2": "kidney",
         "3": "liver",
         "4": "prostate",
