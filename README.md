@@ -132,7 +132,7 @@ cp config_template.json inputs/my_config.json
 ```
 
 **Must update (most users)**
-- `phase_1.segmentation_stage.roi_subset` — list of ROIs to segment.
+- `phase_1.segmentation_stage.roi_subset` — list of ROIs to segment. `remaining_body` (the body outline minus all named organs) is always added automatically — do not include it explicitly.
 - `phase_2.simind_stage.roi_subset` — list of ROIs for SIMIND simulation.
 - `phase_2.opengate_stage.roi_subset` — list of ROIs for OpenGATE dosimetry.
 - `phase_3.spect_postprocess_stage.FrameStartTimes` and `FrameDurations` — frame timing for SPECT reconstruction.
@@ -162,14 +162,18 @@ Each top-level item is treated as one patient — a DICOM folder or a NIfTI file
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config_file PATH` | required | Path to your JSON config |
-| `--input_ct_dir PATH` | required | Directory containing CT inputs |
+| `--input_ct_dir PATH` | required* | Directory containing CT inputs (NIfTI files or DICOM folders) |
+| `--input_ct PATH` | required* | Single CT input — a NIfTI file or a DICOM directory |
 | `--mode {DEBUG,PRODUCTION}` | `PRODUCTION` | Verbosity and intermediate file cleanup |
 | `--logging_on / --no-logging_on` | on | Write per-CT log file |
+| `--ct_index_start N` | `0` | Starting index for output folder naming (e.g. `2` → `_CT_2`, `_CT_3`, …) |
 | `--synthetic_lesions` | off | Run synthetic lesion generation (requires `specs` in config) |
 | `--spect` | off | Run SIMIND SPECT projection simulation |
 | `--dosimetry` | off | Run OpenGATE dosimetry simulation |
 | `--postprocess` | off | Run post-processing for whichever simulations ran |
 | `--save_config` | off | Copy config JSON into each CT output folder |
+
+> \* `--input_ct_dir` and `--input_ct` are mutually exclusive; exactly one is required.
 
 #### 4) Run
 
