@@ -79,7 +79,13 @@ def _load_allowed_options(repo_root: str) -> Dict[str, List]:
 
         _flatten(raw)
     except Exception:
-        pass  # Enum checks simply skip if the file is unreadable
+        import warnings
+        warnings.warn(
+            f"Could not read pipeline_options.json at '{opts_path}'. "
+            "Enum validation (collimator, isotope, reconstruction algorithm) will be skipped.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     return allowed
 
@@ -570,6 +576,18 @@ def validate_config(
             v = spect_pp.get(nf)
             if v is not None:
                 _check_number(v, f"phase_3.spect_postprocess_stage.{nf}")
+
+    # Dosemap post-processing: apply_tac must be True when --postprocess + --dosimetry
+    if run_postprocess and run_dosimetry:
+        p3 = config.get("phase_3", {})
+        dose_pp = p3.get("dosemap_postprocess_stage", {})
+        if not dose_pp.get("apply_tac", True):
+            _err(
+                "'phase_3.dosemap_postprocess_stage.apply_tac' must be true when "
+                "--postprocess and --dosimetry are both enabled. TAC weighting is "
+                "required to convert OpenGATE Gy/decay outputs to absolute dose (Gy). "
+                "There is no other post-processing applied to the dose map."
+            )
 
     # ── Raise with full error summary ──────────────────────────────────────────
 

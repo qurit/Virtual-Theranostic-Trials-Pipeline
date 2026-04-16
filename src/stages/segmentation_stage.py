@@ -37,7 +37,9 @@ import nibabel as nib
 import SimpleITK as sitk
 from torch.cuda.amp import GradScaler as _GradScaler
 from totalsegmentator.python_api import totalsegmentator
-from json_minify import json_minify                                                    
+from json_minify import json_minify
+
+from src.utils.nifti_utils import load_int_seg
 
 # ---------------------------------------------------------------------------
 # Compatibility: some TotalSegmentator/torch combinations expect `torch.GradScaler`.
@@ -266,10 +268,6 @@ class SegmentationStage:
     # helpers — ROI unification
     # ------------------------------------------------------------------
 
-    @staticmethod                                                                      
-    def _load_int_seg(path: str) -> np.ndarray:                                        
-        """Load a NIfTI segmentation and return it as int16 (sufficient for label IDs).""" 
-        return nib.load(path).get_fdata().astype(np.int16)                             
 
     def _assert_unification_inputs_exist(self, plan: TotSegPlan) -> None:              
         """
@@ -364,10 +362,10 @@ class SegmentationStage:
 
         ct_nii = nib.load(self.ct_nii_path)                                            
 
-        body_seg = self._load_int_seg(self.body_ml_path)                               
-        total_seg = self._load_int_seg(self.total_ml_path) if plan.get("run_total", False) else None 
+        body_seg = load_int_seg(self.body_ml_path)                               
+        total_seg = load_int_seg(self.total_ml_path) if plan.get("run_total", False) else None 
         head_seg = (                                                                   
-            self._load_int_seg(self.head_glands_cavities_ml_path) if plan.get("run_head_glands_cavities", False) else None 
+            load_int_seg(self.head_glands_cavities_ml_path) if plan.get("run_head_glands_cavities", False) else None 
         )                                                                              
 
         roi_unified = self._create_roi_unified(body_seg, total_seg, head_seg, plan)    
@@ -428,7 +426,8 @@ class SegmentationStage:
             The updated context object (same instance as `self.context`).
         """
         self._standardize_ct_to_nifti()
-        assert self.ct_nii_path is not None
+        if self.ct_nii_path is None:
+            raise RuntimeError("CT standardisation failed: ct_nii_path is None after _standardize_ct_to_nifti()")
 
         plan = self._pre_totalsegmentation_checks()
         body_ml_done, head_glands_cavities_ml_done, total_ml_done = self._files_exist()

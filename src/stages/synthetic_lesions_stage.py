@@ -66,6 +66,9 @@ import numpy as np
 from json_minify import json_minify
 from scipy.ndimage import distance_transform_edt
 
+from src.utils.nifti_utils import xyz_to_zyx, zyx_to_xyz, get_spacing_zyx_mm, save_nifti_nib
+from src.utils.label_utils import load_tdt_label_map
+
 
 class SyntheticLesionsStage:
     """
@@ -146,51 +149,10 @@ class SyntheticLesionsStage:
     # helpers
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    def _xyz_to_zyx(arr_xyz: np.ndarray) -> np.ndarray:
-        """Transpose an array from (X,Y,Z) to (Z,Y,X)."""
-        return np.transpose(arr_xyz, (2, 1, 0))
-
-    @staticmethod
-    def _zyx_to_xyz(arr_zyx: np.ndarray) -> np.ndarray:
-        """Transpose an array from (Z,Y,X) to (X,Y,Z)."""
-        return np.transpose(arr_zyx, (2, 1, 0))
-
-    @staticmethod
-    def _get_spacing_zyx_mm(nii: nib.Nifti1Image) -> np.ndarray:
-        """
-        Return voxel spacing in (Z,Y,X) order, in mm.
-        NIfTI header zooms are typically (X,Y,Z).
-        """
-        spacing_xyz = np.array(nii.header.get_zooms()[:3], dtype=np.float64)
-        return np.array([spacing_xyz[2], spacing_xyz[1], spacing_xyz[0]], dtype=np.float64)
-
-    @staticmethod
-    def _save_nifti(
-        path: str,
-        data_xyz: np.ndarray,
-        ref_nii: nib.Nifti1Image,
-        dtype: np.dtype,
-    ) -> None:
-        """
-        Save a NIfTI file using the affine + header from `ref_nii`.
-        `data_xyz` must be shaped (X,Y,Z). Units are whatever the data represents.
-        """
-        out = nib.Nifti1Image(data_xyz.astype(dtype, copy=False), ref_nii.affine, ref_nii.header.copy())
-        out.set_data_dtype(dtype)
-        nib.save(out, path)
-
     def _load_tdt_label_map(self) -> Dict[str, int]:
-        """Load TDT_Pipeline label map (name -> id) from configured label_map_path."""
-        ts_map_path = self.context.config["phase_1"]["segmentation_stage"]["label_map_path"] 
-        if not os.path.exists(ts_map_path):
-            raise FileNotFoundError(f"Class map json not found: {ts_map_path}")
-
-        with open(ts_map_path, encoding="utf-8") as f:
-            ts_map_json: Dict[str, Dict[str, str]] = json.loads(json_minify(f.read()))
-
-        # JSON is keyed by label-id strings -> name; we want name -> int(label-id)
-        return {name: int(lab) for lab, name in ts_map_json["TDT_Pipeline"].items()}
+        """Load TDT_Pipeline label map from configured label_map_path."""
+        ts_map_path = self.context.config["phase_1"]["segmentation_stage"]["label_map_path"]
+        return load_tdt_label_map(ts_map_path)
 
     def _ensure_synthetic_lesion_in_roi_subset(self) -> None:
         """Ensure downstream ROI subset includes 'synthetic_lesion'."""
@@ -215,8 +177,8 @@ class SyntheticLesionsStage:
 
         seg_nii = nib.load(self.tdt_roi_seg_path)
         seg_xyz = np.asanyarray(seg_nii.dataobj).astype(np.uint8, copy=False)
-        seg_zyx = self._xyz_to_zyx(seg_xyz)
-        spacing_zyx = self._get_spacing_zyx_mm(seg_nii)
+        seg_zyx = xyz_to_zyx(seg_xyz)
+        spacing_zyx = get_spacing_zyx_mm(seg_nii)
         return seg_nii, seg_xyz, seg_zyx, spacing_zyx
 
     def _write_backup_seg(self, seg_nii: nib.Nifti1Image, seg_xyz: np.ndarray) -> str:
@@ -224,7 +186,7 @@ class SyntheticLesionsStage:
         os.makedirs(self.lesions_outdir, exist_ok=True)
         backup_path = os.path.join(self.lesions_outdir, f"{self.prefix}_pre_lesions.nii.gz")
         # Use uint8 to avoid truncating larger label IDs
-        self._save_nifti(backup_path, seg_xyz, seg_nii, dtype=np.uint8)
+        save_nifti_nib(backup_path, seg_xyz, seg_nii, dtype=np.uint8)
         return backup_path
 
     def _save_stage_metadata(
@@ -734,9 +696,9 @@ class SyntheticLesionsStage:
         bin_path = os.path.join(roi_dir, f"{roi_name}_lesions_binary.nii.gz")
         minus_path = os.path.join(roi_dir, f"{roi_name}_organ_minus_lesions.nii.gz")
 
-        self._save_nifti(labels_path, self._zyx_to_xyz(roi_lesion_labels_zyx), seg_nii, dtype=np.uint16)  
-        self._save_nifti(bin_path, self._zyx_to_xyz(roi_lesion_binary_zyx), seg_nii, dtype=np.uint8)
-        self._save_nifti(minus_path, self._zyx_to_xyz(roi_organ_minus_lesions_zyx), seg_nii, dtype=np.uint8)
+        save_nifti_nib(labels_path, zyx_to_xyz(roi_lesion_labels_zyx), seg_nii, dtype=np.uint16)  
+        save_nifti_nib(bin_path, zyx_to_xyz(roi_lesion_binary_zyx), seg_nii, dtype=np.uint8)
+        save_nifti_nib(minus_path, zyx_to_xyz(roi_organ_minus_lesions_zyx), seg_nii, dtype=np.uint8)
 
         return {
             "lesions_labels": labels_path,
@@ -871,8 +833,8 @@ class SyntheticLesionsStage:
         global_bin_path = os.path.join(self.lesions_outdir, f"{self.prefix}_all_lesions_binary.nii.gz")
         global_lbl_path = os.path.join(self.lesions_outdir, f"{self.prefix}_all_lesions_labels.nii.gz")
 
-        self._save_nifti(global_bin_path, self._zyx_to_xyz(global_lesion_binary_zyx), seg_nii, dtype=np.uint8)
-        self._save_nifti(global_lbl_path, self._zyx_to_xyz(global_lesion_labels_zyx), seg_nii, dtype=np.uint16)  
+        save_nifti_nib(global_bin_path, zyx_to_xyz(global_lesion_binary_zyx), seg_nii, dtype=np.uint8)
+        save_nifti_nib(global_lbl_path, zyx_to_xyz(global_lesion_labels_zyx), seg_nii, dtype=np.uint16)  
 
         return global_bin_path, global_lbl_path
 
@@ -889,8 +851,8 @@ class SyntheticLesionsStage:
         seg_zyx_mod = seg_zyx.copy()
         seg_zyx_mod[global_lesion_binary_zyx > 0] = int(self.synthetic_lesion_id)
 
-        seg_xyz_mod = self._zyx_to_xyz(seg_zyx_mod).astype(np.uint8, copy=False)
-        self._save_nifti(self.tdt_roi_seg_path, seg_xyz_mod, seg_nii, dtype=np.uint8)
+        seg_xyz_mod = zyx_to_xyz(seg_zyx_mod).astype(np.uint8, copy=False)
+        save_nifti_nib(self.tdt_roi_seg_path, seg_xyz_mod, seg_nii, dtype=np.uint8)
 
     # -------------------------------------------------------------------------
     # Public entrypoint

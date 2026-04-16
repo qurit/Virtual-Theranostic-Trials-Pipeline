@@ -55,7 +55,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pycno
-import pydicom
+
+from src.utils.tac_utils import roi_to_voi
+from src.utils.dicom_utils import extract_height_weight
 
 # ---------------------------------------------------------------------------
 # Isotope half-life lookup table (values in minutes).
@@ -145,47 +147,6 @@ class PbpkTacStage:
         mu = np.log(mean) - 0.5 * sigma2
         return float(np.random.lognormal(mean=mu, sigma=np.sqrt(sigma2)))
 
-    def _extract_height_weight_from_dicom_dir(self, dicom_dir: str) -> Tuple[Optional[float], Optional[float]]:
-        """
-        Try to extract patient height (m) and weight (kg) from DICOM tags.
-
-        Tags: PatientSize (0010,1020) -> meters; PatientWeight (0010,1030) -> kg.
-        Scans up to 50 files; returns (None, None) if not found or unreadable.
-        """
-        if not os.path.isdir(dicom_dir):
-            return None, None
-
-        # Walk recursively — DICOM series are often nested several levels deep
-        # (e.g. patient/study/series/*.dcm).  os.listdir only sees the top level.
-        from pathlib import Path as _Path
-        candidates: List[str] = []
-        for _fp in sorted(_Path(dicom_dir).rglob("*")):
-            if _fp.is_file():
-                candidates.append(str(_fp))
-            if len(candidates) >= 200:
-                break
-
-        for path in candidates:
-            try:
-                ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
-                height = getattr(ds, "PatientSize", None)
-                weight = getattr(ds, "PatientWeight", None)
-
-                height = float(height) if height not in (None, "", " ") else None
-                weight = float(weight) if weight not in (None, "", " ") else None
-
-                if height is not None and height <= 0:
-                    height = None
-                if weight is not None and weight <= 0:
-                    weight = None
-
-                if height is not None or weight is not None:
-                    return height, weight
-            except Exception:
-                continue
-
-        return None, None
-
     def _parameter_check(self) -> Dict[str, float]:
         """
         Validate PBPK config inputs and build the PyCNO parameter override dict.
@@ -223,7 +184,7 @@ class PbpkTacStage:
         self.height = None
         self.weight = None
         if os.path.isdir(self.ct_input_path):
-            self.height, self.weight = self._extract_height_weight_from_dicom_dir(self.ct_input_path)
+            self.height, self.weight = extract_height_weight(self.ct_input_path)
 
         if self.height is not None:
             parameters["bodyHeight"] = float(self.height)
@@ -295,24 +256,6 @@ class PbpkTacStage:
         steps = int(np.ceil(stop)) if stop > 0 else 1
         time, tacs = model.simulate(stop=stop, steps=steps, observables=self.vois_pbpk)
         return np.asarray(time, dtype=float), np.asarray(tacs, dtype=float)
-
-    def _roi_to_voi(self, roi_name: str) -> Optional[str]:
-        """
-        Map a TDT ROI name to its PyCNO VOI observable name.
-
-        Returns None if there is no explicit mapping (caller falls back to "Rest").
-        """
-        roi_to_voi = {
-            "kidney":           "Kidney",
-            "remaining_body":   "Rest",
-            "liver":            "Liver",
-            "prostate":         "Prostate",
-            "heart":            "Heart",
-            "spleen":           "Spleen",
-            "salivary_glands":  "SG",
-            "synthetic_lesion": "Tumor1",
-        }
-        return roi_to_voi.get(roi_name, None)
 
     def _extract_tac_for_voi(self, tacs: np.ndarray, voi_index: int) -> np.ndarray:
         """Extract one VOI TAC from PyCNO output (handles 2D and 3D array shapes)."""
@@ -447,7 +390,7 @@ class PbpkTacStage:
         tac_values: Dict[str, np.ndarray] = {}
 
         for roi_name in self.downstream_roi_subset:
-            voi_name = self._roi_to_voi(roi_name)
+            voi_name = roi_to_voi(roi_name)
 
             if voi_name is None or voi_name not in self.vois_pbpk:
                 if "Rest" in self.vois_pbpk:

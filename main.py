@@ -29,6 +29,7 @@ from src.stages.simind_simulation_stage import SimindSimulationStage
 from src.stages.spect_postprocess_stage import SpectPostprocessStage
 from src.stages.opengate_simulation_stage import OpenGateSimulationStage
 from src.stages.dosemap_postprocess_stage import DosemapPostprocessStage
+from src.utils.dicom_utils import extract_height_weight
 
 
 CTInputType = Literal["nii", "dicom"]
@@ -292,45 +293,10 @@ class TdtPipeline:
                     "missing": ["height", "weight"], "source": "not_dicom"}
 
         try:
-            import pydicom
-        except ImportError:
-            return {"height_m": None, "weight_kg": None,
-                    "missing": ["height", "weight"], "source": "pydicom_missing"}
-
-        # Walk recursively — series are often nested several levels deep
-        # (e.g. patient/study/series/*.dcm).
-        candidates: List[str] = []
-        try:
-            from pathlib import Path as _Path
-            for fp in sorted(_Path(self.ct_input).rglob("*")):
-                if fp.is_file():
-                    candidates.append(str(fp))
-                if len(candidates) >= 200:
-                    break
+            height, weight = extract_height_weight(self.ct_input)
         except Exception:
-            pass
-
-        height: Optional[float] = None
-        weight: Optional[float] = None
-        for fp in candidates:
-            try:
-                ds = pydicom.dcmread(fp, stop_before_pixels=True, force=True)
-                h = getattr(ds, "PatientSize", None)
-                w = getattr(ds, "PatientWeight", None)
-                h = float(h) if h not in (None, "", " ") else None
-                w = float(w) if w not in (None, "", " ") else None
-                if h is not None and h <= 0:
-                    h = None
-                if w is not None and w <= 0:
-                    w = None
-                if h is not None:
-                    height = h
-                if w is not None:
-                    weight = w
-                if height is not None and weight is not None:
-                    break
-            except Exception:
-                continue
+            return {"height_m": None, "weight_kg": None,
+                    "missing": ["height", "weight"], "source": "no_files"}
 
         missing = (["height"] if height is None else []) + (["weight"] if weight is None else [])
         return {"height_m": height, "weight_kg": weight,
@@ -468,13 +434,13 @@ class TdtPipeline:
         else: 
             print(banner) 
 
-    def _cleanup_work_dir(self, work_dir: str) -> None: 
-        """Remove a work directory in PRODUCTION mode to save disk space.""" 
-        if self.mode == "PRODUCTION" and work_dir and os.path.exists(work_dir): 
-            work_dir_abs = os.path.abspath(work_dir) 
-            shutil.rmtree(work_dir_abs, ignore_errors=True) 
-            if self.mode == "DEBUG": 
-                _debug_print(f"Cleaned up work_dir: {work_dir_abs}", "CLEANUP", self.logger) 
+    def _cleanup_work_dir(self, work_dir: str) -> None:
+        """Remove a work directory in PRODUCTION mode to save disk space."""
+        if self.mode == "PRODUCTION" and work_dir and os.path.exists(work_dir):
+            work_dir_abs = os.path.abspath(work_dir)
+            shutil.rmtree(work_dir_abs, ignore_errors=True)
+        elif self.mode == "DEBUG":
+            _debug_print(f"Skipping cleanup of work_dir (DEBUG mode): {work_dir}", "CLEANUP", self.logger)
 
     def run(self) -> Context:
         """

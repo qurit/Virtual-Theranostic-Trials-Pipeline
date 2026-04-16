@@ -70,6 +70,9 @@ import numpy as np
 import SimpleITK as sitk
 from json_minify import json_minify
 
+from src.utils.nifti_utils import save_nii_sitk
+from src.utils.label_utils import load_tdt_label_map
+
 # opengate is imported lazily inside run() so that importing this module does not
 # crash the process on systems where opengate_core is unavailable (e.g. wrong OS
 # version).  All module-level references below use the global `gate` name which is
@@ -158,6 +161,12 @@ class OpenGateSimulationStage:
         self.histories_per_thread: int = self.requested_total_histories // self.num_threads
         self.actual_total_histories: int = self.histories_per_thread * self.num_threads
         self.history_rounding_loss: int = self.requested_total_histories - self.actual_total_histories
+        if self.history_rounding_loss > 0:
+            print(
+                f"[OpenGateSimulationStage] History rounding: requested {self.requested_total_histories}, "
+                f"running {self.actual_total_histories} ({self.histories_per_thread} per thread × "
+                f"{self.num_threads} threads). Loss: {self.history_rounding_loss} histories."
+            )
 
         # Only Lu-177 is currently supported in this stage.
         source_cfg = self.stage_cfg.get("source", {})
@@ -178,7 +187,7 @@ class OpenGateSimulationStage:
         self.ct_nii_path: Path = Path(context.ct_nii_path)
         self.tdt_roi_seg_path: Path = Path(context.tdt_roi_seg_path)
         self.label_map_path: Path = Path(context.config["phase_1"]["segmentation_stage"]["label_map_path"]) 
-        self.tdt_name2id: Dict[str, int] = self._load_tdt_label_map(self.label_map_path)
+        self.tdt_name2id: Dict[str, int] = load_tdt_label_map(self.label_map_path)
 
         # Build final ROI list from opengate_stage config (independent from phase_1) 
         opengate_roi_subset = self.stage_cfg.get("roi_subset")                         
@@ -225,24 +234,6 @@ class OpenGateSimulationStage:
         """Return the expected final NIfTI output path for a given ROI dose map."""
         return Path(self.work_dir) / f"{self.prefix}_dose_{roi_name}.nii.gz"
 
-    @staticmethod
-    def _load_tdt_label_map(path: Path) -> Dict[str, int]:
-        """Load the TDT_Pipeline label map as {roi_name: label_id}."""
-        if not path.exists():
-            raise FileNotFoundError(f"TDT label map not found: {path}")
-        with open(path, encoding="utf-8") as f:
-            data = json.loads(json_minify(f.read()))
-        if "TDT_Pipeline" not in data:
-            raise KeyError("Label map JSON missing 'TDT_Pipeline' key")
-        return {name: int(label_id) for label_id, name in data["TDT_Pipeline"].items()}
-
-    @staticmethod
-    def _save_nii(ref: sitk.Image, arr: np.ndarray, path: Path) -> str:
-        """Save a numpy array as NIfTI using `ref` geometry."""
-        img = sitk.GetImageFromArray(np.asarray(arr))
-        img.CopyInformation(ref)
-        sitk.WriteImage(img, str(path), imageIO="NiftiImageIO")
-        return str(path)
 
     @staticmethod
     def _cleanup_mhd(path: Path) -> None:
@@ -496,7 +487,7 @@ class OpenGateSimulationStage:
                 continue
 
             mask_path = Path(self.source_mask_dir) / f"{self.prefix}_{roi_name}_source_mask.nii.gz"
-            self._save_nii(sim_ct, mask, mask_path)
+            save_nii_sitk(sim_ct, mask, mask_path)
             mask_paths[roi_name] = str(mask_path)
             counts[roi_name] = n_vox
             names.append(roi_name)
@@ -827,7 +818,7 @@ class OpenGateSimulationStage:
             sum_arr = dose_native.copy() if sum_arr is None else sum_arr + dose_native
 
             if self.save_per_roi_dose_maps:
-                dose_paths[roi_name] = self._save_nii(
+                dose_paths[roi_name] = save_nii_sitk(
                     native_ct,
                     dose_native.astype(np.float32),
                     expected_nii,
@@ -839,7 +830,7 @@ class OpenGateSimulationStage:
                     if needs_upsample
                     else res["unc_arr"]
                 )
-                unc_paths[roi_name] = self._save_nii(
+                unc_paths[roi_name] = save_nii_sitk(
                     native_ct,
                     unc_out,
                     Path(self.work_dir) / f"{self.prefix}_unc_{roi_name}.nii.gz",
@@ -848,7 +839,7 @@ class OpenGateSimulationStage:
             # Save the material label image from the first successful ROI only.
             if mat_label_path is None and self.save_material_label_image and res["label_mhd_path"] and os.path.exists(res["label_mhd_path"]):
                 labels = sitk.GetArrayFromImage(sitk.ReadImage(res["label_mhd_path"])).astype(np.int16)
-                mat_label_path = self._save_nii(
+                mat_label_path = save_nii_sitk(
                     sim_ct,
                     labels,
                     Path(self.work_dir) / f"{self.prefix}_material_labels.nii.gz",
@@ -874,7 +865,7 @@ class OpenGateSimulationStage:
 
         sum_path: Optional[str] = None
         if self.save_summed_dose_map and sum_arr is not None:
-            sum_path = self._save_nii(
+            sum_path = save_nii_sitk(
                 native_ct,
                 sum_arr.astype(np.float32),
                 Path(self.output_dir) / f"{self.prefix}_dose_sum.nii.gz",

@@ -54,14 +54,30 @@ import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import nibabel as nib                                                                  
+import nibabel as nib
 import numpy as np
-from scipy.ndimage import zoom                                                         
-from json_minify import json_minify                                                    
+from scipy.ndimage import zoom
+from json_minify import json_minify
 
-# Linear attenuation coefficients at the Lu-177 photopeak (~208 keV), in 1/cm. 
-MU_WATER_CM_INV: float = 0.1537                                                       
-MU_BONE_CM_INV: float = 0.2234                                                        
+from src.utils.label_utils import load_tdt_label_map, build_class_map, build_label_masks
+
+# Linear attenuation coefficients (1/cm) at each isotope's primary photopeak energy.
+# Values from NIST XCOM (https://physics.nist.gov/PhysRefData/Xcom/html/xcom1.html)
+# for liquid water and cortical bone.  Add a new entry here when supporting a new isotope.
+#
+#   lu177  : 208 keV primary photopeak  (water=0.1537, bone=0.2234)
+#   i131   : 364 keV primary photopeak  (water=0.1113, bone=0.1567)  — future example
+#
+# IMPORTANT: if you add a new isotope to the pipeline, add its attenuation values here
+# and ensure the preprocessor is initialised with the correct isotope key (currently
+# hard-coded to "lu177" in SimindSimulationStage — search for MU_TABLE_CM_INV to update).
+_MU_TABLE_CM_INV: dict = {
+    "lu177": {"water": 0.1537, "bone": 0.2234},
+}
+
+# Convenience aliases kept for any direct references elsewhere in the file.
+MU_WATER_CM_INV: float = _MU_TABLE_CM_INV["lu177"]["water"]
+MU_BONE_CM_INV:  float = _MU_TABLE_CM_INV["lu177"]["bone"]
 
 
 class _SimindPreprocessor:                                                             
@@ -98,51 +114,6 @@ class _SimindPreprocessor:
         self.prefix = prefix                                                           
         self.resize = resize                                                           
         self.debug = debug                                                             
-    @staticmethod
-    def _build_class_map(seg_arr: np.ndarray, id_to_name: Dict[int, str]) -> Dict[str, int]:
-        """
-        Return {roi_name: label_id} for labels actually present in `seg_arr`.
-
-        Parameters
-        ----------
-        seg_arr : np.ndarray
-        id_to_name : dict[int, str]
-
-        Returns
-        -------
-        dict[str, int]
-        """
-        class_map: Dict[str, int] = {}
-        for lab in np.unique(seg_arr.astype(int)):
-            if lab == 0:
-                continue
-            name = id_to_name.get(int(lab))
-            if name is not None:
-                class_map[name] = int(lab)
-        return class_map
-
-    @staticmethod
-    def _build_label_masks(arr: np.ndarray) -> Dict[int, np.ndarray]:
-        """
-        Build boolean masks for each non-zero label in a multilabel segmentation.
-
-        Returns
-        -------
-        dict[int, np.ndarray]  (label_id -> bool mask)
-
-        Raises
-        ------
-        ValueError  if the array contains only background (all zeros).
-        """
-        labels = np.unique(arr)
-        labels = labels[labels != 0]
-        if labels.size == 0:
-            raise ValueError(
-                "Segmentation has no non-zero labels. "
-                "Segmentation likely failed or ROI subset is empty/mismatched."
-            )
-        return {int(lab): (arr == lab) for lab in labels}
-
     @staticmethod
     def _hu_to_mu(
         hu_arr: np.ndarray,
@@ -346,8 +317,8 @@ class _SimindPreprocessor:
         roi_body_arr = np.fromfile(roi_body_path, dtype=np.float32).reshape(shape).astype(np.int16)
 
         id_to_name = {v: k for k, v in self.tdt_name2id.items()}
-        class_seg = self._build_class_map(roi_body_arr, id_to_name)
-        masks = self._build_label_masks(roi_body_arr)
+        class_seg = build_class_map(roi_body_arr, id_to_name)
+        masks = build_label_masks(roi_body_arr)
 
         binary_roi_act_map_paths: Dict[str, str] = {}
         for roi_name in class_seg:
@@ -441,9 +412,9 @@ class _SimindPreprocessor:
         # Mask ROI labels to body to prevent out-of-body artifacts.
         roi_body_arr = (roi_arr * body_mask).astype(np.int16)
 
-        masks = self._build_label_masks(roi_body_arr)
+        masks = build_label_masks(roi_body_arr)
         id_to_name = {v: k for k, v in self.tdt_name2id.items()}
-        class_seg = self._build_class_map(roi_body_arr, id_to_name)
+        class_seg = build_class_map(roi_body_arr, id_to_name)
 
         # Spacing: original NIfTI zooms are in mm; after zoom, spacing shrinks by scale.
         zooms_mm = np.array(ct_nii.header.get_zooms()[:3], dtype=float) / scale
@@ -564,15 +535,9 @@ class SimindSimulationStage:
                 f"Available: {sorted(phase1_rois)}"                                    
             )                                                                          
 
-        # Load TDT label map 
-        self.ts_map_path: str = context.config["phase_1"]["segmentation_stage"]["label_map_path"] 
-        if not os.path.exists(self.ts_map_path):                                       
-            raise FileNotFoundError(f"Class map json not found: {self.ts_map_path}")   
-        with open(self.ts_map_path, encoding="utf-8") as f:                            
-            ts_map_json = json.loads(json_minify(f.read()))                             
-        self.tdt_name2id: Dict[str, int] = {                                           
-            name: int(lab) for lab, name in ts_map_json["TDT_Pipeline"].items()        
-        }                                                                              
+        # Load TDT label map
+        self.ts_map_path: str = context.config["phase_1"]["segmentation_stage"]["label_map_path"]
+        self.tdt_name2id: Dict[str, int] = load_tdt_label_map(self.ts_map_path)
 
         # CPU count: 0 or invalid -> use all available cores
         _cfg_num_cpu = self.stage_cfg.get("num_cpu", 1)

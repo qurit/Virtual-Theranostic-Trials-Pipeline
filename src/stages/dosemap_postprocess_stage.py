@@ -64,8 +64,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import SimpleITK as sitk
 
-# NumPy 2.0 renamed np.trapz -> np.trapezoid
-_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+from src.utils.nifti_utils import save_nii_sitk
+from src.utils.tac_utils import compute_roi_cumulated_activity
 
 
 class DosemapPostprocessStage:
@@ -103,44 +103,18 @@ class DosemapPostprocessStage:
 
         self.prefix: str = self.stage_cfg.get("file_prefix", "dosemap_postprocess")
 
+        # apply_tac is the only post-processing applied to dose maps. Without it,
+        # OpenGATE outputs (Gy/decay) cannot be converted to absolute dose (Gy).
+        if not self.stage_cfg.get("apply_tac", True):
+            raise ValueError(
+                "'phase_3.dosemap_postprocess_stage.apply_tac' must be true. "
+                "TAC weighting is required to convert OpenGATE Gy/decay outputs to "
+                "absolute dose (Gy). There is no other post-processing path for dose maps."
+            )
+
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _save_nii(ref: sitk.Image, arr: np.ndarray, path: str) -> str:
-        """Save a numpy array as NIfTI using `ref` geometry."""
-        img = sitk.GetImageFromArray(np.asarray(arr, dtype=np.float32))
-        img.CopyInformation(ref)
-        sitk.WriteImage(img, path, imageIO="NiftiImageIO")
-        return path
-
-    @staticmethod
-    def _compute_roi_cumulated_activity(
-        tac_time: np.ndarray,
-        tac_roi: np.ndarray,
-    ) -> float:
-        """
-        Compute total cumulated activity (total decays) for a single ROI over the
-        full extent of the TAC from t=0 to the last timepoint.
-
-        Uses trapezoidal integration of the ROI's TAC.
-
-        Parameters
-        ----------
-        tac_time : np.ndarray  (minutes)
-        tac_roi : np.ndarray  (TAC in MBq for this specific ROI)
-
-        Returns
-        -------
-        float  total number of decays over the full TAC period
-        """
-        tac_float = tac_roi.astype(np.float64)
-        integral_mbq_min = _trapezoid(tac_float, tac_time.astype(np.float64))
-
-        # Convert MBq*min -> decays: 1 MBq = 1e6 decays/s, 1 min = 60 s
-        n_decays = integral_mbq_min * 1e6 * 60.0
-        return float(n_decays)
 
     def _save_stage_metadata(
         self,
@@ -276,7 +250,7 @@ class DosemapPostprocessStage:
         cumulated_activities: Dict[str, float] = {}
 
         for roi_name, dose_per_decay in roi_dose_maps.items():
-            n_decays = self._compute_roi_cumulated_activity(tac_time, tac_values[roi_name])
+            n_decays = compute_roi_cumulated_activity(tac_time, tac_values[roi_name])
             cumulated_activities[roi_name] = n_decays
 
             roi_contribution = dose_per_decay * n_decays
@@ -290,7 +264,7 @@ class DosemapPostprocessStage:
             roi_contrib_path = os.path.join(
                 self.work_dir, f"{self.prefix}_{roi_name}_dose_contribution.nii.gz"
             )
-            self._save_nii(ref_ct, roi_contribution.astype(np.float32), roi_contrib_path)
+            save_nii_sitk(ref_ct, roi_contribution.astype(np.float32), roi_contrib_path)
 
             if self.debug:
                 print(
@@ -307,7 +281,7 @@ class DosemapPostprocessStage:
                 f"({integration_end_min / 60.0 / 24.0:.1f} days)"
             )
 
-        self._save_nii(ref_ct, total_dose.astype(np.float32), output_path)
+        save_nii_sitk(ref_ct, total_dose.astype(np.float32), output_path)
 
         self._save_stage_metadata(output_path, cumulated_activities, roi_names_used, integration_end_min)
 

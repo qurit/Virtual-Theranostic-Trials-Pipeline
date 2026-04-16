@@ -48,6 +48,8 @@ import SimpleITK as sitk
 import torch
 import pytomography
 
+from src.utils.nifti_utils import voxel_volume_ml
+
 from pytomography.algorithms import OSEM
 from pytomography.io.SPECT import simind
 from pytomography.io.shared import get_header_value
@@ -80,11 +82,15 @@ class SpectPostprocessStage:
         self.prefix: str = self.stage_cfg.get("file_prefix", "spect_postprocess")      
         self.mode: str = context.mode
 
-        # Post-processing control flags 
-        self.apply_tac: bool = bool(self.stage_cfg.get("apply_tac", True))             
-        self.apply_poisson_noise: bool = bool(self.stage_cfg.get("apply_poisson_noise", True)) 
-        self.apply_reconstruction: bool = bool(self.stage_cfg.get("apply_reconstruction", True)) 
-        self.apply_frame_duration: bool = bool(self.stage_cfg.get("apply_frame_duration", True)) 
+        # Post-processing control flags
+        self.apply_tac: bool = bool(self.stage_cfg.get("apply_tac", True))
+        self.apply_poisson_noise: bool = bool(self.stage_cfg.get("apply_poisson_noise", True))
+        self.apply_reconstruction: bool = bool(self.stage_cfg.get("apply_reconstruction", True))
+        # NOTE: apply_frame_duration MUST be True for correct units.
+        # SIMIND projections are in counts/MBq/s; organ_sum is in MBq.
+        # Without the frame duration (seconds), the weighted projections are count
+        # rates (counts/s) rather than counts — reconstruction would receive wrong inputs.
+        self.apply_frame_duration: bool = bool(self.stage_cfg.get("apply_frame_duration", True))
 
         # Frame timing from post-process config 
         self.frame_start: Sequence[float] = self.stage_cfg["FrameStartTimes"]          
@@ -127,10 +133,6 @@ class SpectPostprocessStage:
     # ------------------------------------------------------------------
     # helpers — projection I/O
     # ------------------------------------------------------------------
-
-    def _voxel_volume_ml(self, arr_px_spacing_cm: Sequence[float]) -> float:           
-        """Compute voxel volume in mL from (z, y, x) spacing in cm. (cm^3 == mL)"""
-        return float(np.prod(np.asarray(arr_px_spacing_cm, dtype=float)))
 
     def _write_activity_map_nifti(self, arr_zyx: np.ndarray, out_path: str) -> None:   
         """Save a SIMIND-grid activity map as NIfTI using SimpleITK."""
@@ -285,20 +287,6 @@ class SpectPostprocessStage:
     # helpers — TAC application
     # ------------------------------------------------------------------
 
-    def _roi_to_voi(self, roi_name: str) -> Optional[str]:                             
-        """Map a TDT ROI name to its PyCNO VOI observable name."""
-        roi_to_voi = {
-            "kidney":           "Kidney",
-            "remaining_body":   "Rest",
-            "liver":            "Liver",
-            "prostate":         "Prostate",
-            "heart":            "Heart",
-            "spleen":           "Spleen",
-            "salivary_glands":  "SG",
-            "synthetic_lesion": "Tumor1",
-        }
-        return roi_to_voi.get(roi_name, None)
-
     def _build_pbpk_projection_paths(self) -> Dict[str, Dict[str, str]]:
         """Build the expected output paths for PBPK-weighted frame projections."""
         projection_paths: Dict[str, Dict[str, str]] = {}
@@ -365,7 +353,7 @@ class SpectPostprocessStage:
 
         # Remove "background" label if present (not a real ROI).  
         class_seg = {k: v for k, v in self.context.class_seg.items() if k != "background"}
-        voxel_vol_ml = self._voxel_volume_ml(self.context.arr_px_spacing_cm)
+        voxel_vol_ml = voxel_volume_ml(self.context.arr_px_spacing_cm)
 
         roi_list = list(self.context.simind_projection_paths.keys())
         if not roi_list:
