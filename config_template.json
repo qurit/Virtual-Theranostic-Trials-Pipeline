@@ -107,8 +107,9 @@
       "roi_subset": ["liver", "kidney", "salivary_glands"],
 
       // Simulation grid: [x, y, z] voxel counts, or null for native CT resolution.
-      // Each value must be smaller than the corresponding CT dimension.
-      // Example: [128, 128, 128] for faster Monte Carlo at lower spatial resolution.
+      // Each axis is scaled independently — x, y, and z each use their own scale factor
+      // so physical voxel spacings are exact per axis. Values must be smaller than the
+      // corresponding CT dimension. Example: [128, 128, 128] for faster simulation.
       "xyz_dim": null,
 
       // Collimator code. Must match a *.col file in your SIMIND installation.
@@ -117,7 +118,10 @@
       // Isotope code for SIMIND physics lookup.
       "Isotope": "lu177",
 
-      // Angular projection views over a full 360° rotation. Typical range: 60–128.
+      // Angular projection views over a full 360° rotation.
+      // Minimum: 64 — fewer causes angular undersampling and streak artifacts in OSEM.
+      // Rule: phase_3.spect_postprocess_stage.Subsets × Iterations ≤ NumProjections.
+      // Typical clinical range: 64–128.
       "NumProjections": 64,
 
       // Total photon histories. Higher = lower noise, longer runtime. (e.g. 1e8)
@@ -170,6 +174,8 @@
       "write_mhd_outputs": false,
 
       // Simulation grid: [x, y, z] voxel counts, or null for native CT resolution.
+      // Each axis is scaled independently. Dose maps are resampled back to native
+      // CT resolution after simulation. Values must be smaller than the CT dimension.
       "xyz_dim": null,
 
       // Enable forced-detection variance reduction (valid for Lu-177 when voxel size << photon mean-free path).
@@ -241,9 +247,11 @@
       "ReconstructionAlgorithm": "OSEM",
 
       // OSEM reconstruction iterations.
+      // Constraint: Subsets × Iterations must not exceed phase_2.simind_stage.NumProjections.
       "Iterations": 4,
 
-      // OSEM ordered subsets.
+      // OSEM ordered subsets. Higher values accelerate convergence but may reduce stability.
+      // Constraint: Subsets × Iterations must not exceed phase_2.simind_stage.NumProjections.
       "Subsets": 8
     },
 

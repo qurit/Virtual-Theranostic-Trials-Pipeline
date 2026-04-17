@@ -139,12 +139,13 @@ cp config_template.json inputs/my_config.json
 - `src/data/pipeline_paths.json` → `input_paths.SIMINDDirectory` — path to your SIMIND install (set once, shared across all runs).
 
 **Common tweaks (runtime / quality)**
-- `phase_2.simind_stage.NumPhotons`, `NumProjections`, `EnergyWindowWidth` — simulation fidelity vs. runtime.
+- `phase_2.simind_stage.NumPhotons`, `NumProjections`, `EnergyWindowWidth` — simulation fidelity vs. runtime. `NumProjections` must be ≥ 64; fewer projections causes angular undersampling and streak artifacts in OSEM reconstruction. The constraint `Subsets × Iterations ≤ NumProjections` must also hold.
 - `phase_2.simind_stage.num_cpu` — CPU cores for parallel SIMIND (`0` = use all available).
-- `phase_3.spect_postprocess_stage.Iterations`, `Subsets` — OSEM reconstruction settings.
-- `phase_2.opengate_stage.xyz_dim` — downsample CT/seg before dosimetry (e.g. `[128,128,128]` for fast validation, `null` for native resolution).
+- `phase_3.spect_postprocess_stage.Iterations`, `Subsets` — OSEM reconstruction settings. `Subsets × Iterations` must not exceed `NumProjections`.
+- `phase_2.simind_stage.xyz_dim` — optional simulation grid as `[x, y, z]` voxel counts. Each axis is scaled independently from the native CT, preserving physical extent per axis. `null` = native CT resolution.
+- `phase_2.opengate_stage.xyz_dim` — optional simulation grid as `[x, y, z]` voxel counts for dosimetry. Each axis is scaled independently. Dose maps are resampled back to native CT resolution after simulation. `null` = native CT resolution.
 - `phase_2.opengate_stage.gate.total_histories` — Monte Carlo histories for dosimetry.
-- `phase_2.opengate_stage.gate.num_cpu` — OpenGATE threads (up to your CPU count; `0` = use all available).
+- `phase_2.opengate_stage.gate.num_cpu` — OpenGATE threads (`0` = use all available).
 
 #### 2) CT Input
 
@@ -256,7 +257,7 @@ test_run_CT_0/
 **Notes:**
 - `*_tot_w1/w2/w3.a00` are SIMIND energy-window projection totals (lower / photopeak / upper).
 - `calib.res` is produced by SIMIND Jaszczak calibration and converts counts -> activity.
-- All dose maps in the dosimetry output are in native CT resolution (upsampled back if `xy_dim` was set).
+- All dose maps are saved in native CT resolution. If `xyz_dim` was set for OpenGATE, the simulation runs on the downsampled grid and outputs are resampled back automatically.
 - The total dose map is computed using per-ROI weighting: each ROI's dose-per-decay map is multiplied by that ROI's own cumulated activity (TAC integrated from t=0 over 10x the isotope half-life, capturing >99.9% of all decays), then summed across ROIs. This avoids unphysical cross-terms.
 - PBPK TAC simulation length is derived automatically from the configured isotope half-life (10x multiplier). If any SPECT frame time extends beyond this, the TAC is extended to cover it.
 - In `PRODUCTION` mode, SIMIND `work_dir` is deleted after post-processing to save disk space.

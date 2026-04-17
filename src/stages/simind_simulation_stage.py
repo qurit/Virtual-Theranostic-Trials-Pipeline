@@ -60,6 +60,7 @@ from scipy.ndimage import zoom
 from json_minify import json_minify
 
 from src.utils.label_utils import load_tdt_label_map, build_class_map, build_label_masks
+from src.utils.resize_utils import resolve_simulation_grid
 
 # Linear attenuation coefficients (1/cm) at each isotope's primary photopeak energy.
 # Values from NIST XCOM (https://physics.nist.gov/PhysRefData/Xcom/html/xcom1.html)
@@ -220,46 +221,39 @@ class _SimindPreprocessor:
         resize: Optional[int] = None,
         transpose_tuple: Tuple[int, int, int] = (2, 1, 0),
         zoom_order: int = 0,
-    ) -> Tuple[np.ndarray, float]:
+    ) -> Tuple[np.ndarray, float, float, float]:
         """
-        Convert a NIfTI object to SIMIND grid format with optional isotropic resizing.
+        Convert a NIfTI object to SIMIND grid format with optional resizing.
 
         Convention: transpose to (z, y, x), then flip y.
 
         Parameters
         ----------
         nii_obj : nib.Nifti1Image
-        resize : Optional[int | tuple[int,int,int]]
-            If int: isotropic scale derived from that in-plane target (legacy behaviour).
-            If (x, y, z) tuple: resize each axis independently.
-            None: no resize.
+        resize : Optional[int | list[int]]
+            Passed directly to :func:`~src.utils.resize_utils.resolve_simulation_grid`.
+            ``[x, y, z]`` for per-axis targets; ``int`` for legacy isotropic scalar;
+            ``None`` for no resizing.
         transpose_tuple : tuple[int,int,int]
         zoom_order : int  0 = nearest (seg), 1 = linear (CT)
 
         Returns
         -------
-        (array_zyx, mean_xy_scale_factor)
+        (array_zyx, scale_x, scale_y, scale_z)
         """
         arr = np.array(nii_obj.get_fdata(dtype=np.float32))
         arr = np.transpose(arr, transpose_tuple)[:, ::-1, :]  # now (z, y, x)
 
-        scale = 1.0
-        if resize is not None:
-            if isinstance(resize, (list, tuple)):
-                # xyz_dim = [x, y, z]  →  target shape (z, y, x)
-                tx, ty, tz = int(resize[0]), int(resize[1]), int(resize[2])
-                sz, sy, sx = arr.shape
-                scale_z = tz / sz if sz > 0 else 1.0
-                scale_y = ty / sy if sy > 0 else 1.0
-                scale_x = tx / sx if sx > 0 else 1.0
-                arr = zoom(arr, (scale_z, scale_y, scale_x), order=zoom_order)
-                scale = (scale_x + scale_y) / 2.0  # representative in-plane scale for spacing
-            else:
-                # Legacy scalar: isotropic in-plane resize
-                scale = resize / arr.shape[1]
-                arr = zoom(arr, (scale, scale, scale), order=zoom_order)
+        # arr is (sz, sy, sx); present as (sx, sy, sz) for resolve_simulation_grid
+        sz, sy, sx = arr.shape
+        result = resolve_simulation_grid(resize, (sx, sy, sz))
 
-        return arr, scale
+        scale_x = scale_y = scale_z = 1.0
+        if result is not None:
+            (nx, ny, nz), (scale_x, scale_y, scale_z) = result
+            arr = zoom(arr, (scale_z, scale_y, scale_x), order=zoom_order)
+
+        return arr, scale_x, scale_y, scale_z
 
     def _write_binary_roi_maps(
         self,
@@ -395,8 +389,8 @@ class _SimindPreprocessor:
 
         # Convert to SIMIND grid (z, y, x) with optional resize.
         # CT uses linear interpolation; seg uses nearest-neighbour.
-        ct_arr, scale = self._to_simind_grid(ct_nii, resize=self.resize, zoom_order=1)
-        roi_arr_full, _ = self._to_simind_grid(roi_nii, resize=self.resize, zoom_order=0)
+        ct_arr, scale_x, scale_y, scale_z = self._to_simind_grid(ct_nii, resize=self.resize, zoom_order=1)
+        roi_arr_full, _, _, _ = self._to_simind_grid(roi_nii, resize=self.resize, zoom_order=0)
         roi_arr_full = roi_arr_full.astype(np.int16)
 
         body_label = self.tdt_name2id.get("remaining_body")
@@ -416,9 +410,14 @@ class _SimindPreprocessor:
         id_to_name = {v: k for k, v in self.tdt_name2id.items()}
         class_seg = build_class_map(roi_body_arr, id_to_name)
 
-        # Spacing: original NIfTI zooms are in mm; after zoom, spacing shrinks by scale.
-        zooms_mm = np.array(ct_nii.header.get_zooms()[:3], dtype=float) / scale
-        zooms_mm = zooms_mm[[2, 1, 0]]  # reorder to (z, y, x) to match the transposed array
+        # Spacing: original NIfTI zooms (x, y, z) in mm, each divided by its own
+        # per-axis scale factor so the physical voxel size is exact for every axis.
+        zooms_nii_mm = np.array(ct_nii.header.get_zooms()[:3], dtype=float)  # (x, y, z)
+        zooms_mm = np.array([
+            zooms_nii_mm[2] / scale_z,  # z-axis → arr index 0
+            zooms_nii_mm[1] / scale_y,  # y-axis → arr index 1
+            zooms_nii_mm[0] / scale_x,  # x-axis → arr index 2
+        ])
         arr_px_spacing_cm = tuple(float(x) * 0.1 for x in zooms_mm)
 
         # HU->mu conversion uses mean in-plane (y, x) spacing.

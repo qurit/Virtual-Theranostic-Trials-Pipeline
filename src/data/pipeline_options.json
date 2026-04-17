@@ -39,9 +39,10 @@
   "collimator": ["si-me"],
 
   // Number of SPECT angular projection views acquired in a full rotation.
-  // More projections improve angular sampling at the cost of longer
-  // simulated acquisition time.  Typical clinical range: 60–128.
-  "num_projections": [32, 60, 64, 72, 96, 120, 128],
+  // Minimum: 64. Fewer projections causes angular undersampling and streak
+  // artifacts in OSEM reconstruction. Rule: Subsets × Iterations ≤ NumProjections.
+  // Typical clinical range: 64–128.
+  "num_projections": [64, 72, 96, 120, 128],
 
   // ==========================================================================
   // PHASE 3 — Post-Processing

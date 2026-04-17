@@ -92,6 +92,7 @@ class TdtPipeline:
         run_dosimetry: bool = False,
         run_postprocess: bool = False,
         launched_via: str = "cli",
+        startup_banner_lines: Optional[List[str]] = None,
     ) -> None:
         self.config_path: str = config_path
         self.ct_input: str = ct_input
@@ -103,9 +104,10 @@ class TdtPipeline:
         self.launched_via: str = launched_via
         self.mode: Literal["DEBUG", "PRODUCTION"] = mode
         self.synthetic_lesions: bool = synthetic_lesions
-        self.run_spect: bool = run_spect       
-        self.run_dosimetry: bool = run_dosimetry 
-        self.run_postprocess: bool = run_postprocess 
+        self.run_spect: bool = run_spect
+        self.run_dosimetry: bool = run_dosimetry
+        self.run_postprocess: bool = run_postprocess
+        self.startup_banner_lines: List[str] = startup_banner_lines or []
 
         self.config: Dict[str, Any] = {}
         self.output_folder_path: str = ""
@@ -171,6 +173,10 @@ class TdtPipeline:
                 )
             )
             logger.addHandler(fh)
+
+        if self.startup_banner_lines:
+            for line in self.startup_banner_lines:
+                logger.info(line)
 
         logger.info("----Log started----")
         logger.info("Launched via: %s", self.launched_via)
@@ -640,9 +646,8 @@ def _print_startup_banner(
     args: Any,
     items: List[str],
     cfg: Dict[str, Any],
-    log_path: Optional[str] = None,
-) -> None:
-    """Print a formatted startup banner to stdout and optionally append it to a log file."""
+) -> List[str]:
+    """Print a formatted startup banner to stdout and return the lines for per-patient logs."""
     import datetime
 
     avail = os.cpu_count() or 1
@@ -711,14 +716,7 @@ def _print_startup_banner(
     for line in lines:
         print(line)
 
-    # Append to log file if provided
-    if log_path:
-        try:
-            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-            with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write("\n".join(lines) + "\n")
-        except Exception:
-            pass  # Never block the run due to logging
+    return lines
 
 
 def main() -> int:
@@ -774,8 +772,7 @@ def main() -> int:
         print(f"\n[ERROR] Config file not found: {_fnf}\n")
         return 1
 
-    _banner_log = os.path.join(os.path.dirname(os.path.abspath(args.config_file)), "pipeline_run.log")
-    _print_startup_banner(args, items, _cfg_raw, log_path=_banner_log)
+    _banner_lines = _print_startup_banner(args, items, _cfg_raw)
 
     any_failed = False
     for idx, name in enumerate(items, start=args.ct_index_start):
@@ -794,6 +791,7 @@ def main() -> int:
                 run_dosimetry=args.dosimetry,
                 run_postprocess=args.postprocess,
                 launched_via=args.launched_via,
+                startup_banner_lines=_banner_lines,
             )
             pipeline.run()
         except Exception:

@@ -72,6 +72,7 @@ from json_minify import json_minify
 
 from src.utils.nifti_utils import save_nii_sitk
 from src.utils.label_utils import load_tdt_label_map
+from src.utils.resize_utils import resolve_simulation_grid
 
 # opengate is imported lazily inside run() so that importing this module does not
 # crash the process on systems where opengate_core is unavailable (e.g. wrong OS
@@ -299,33 +300,19 @@ class OpenGateSimulationStage:
 
     def _compute_resampled_geometry(self, img: sitk.Image) -> Optional[Tuple[Tuple[int, ...], Tuple[float, ...]]]:
         """
-        Compute an isotropically scaled in-plane geometry if xy downsampling is requested.
+        Resolve the xyz_dim parameter to a target grid and new voxel spacings.
 
         Returns None when downsampling is disabled or unnecessary.
         """
-        if self.xy_dim is None:
-            return None
-
         sx, sy, sz = img.GetSize()
         spx, spy, spz = img.GetSpacing()
 
-        if isinstance(self.xy_dim, (list, tuple)):
-            # xyz_dim = [x, y, z] — explicit per-axis target voxel counts
-            nx = max(1, int(self.xy_dim[0]))
-            ny = max(1, int(self.xy_dim[1]))
-            nz = max(1, int(self.xy_dim[2]))
-        else:
-            # Legacy scalar: isotropic in-plane scale
-            if sx <= self.xy_dim and sy <= self.xy_dim:
-                return None
-            scale = min(self.xy_dim / sx, self.xy_dim / sy)
-            nx = max(1, round(sx * scale))
-            ny = max(1, round(sy * scale))
-            nz = max(1, round(sz * scale))
+        result = resolve_simulation_grid(self.xy_dim, (sx, sy, sz))
+        if result is None:
+            return None
 
-        if nx >= sx and ny >= sy and nz >= sz:
-            return None  # target is same or larger — skip resampling
-        return (nx, ny, nz), (spx * sx / nx, spy * sy / ny, spz * sz / nz)
+        (nx, ny, nz), (scale_x, scale_y, scale_z) = result
+        return (nx, ny, nz), (spx / scale_x, spy / scale_y, spz / scale_z)
 
     @staticmethod
     def _resample(

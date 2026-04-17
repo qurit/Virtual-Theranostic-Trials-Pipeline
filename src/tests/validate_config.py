@@ -484,6 +484,20 @@ def validate_config(
                 f"got {num_photons}"
             )
 
+        num_proj = simind.get("NumProjections")
+        if (
+            isinstance(num_proj, (int, float))
+            and not isinstance(num_proj, bool)
+            and num_proj < 64
+        ):
+            _err(
+                f"'phase_2.simind_stage.NumProjections' is {int(num_proj)}, "
+                "but the minimum for valid OSEM reconstruction is 64. "
+                "Fewer projections causes severe angular undersampling and streak "
+                "artifacts. Rule of thumb: Subsets × Iterations must not exceed "
+                "NumProjections, and NumProjections must be >= 64."
+            )
+
         _check_xyz_dim(simind.get("xyz_dim"), "phase_2.simind_stage.xyz_dim")
 
     # OpenGATE dosimetry simulation (only when --dosimetry is set)
@@ -576,6 +590,26 @@ def validate_config(
             v = spect_pp.get(nf)
             if v is not None:
                 _check_number(v, f"phase_3.spect_postprocess_stage.{nf}")
+
+        # Cross-check: Subsets × Iterations must not exceed NumProjections.
+        if run_spect:
+            iters   = spect_pp.get("Iterations")
+            subsets = spect_pp.get("Subsets")
+            num_proj_pp = p2.get("simind_stage", {}).get("NumProjections")
+            if (
+                isinstance(iters, (int, float)) and not isinstance(iters, bool)
+                and isinstance(subsets, (int, float)) and not isinstance(subsets, bool)
+                and isinstance(num_proj_pp, (int, float)) and not isinstance(num_proj_pp, bool)
+                and subsets * iters > num_proj_pp
+            ):
+                _err(
+                    f"Subsets × Iterations ({int(subsets)} × {int(iters)} = "
+                    f"{int(subsets * iters)}) exceeds NumProjections "
+                    f"({int(num_proj_pp)}). This over-updates the reconstruction "
+                    "relative to available angular data and amplifies artifacts. "
+                    "Reduce Subsets or Iterations, or increase NumProjections, so "
+                    "that Subsets × Iterations ≤ NumProjections."
+                )
 
     # Dosemap post-processing: apply_tac must be True when --postprocess + --dosimetry
     if run_postprocess and run_dosimetry:

@@ -811,6 +811,32 @@ function NumCpuField({value,onChange,desc,systemCpuCount}){
   );
 }
 
+// ─── NumProjectionsField ──────────────────────────────────────────────────────
+function NumProjectionsField({value,onChange,desc,opts}){
+  const [showDesc,setShowDesc]=useState(false);
+  const err=typeof value==='number'&&value<64
+    ?`${value} projections is below the minimum of 64. Fewer projections causes angular undersampling and streak artifacts in OSEM reconstruction.`
+    :'';
+  const note='Rule: Subsets \u00d7 Iterations must not exceed NumProjections.';
+  return(
+    <div className="py-2 border-b border-slate-100 last:border-0">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          <span className="text-sm font-medium text-slate-700">NumProjections</span>
+          {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
+        </div>
+        <select value={value} onChange={e=>onChange(parseFloat(e.target.value))}
+          className={`px-2 py-1 text-sm border rounded-lg focus:outline-none focus:ring-2 bg-white ${err?'border-red-400 focus:ring-red-300':'border-slate-300 focus:ring-blue-400'}`}>
+          {(opts||[]).map(o=><option key={o} value={o}>{o}</option>)}
+        </select>
+      </div>
+      {err&&<p className="text-xs text-red-500 pt-1">{err}</p>}
+      {!err&&<p className="text-xs text-slate-400 pt-1">{note}</p>}
+      {showDesc&&<p className="text-xs text-slate-400 pt-1 leading-relaxed">{desc}</p>}
+    </div>
+  );
+}
+
 // ─── FieldRenderer ────────────────────────────────────────────────────────────
 function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape,systemCpuCount,lesionSpecs}){
   const desc=descriptions[fieldKey]||'';
@@ -832,6 +858,7 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
   if(fieldKey==='xyz_dim') return<XyzDimFieldInner value={value} onChange={call} desc={desc} patientShape={patientShape}/>;
   if(fieldKey==='random_seed') return<RandomSeedField value={value} onChange={call} desc={desc}/>;
   if(fieldKey==='num_cpu') return<NumCpuField value={value} onChange={call} desc={desc} systemCpuCount={systemCpuCount}/>;
+  if(fieldKey==='NumProjections') return<NumProjectionsField value={value} onChange={call} desc={desc} opts={opts}/>;
   if(typeof value==='boolean') return<><LabelRow><input type="checkbox" checked={value} onChange={e=>call(e.target.checked)} className="w-4 h-4 accent-blue-600 flex-shrink-0"/></LabelRow><DescLine/></>;
   if(typeof value==='number'&&opts&&Array.isArray(opts)) return(
     <><LabelRow>
