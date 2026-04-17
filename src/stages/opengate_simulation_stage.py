@@ -70,6 +70,14 @@ import numpy as np
 import SimpleITK as sitk
 from json_minify import json_minify
 
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_opengate_rerun_snapshot,
+    fingerprint_optional_file,
+    stage_metadata_path,
+    write_json,
+)
 from src.utils.nifti_utils import save_nii_sitk
 from src.utils.label_utils import load_tdt_label_map
 from src.utils.resize_utils import resolve_simulation_grid
@@ -104,9 +112,12 @@ class OpenGateSimulationStage:
             "ct_nii_path",
             "tdt_roi_seg_path",
             "downstream_roi_subset",
+            "output_folder_path",
+            "ct_input_identity",
         )
         self.context = context
         self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
         self.phase_output_dir: str = context.subdir_paths["phase_2"]                   
         self.stage_cfg: Dict[str, Any] = context.config["phase_2"]["opengate_stage"]   
@@ -125,7 +136,7 @@ class OpenGateSimulationStage:
         os.makedirs(self.resample_dir, exist_ok=True)
 
         self.prefix: str = str(self.stage_cfg.get("file_prefix", "dosimetry"))
-        self.metadata_path: str = os.path.join(self.work_dir, f"{self.prefix}_metadata.json")
+        self.metadata_path: str = stage_metadata_path(context.output_folder_path, "opengate_simulation_stage")
 
         # Save / provenance options
         self.save_per_roi_dose_maps: bool = bool(self.stage_cfg.get("save_per_roi_dose_maps", True))
@@ -221,6 +232,42 @@ class OpenGateSimulationStage:
         # Populated during image preparation and used later when restoring dose arrays.
         self._original_sim_ct_img: Optional[sitk.Image] = None
         self._centering_flipped_axes: List[int] = []
+
+    def _rerun_config_snapshot(self) -> Dict[str, Any]:
+        """Return the OpenGATE settings that must match for cached outputs to remain valid."""
+        return build_opengate_rerun_snapshot(
+            self.context.config,
+            synthetic_enabled=bool(getattr(self.context, "synthetic_lesions_enabled", False)),
+        )
+
+    def _current_dependency_fingerprints(self) -> Dict[str, Any]:
+        """Return fingerprints for the current stage inputs that affect dosimetry outputs."""
+        deps = {
+            "ct_nii": fingerprint_optional_file(self.ct_nii_path),
+            "tdt_roi_seg": fingerprint_optional_file(self.tdt_roi_seg_path),
+            "label_map_json": fingerprint_optional_file(self.label_map_path),
+            "segmentation_stage_metadata": fingerprint_optional_file(
+                stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
+            ),
+        }
+        if getattr(self.context, "synthetic_lesions_enabled", False):
+            deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
+                stage_metadata_path(self.context.output_folder_path, "synthetic_lesions_stage")
+            )
+        return deps
+
+    def _cache_marker_paths(self) -> List[str]:
+        """Return representative output files whose presence means rerun metadata must match."""
+        markers: List[str] = []
+        if self.save_summed_dose_map:
+            markers.append(str(Path(self.output_dir) / f"{self.prefix}_dose_sum.nii.gz"))
+        if self.save_material_label_image:
+            markers.append(str(Path(self.work_dir) / f"{self.prefix}_material_labels.nii.gz"))
+        for roi_name in self.requested_roi_subset:
+            markers.append(str(self._roi_dose_nii_path(roi_name)))
+            if self.save_uncertainty_map:
+                markers.append(str(Path(self.work_dir) / f"{self.prefix}_unc_{roi_name}.nii.gz"))
+        return markers
 
     # ------------------------------------------------------------------
     # helpers
@@ -663,7 +710,13 @@ class OpenGateSimulationStage:
         sim_seg_path: str,
     ) -> None:
         """Save stage metadata for provenance, debugging, and rerun reproducibility."""
-        metadata: Dict[str, Any] = {
+        outputs: Dict[str, Any] = {
+            "dose_paths": dose_paths,
+            "unc_paths": unc_paths,
+            "sum_path": sum_path,
+            "mat_label_path": mat_label_path,
+        }
+        extra: Dict[str, Any] = {
             "stage": "opengate_simulation_stage",
             "dose_units": "Gy/decay",
             "ct_nii_path": str(self.ct_nii_path),
@@ -716,8 +769,15 @@ class OpenGateSimulationStage:
             },
             "roi_metadata": roi_meta,
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
+        metadata = build_stage_metadata(
+            stage_name="opengate_simulation_stage",
+            config_snapshot=self._rerun_config_snapshot(),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints=self._current_dependency_fingerprints(),
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
     # ------------------------------------------------------------------
     # main
@@ -735,6 +795,15 @@ class OpenGateSimulationStage:
         -------
         context : Context-like
         """
+        assert_stage_rerun_safe(
+            stage_name="opengate_simulation_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=self._cache_marker_paths(),
+            current_config_snapshot=self._rerun_config_snapshot(),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints=self._current_dependency_fingerprints(),
+        )
+
         # Lazy import: opengate is only available on compatible platforms.
         # Importing it here (rather than at module level) lets the rest of the
         # pipeline load even when opengate_core cannot be dlopen'd.

@@ -21,20 +21,19 @@ Sampling:
 Outputs
 -------
 Writes into:
-  <phase_1_output>/synthetic_lesions_stage/  
+  <phase_1_output>/synthetic_lesions_stage/
 
-- Backup of unified seg BEFORE lesions:
-    work_dir/<file_prefix>_pre_lesions.nii.gz  
-- Global lesion masks:
-    work_dir/<file_prefix>_all_lesions_binary.nii.gz   (uint8 0/1)  
-    work_dir/<file_prefix>_all_lesions_labels.nii.gz   (uint8 0=bg, 1..K=lesion id across ALL ROIs)  
-- Per-ROI outputs (for QC):
-    work_dir/<roi>/<roi>_lesions_labels.nii.gz  
-    work_dir/<roi>/<roi>_lesions_binary.nii.gz  
-    work_dir/<roi>/<roi>_organ_minus_lesions.nii.gz  
-    work_dir/<roi>/<roi>_lesion_metadata.json  
-- Stage metadata / debug:
-    work_dir/<file_prefix>_metadata.json
+Persistent (survive work_dir cleanup, used for rerun cache check):
+  <file_prefix>_all_lesions_binary.nii.gz   (uint8 0/1)
+  <file_prefix>_all_lesions_labels.nii.gz   (uint8 0=bg, 1..K=lesion id across ALL ROIs)
+  <output_root>/pipeline_metadata/synthetic_lesions_stage.json
+
+Debug / QC only (inside work_dir, safe to delete):
+  work_dir/<file_prefix>_pre_lesions.nii.gz
+  work_dir/<roi>/<roi>_lesions_labels.nii.gz
+  work_dir/<roi>/<roi>_lesions_binary.nii.gz
+  work_dir/<roi>/<roi>_organ_minus_lesions.nii.gz
+  work_dir/<roi>/<roi>_lesion_metadata.json
 
 Primary side effect
 -------------------
@@ -59,6 +58,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import nibabel as nib
@@ -66,6 +66,14 @@ import numpy as np
 from json_minify import json_minify
 from scipy.ndimage import distance_transform_edt
 
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_synthetic_lesions_rerun_snapshot,
+    fingerprint_optional_file,
+    stage_metadata_path,
+    write_json,
+)
 from src.utils.nifti_utils import xyz_to_zyx, zyx_to_xyz, get_spacing_zyx_mm, save_nifti_nib
 from src.utils.label_utils import load_tdt_label_map
 
@@ -95,7 +103,13 @@ class SyntheticLesionsStage:
     _EPS_RADIUS_VOX_FRAC: float = 0.50  # radius floor ~0.5 * min_voxel_size (epsilon radius vox fraction)
 
     def __init__(self, context: Any) -> None:
-        context.require("subdir_paths", "config", "tdt_roi_seg_path")  
+        context.require(
+            "subdir_paths",
+            "config",
+            "tdt_roi_seg_path",
+            "output_folder_path",
+            "ct_input_identity",
+        )
         self.context = context
 
         # Output base directory for this stage (under phase 1)
@@ -109,6 +123,7 @@ class SyntheticLesionsStage:
         self.cfg: Dict[str, Any] = context.config.get("phase_1", {}).get("synthetic_lesions_stage", {})
         self.prefix: str = str(self.cfg.get("file_prefix", "synthetic_lesions"))
         self.specs: Optional[Dict[str, Dict[str, Any]]] = self.cfg.get("specs", None)
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
         # Input unified segmentation path (multilabel) - will be overwritten on disk by this stage with lesions inserted
         self.tdt_roi_seg_path: Optional[str] = getattr(context, "tdt_roi_seg_path", None)
@@ -132,9 +147,12 @@ class SyntheticLesionsStage:
             self.cfg.get("max_lesion_placement_attempts", self.MAX_LESION_PLACEMENT_ATTEMPTS)
         )
 
-        # Stage outputs directory
-        self.lesions_outdir = self.work_dir  
-        self.metadata_path = os.path.join(self.work_dir, f"{self.prefix}_metadata.json")
+        # Persistent primary outputs live directly in output_dir (survive work_dir cleanup).
+        # Per-ROI QC files and the pre-lesion backup stay in work_dir (debug only).
+        self.metadata_path = stage_metadata_path(context.output_folder_path, "synthetic_lesions_stage")
+        self.global_bin_path = os.path.join(self.output_dir, f"{self.prefix}_all_lesions_binary.nii.gz")
+        self.global_lbl_path = os.path.join(self.output_dir, f"{self.prefix}_all_lesions_labels.nii.gz")
+        self.backup_path = os.path.join(self.work_dir, f"{self.prefix}_pre_lesions.nii.gz")
 
         # Load label map from configured phase 1 unification stage path
         self.tdt_name2id = self._load_tdt_label_map()
@@ -144,6 +162,29 @@ class SyntheticLesionsStage:
                 "Add it (e.g. \"8\": \"synthetic_lesion\")."
             )
         self.synthetic_lesion_id: int = int(self.tdt_name2id["synthetic_lesion"])
+
+    def _rerun_config_snapshot(self) -> Dict[str, Any]:
+        """Return the config subset that must match for cached lesion outputs to remain valid."""
+        return build_synthetic_lesions_rerun_snapshot(self.context.config)
+
+    def _current_dependency_fingerprints(self) -> Dict[str, Any]:
+        """Return fingerprints for dependencies that must remain unchanged on rerun."""
+        label_map_path = self.context.config["phase_1"]["segmentation_stage"]["label_map_path"]
+        return {
+            "segmentation_stage_metadata": fingerprint_optional_file(
+                stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
+            ),
+            "label_map_json": fingerprint_optional_file(label_map_path),
+            "lesioned_seg_handoff": fingerprint_optional_file(self.tdt_roi_seg_path),
+        }
+
+    def _cleanup_failed_run(self) -> None:
+        """Remove partial outputs after a failed fresh lesion-generation attempt."""
+        shutil.rmtree(self.output_dir, ignore_errors=True)
+        try:
+            os.remove(self.metadata_path)
+        except FileNotFoundError:
+            pass
 
     # -------------------------------------------------------------------------
     # helpers
@@ -183,11 +224,9 @@ class SyntheticLesionsStage:
 
     def _write_backup_seg(self, seg_nii: nib.Nifti1Image, seg_xyz: np.ndarray) -> str:
         """Save a pre-lesion backup of the unified seg; returns path."""
-        os.makedirs(self.lesions_outdir, exist_ok=True)
-        backup_path = os.path.join(self.lesions_outdir, f"{self.prefix}_pre_lesions.nii.gz")
-        # Use uint8 to avoid truncating larger label IDs
-        save_nifti_nib(backup_path, seg_xyz, seg_nii, dtype=np.uint8)
-        return backup_path
+        os.makedirs(self.output_dir, exist_ok=True)
+        save_nifti_nib(self.backup_path, seg_xyz, seg_nii, dtype=np.uint8)
+        return self.backup_path
 
     def _save_stage_metadata(
         self,
@@ -197,7 +236,13 @@ class SyntheticLesionsStage:
         global_lbl_path: str,
     ) -> None:
         """Save stage-specific metadata for debugging / provenance."""
-        metadata = {
+        outputs = {
+            "backup_seg_path": backup_path,
+            "global_binary_path": global_bin_path,
+            "global_labels_path": global_lbl_path,
+            "tdt_roi_seg_path": self.tdt_roi_seg_path,
+        }
+        extra = {
             "stage": "synthetic_lesions_stage",
             "output_dir": self.output_dir,
             "work_dir": self.work_dir,
@@ -213,9 +258,17 @@ class SyntheticLesionsStage:
             "global_binary_path": global_bin_path,
             "global_labels_path": global_lbl_path,
             "results_summary": list(results.keys()),
+            "results": results,
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
+        metadata = build_stage_metadata(
+            stage_name="synthetic_lesions_stage",
+            config_snapshot=self._rerun_config_snapshot(),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints=self._current_dependency_fingerprints(),
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
     # -------------------------------------------------------------------------
     # Geometry + sampling helpers
@@ -791,8 +844,8 @@ class SyntheticLesionsStage:
             global_lesion_labels_zyx[m] = (roi_lesion_labels_zyx[m].astype(np.uint16) + offset).astype(np.uint16)  
             global_next_id += roi_max
 
-        # Save per-ROI outputs
-        roi_dir = os.path.join(self.lesions_outdir, roi_name)
+        # Save per-ROI QC outputs into work_dir (debug artifacts, not needed for reruns)
+        roi_dir = os.path.join(self.work_dir, roi_name)
         paths = self._save_roi_outputs(
             roi_dir=roi_dir,
             roi_name=roi_name,
@@ -829,14 +882,10 @@ class SyntheticLesionsStage:
         global_lesion_binary_zyx: np.ndarray,
         global_lesion_labels_zyx: np.ndarray,
     ) -> Tuple[str, str]:
-        """Save global lesion binary + label volumes; returns (binary_path, labels_path)."""
-        global_bin_path = os.path.join(self.lesions_outdir, f"{self.prefix}_all_lesions_binary.nii.gz")
-        global_lbl_path = os.path.join(self.lesions_outdir, f"{self.prefix}_all_lesions_labels.nii.gz")
-
-        save_nifti_nib(global_bin_path, zyx_to_xyz(global_lesion_binary_zyx), seg_nii, dtype=np.uint8)
-        save_nifti_nib(global_lbl_path, zyx_to_xyz(global_lesion_labels_zyx), seg_nii, dtype=np.uint16)  
-
-        return global_bin_path, global_lbl_path
+        """Save global lesion binary + label volumes to output_dir; returns (binary_path, labels_path)."""
+        save_nifti_nib(self.global_bin_path, zyx_to_xyz(global_lesion_binary_zyx), seg_nii, dtype=np.uint8)
+        save_nifti_nib(self.global_lbl_path, zyx_to_xyz(global_lesion_labels_zyx), seg_nii, dtype=np.uint16)
+        return self.global_bin_path, self.global_lbl_path
 
     def _overwrite_unified_seg_with_lesions(
         self,
@@ -883,15 +932,22 @@ class SyntheticLesionsStage:
             return self.context
 
         # Skip if outputs from a previous run already exist.
-        if os.path.exists(self.metadata_path):
+        cache_meta = assert_stage_rerun_safe(
+            stage_name="synthetic_lesions_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=[self.backup_path, self.global_bin_path, self.global_lbl_path],
+            current_config_snapshot=self._rerun_config_snapshot(),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints=self._current_dependency_fingerprints(),
+        )
+
+        if cache_meta is not None:
             self.logger.info("Synthetic lesions already exist, skipping generation.")
-            with open(self.metadata_path, encoding="utf-8") as _f:
-                _meta = json.load(_f)
-            self.context.synthetic_lesions_outdir = self.lesions_outdir
-            self.context.synthetic_lesions_results = {}
-            self.context.synthetic_lesions_backup_seg_path = _meta.get("backup_seg_path")
-            self.context.synthetic_lesions_global_binary_path = _meta.get("global_binary_path")
-            self.context.synthetic_lesions_global_labels_path = _meta.get("global_labels_path")
+            self.context.synthetic_lesions_outdir = self.output_dir
+            self.context.synthetic_lesions_results = cache_meta.get("results", {})
+            self.context.synthetic_lesions_backup_seg_path = cache_meta.get("backup_seg_path")
+            self.context.synthetic_lesions_global_binary_path = cache_meta.get("global_binary_path")
+            self.context.synthetic_lesions_global_labels_path = cache_meta.get("global_labels_path")
             self.context.tdt_roi_seg_path = self.tdt_roi_seg_path
             self.context.extras["synthetic_lesions_stage"] = {
                 "output_dir": self.output_dir,
@@ -901,8 +957,7 @@ class SyntheticLesionsStage:
             self._ensure_synthetic_lesion_in_roi_subset()
             return self.context
 
-        os.makedirs(self.lesions_outdir, exist_ok=True)
-        self._ensure_synthetic_lesion_in_roi_subset() # ensures downstream ROI subset includes synthetic_lesion
+        os.makedirs(self.output_dir, exist_ok=True)
 
         # Load segmentation + backup
         seg_nii, seg_xyz, seg_zyx, spacing_zyx_mm = self._load_unified_seg()
@@ -931,10 +986,20 @@ class SyntheticLesionsStage:
                 if meta is not None:
                     results[roi_name] = meta
             except (RuntimeError, ValueError) as e:
-                # Auto mode failures are expected sometimes; we skip that ROI but continue.
-                # Manual mode failures also raise RuntimeError; you can change this to "raise" if preferred.
-                self.logger.warning(f"[{roi_name}] Lesion generation failed; skipping ROI. Error: {e}")
-                continue
+                self._cleanup_failed_run()
+                raise RuntimeError(
+                    f"[{roi_name}] Synthetic lesion generation failed. "
+                    "Delete the old synthetic-lesion outputs for this patient and rerun "
+                    f"after fixing the config. Original error: {e}"
+                ) from e
+
+        if not results or int(global_lesion_binary_zyx.sum()) == 0:
+            self._cleanup_failed_run()
+            raise RuntimeError(
+                "Synthetic lesion generation did not create any lesion voxels. "
+                "Delete the old synthetic-lesion outputs for this patient and rerun "
+                "after fixing the config."
+            )
 
         # Save global masks
         global_bin_path, global_lbl_path = self._save_global_outputs(
@@ -953,7 +1018,8 @@ class SyntheticLesionsStage:
         self._save_stage_metadata(results, backup_path, global_bin_path, global_lbl_path)
 
         # Update context for downstream stages
-        self.context.synthetic_lesions_outdir = self.lesions_outdir
+        self._ensure_synthetic_lesion_in_roi_subset()
+        self.context.synthetic_lesions_outdir = self.output_dir
         self.context.synthetic_lesions_results = results
         self.context.synthetic_lesions_backup_seg_path = backup_path
         self.context.synthetic_lesions_global_binary_path = global_bin_path

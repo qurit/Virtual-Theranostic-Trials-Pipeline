@@ -64,6 +64,14 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import SimpleITK as sitk
 
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_dosemap_rerun_snapshot,
+    fingerprint_optional_file,
+    stage_metadata_path,
+    write_json,
+)
 from src.utils.nifti_utils import save_nii_sitk
 from src.utils.tac_utils import compute_roi_cumulated_activity
 
@@ -85,6 +93,8 @@ class DosemapPostprocessStage:
             "pbpk_tac_time",
             "pbpk_tac_values",
             "ct_nii_path",
+            "output_folder_path",
+            "ct_input_identity",
         )
         self.context = context
         self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"
@@ -99,7 +109,8 @@ class DosemapPostprocessStage:
         os.makedirs(self.stage_output_dir, exist_ok=True)
         self.work_dir: str = os.path.join(self.stage_output_dir, "work_dir")
         os.makedirs(self.work_dir, exist_ok=True)
-        self.metadata_path: str = os.path.join(self.work_dir, "dosemap_postprocess_metadata.json")
+        self.metadata_path: str = stage_metadata_path(context.output_folder_path, "dosemap_postprocess_stage")
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
         self.prefix: str = self.stage_cfg.get("file_prefix", "dosemap_postprocess")
 
@@ -111,6 +122,27 @@ class DosemapPostprocessStage:
                 "TAC weighting is required to convert OpenGATE Gy/decay outputs to "
                 "absolute dose (Gy). There is no other post-processing path for dose maps."
             )
+
+    def _rerun_config_snapshot(self) -> Dict[str, Any]:
+        """Return the dose post-processing settings that must match for reruns."""
+        return build_dosemap_rerun_snapshot(self.context.config)
+
+    def _current_dependency_fingerprints(self) -> Dict[str, Any]:
+        """Return fingerprints for the upstream artifacts that feed this stage."""
+        return {
+            "opengate_stage_metadata": fingerprint_optional_file(self.context.dosimetry_metadata_path),
+            "pbpk_tac_json": fingerprint_optional_file(self.context.pbpk_tac_json_path),
+            "pbpk_tac_npz": fingerprint_optional_file(self.context.pbpk_tac_npz_path),
+        }
+
+    def _cache_marker_paths(self) -> List[str]:
+        """Return representative output files whose presence means rerun metadata must match."""
+        markers = [
+            os.path.join(self.phase_output_dir, f"{self.prefix}_total_dose.nii.gz"),
+        ]
+        for roi_name in self.context.dosimetry_raw_dose_paths.keys():
+            markers.append(os.path.join(self.work_dir, f"{self.prefix}_{roi_name}_dose_contribution.nii.gz"))
+        return markers
 
     # ------------------------------------------------------------------
     # helpers
@@ -128,7 +160,11 @@ class DosemapPostprocessStage:
             roi: os.path.join(self.work_dir, f"{self.prefix}_{roi}_dose_contribution.nii.gz")
             for roi in roi_names_used
         }
-        metadata: Dict[str, Any] = {
+        outputs: Dict[str, Any] = {
+            "dose_output_path": dose_path,
+            "roi_contribution_paths": roi_contribution_paths,
+        }
+        extra: Dict[str, Any] = {
             "stage": "dosemap_postprocess_stage",
             "stage_output_dir": self.stage_output_dir,
             "work_dir": self.work_dir,
@@ -143,8 +179,15 @@ class DosemapPostprocessStage:
             "dose_input_units": "Gy/decay (per ROI source)",
             "dose_output_units": "Gy (total absorbed dose, summed across ROI sources)",
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
+        metadata = build_stage_metadata(
+            stage_name="dosemap_postprocess_stage",
+            config_snapshot=self._rerun_config_snapshot(),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints=self._current_dependency_fingerprints(),
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
     # ------------------------------------------------------------------
     # main
@@ -196,6 +239,15 @@ class DosemapPostprocessStage:
         output_path = os.path.join(
             self.phase_output_dir,
             f"{self.prefix}_total_dose.nii.gz",
+        )
+
+        assert_stage_rerun_safe(
+            stage_name="dosemap_postprocess_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=self._cache_marker_paths(),
+            current_config_snapshot=self._rerun_config_snapshot(),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints=self._current_dependency_fingerprints(),
         )
 
         # Skip if output already exists

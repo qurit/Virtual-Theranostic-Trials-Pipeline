@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from src.io.config_paths import inject_pipeline_paths
 from src.io.context import Context
+from src.io.rerun_guard import ensure_ct_matches_saved_copy, ensure_metadata_dir
 from src.tests.validate_config import validate_config
 
 from src.stages.segmentation_stage import SegmentationStage
@@ -69,8 +70,6 @@ class TdtPipeline:
         If True, saves a copy of the config JSON into the output folder.
     mode : {"DEBUG", "PRODUCTION"}, default="PRODUCTION"
         Controls verbosity and whether intermediate files are cleaned up.
-    synthetic_lesions : bool, default=False
-        If True, runs the synthetic lesions stage to add simulated lesions to the CT.
     run_spect : bool, default=False
         If True, runs SIMIND SPECT simulation in Phase 2.
     run_dosimetry : bool, default=False
@@ -87,7 +86,6 @@ class TdtPipeline:
         logging_on: bool = True,
         save_config: bool = False,
         mode: Literal["DEBUG", "PRODUCTION"] = "PRODUCTION",
-        synthetic_lesions: bool = False,
         run_spect: bool = False,
         run_dosimetry: bool = False,
         run_postprocess: bool = False,
@@ -103,7 +101,6 @@ class TdtPipeline:
         self.save_config: bool = save_config
         self.launched_via: str = launched_via
         self.mode: Literal["DEBUG", "PRODUCTION"] = mode
-        self.synthetic_lesions: bool = synthetic_lesions
         self.run_spect: bool = run_spect
         self.run_dosimetry: bool = run_dosimetry
         self.run_postprocess: bool = run_postprocess
@@ -111,9 +108,11 @@ class TdtPipeline:
 
         self.config: Dict[str, Any] = {}
         self.output_folder_path: str = ""
+        self.metadata_dir_path: str = ""
         self.ct_input_type: CTInputType = "dicom"
+        self.ct_saved_copy_path: str = ""
+        self.ct_input_identity: Dict[str, Any] = {}
         self.run_synthetic_lesions: bool = False
-        self.synthetic_lesions_disabled_reason: str | None = None
         self.sub_dir_names: Dict[str, str] = {}
 
         self.logger: logging.Logger = logging.getLogger(f"VTT_PIPELINE_CT_{self.ct_index}")
@@ -129,9 +128,6 @@ class TdtPipeline:
 
         self.context: Context
         self._context_setup()
-
-        if self.synthetic_lesions_disabled_reason is not None:
-            self.logger.info(self.synthetic_lesions_disabled_reason)
 
         if not self.logging_on:
             self.context._log_enabled = False
@@ -149,7 +145,16 @@ class TdtPipeline:
             if not os.path.exists(dst):
                 shutil.copytree(self.ct_input, dst)
         else:
-            shutil.copy2(self.ct_input, dst)
+            if not os.path.exists(dst):
+                shutil.copy2(self.ct_input, dst)
+
+        self.ct_saved_copy_path = dst
+        self.ct_input_identity = ensure_ct_matches_saved_copy(
+            current_input_path=self.ct_input,
+            saved_copy_path=dst,
+            output_folder_path=self.output_folder_path,
+            input_type=self.ct_input_type,
+        )
 
     def _log_setup(self) -> logging.Logger:
         """
@@ -209,6 +214,7 @@ class TdtPipeline:
         output_folder_title = f"{self.config['output_folder_title']}_CT_{self.ct_index}"
         self.output_folder_path = os.path.join(self.current_dir_path, output_folder_title)
         os.makedirs(self.output_folder_path, exist_ok=True)
+        self.metadata_dir_path = str(ensure_metadata_dir(self.output_folder_path))
 
         if os.path.isfile(self.ct_input):
             ct_lower = self.ct_input.lower()
@@ -232,14 +238,9 @@ class TdtPipeline:
 
         self._save_ct_scan_copy()
 
-        # Enable synthetic lesions only if the flag is set AND lesion specs are defined in config.
+        # Run synthetic lesions automatically when specs are defined in config.
         lesion_specs = self.config["phase_1"]["synthetic_lesions_stage"].get("specs")
-        self.run_synthetic_lesions = bool(self.synthetic_lesions and lesion_specs)
-        if self.synthetic_lesions and not lesion_specs:
-            self.synthetic_lesions_disabled_reason = (
-                "Synthetic lesions stage is disabled because "
-                "'phase_1.synthetic_lesions_stage.specs' is None or empty."
-            )
+        self.run_synthetic_lesions = bool(lesion_specs)
 
         # Create phase subdirs
         phases = ["phase_1", "phase_2", "phase_3"]                                     
@@ -268,8 +269,11 @@ class TdtPipeline:
         context.mode = self.mode
         context.ct_input_path = self.ct_input
         context.ct_input_type = self.ct_input_type
+        context.ct_input_identity = copy.deepcopy(self.ct_input_identity)
+        context.ct_saved_copy_path = self.ct_saved_copy_path
         context.ct_index = self.ct_index
         context.output_folder_path = self.output_folder_path
+        context.metadata_dir = self.metadata_dir_path
         context.synthetic_lesions_enabled = self.run_synthetic_lesions
         context.run_spect = self.run_spect           
         context.run_dosimetry = self.run_dosimetry   
@@ -599,8 +603,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ct_index_start",
         type=int,
-        default=0,
-        help="Starting CT index for output folder naming (e.g. 1 → _CT_1, _CT_2, …). Default: 0.",
+        default=1,
+        help="Starting CT index for output folder naming (e.g. 1 → _CT_1, _CT_2, …). Default: 1.",
     )
     parser.add_argument(
         "--save_config",
@@ -609,13 +613,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Copy the config JSON into each CT output folder. Default: disabled.",
     )
     parser.add_argument(
-        "--synthetic_lesions",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Run synthetic lesion generation. Requires specs in config. Default: disabled.",
-    )
-    parser.add_argument( 
-        "--spect", 
+        "--spect",
         action=argparse.BooleanOptionalAction, 
         default=False, 
         help="Run SIMIND SPECT projection simulation in Phase 2. Default: disabled.", 
@@ -671,7 +669,7 @@ def _print_startup_banner(
 
     # Phases to run
     phase1_tasks = ["segmentation", "PBPK"]
-    if args.synthetic_lesions:
+    if cfg.get("phase_1", {}).get("synthetic_lesions_stage", {}).get("specs"):
         phase1_tasks.append("synthetic lesions")
     add("  Phases to run:")
     add(f"    ✓  Phase 1  —  {', '.join(phase1_tasks)}")
@@ -707,7 +705,7 @@ def _print_startup_banner(
         note2 = f"num_cpu={nc2} → using all {avail}" if nc2 == 0 else f"num_cpu={nc2}"
         add(f"  OpenGATE      : {eff_nc2} thread(s)  ({note2})")
     add()
-    add("  Existing stage outputs are skipped automatically on rerun.")
+    add("  Existing stage outputs are reused only when CT/config metadata still match.")
     add()
     add("─" * (w + 2))
     add()
@@ -763,7 +761,6 @@ def main() -> int:
             run_spect=args.spect,
             run_dosimetry=args.dosimetry,
             run_postprocess=args.postprocess,
-            synthetic_lesions=args.synthetic_lesions,
         )
     except ValueError as _ve:
         print(f"\n[ERROR] {_ve}\n")
@@ -786,7 +783,6 @@ def main() -> int:
                 logging_on=args.logging_on,
                 save_config=args.save_config,
                 mode=args.mode,
-                synthetic_lesions=args.synthetic_lesions,
                 run_spect=args.spect,
                 run_dosimetry=args.dosimetry,
                 run_postprocess=args.postprocess,
@@ -807,4 +803,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-# quick run: python main.py --config_file inputs/config.json --input_ct_dir inputs/ct_testing --mode DEBUG --logging_on --save_config --synthetic_lesions --spect --dosimetry --postprocess 
+# quick run: python main.py --config_file inputs/my_config.json --input_ct_dir inputs/ct_testing --mode DEBUG --logging_on --save_config --spect --dosimetry --postprocess

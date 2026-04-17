@@ -56,6 +56,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pycno
 
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_pbpk_rerun_snapshot,
+    stage_metadata_path,
+    write_json,
+)
 from src.utils.tac_utils import roi_to_voi
 from src.utils.dicom_utils import extract_height_weight
 
@@ -80,7 +87,14 @@ class PbpkTacStage:
     """
 
     def __init__(self, context: Any) -> None:
-        context.require("subdir_paths", "config", "ct_input_path", "downstream_roi_subset")
+        context.require(
+            "subdir_paths",
+            "config",
+            "ct_input_path",
+            "downstream_roi_subset",
+            "output_folder_path",
+            "ct_input_identity",
+        )
         self.context = context
         self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"
 
@@ -93,9 +107,10 @@ class PbpkTacStage:
         os.makedirs(self.output_dir, exist_ok=True)
         self.work_dir: str = os.path.join(self.output_dir, "work_dir")
         os.makedirs(self.work_dir, exist_ok=True)
-        self.metadata_path: str = os.path.join(self.work_dir, "pbpk_tac_metadata.json")
+        self.metadata_path: str = stage_metadata_path(context.output_folder_path, "pbpk_tac_stage")
 
         self.ct_input_path: str = context.ct_input_path
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
         self.prefix: str = self.stage_cfg.get("file_prefix", self.stage_cfg.get("name", "pbpk"))
         self.model_type: str = self.stage_cfg.get("model_type", "PSMA")
@@ -123,6 +138,13 @@ class PbpkTacStage:
 
         self.tac_json_path: str = os.path.join(self.output_dir, f"{self.prefix}_tacs.json")
         self.tac_npz_path: str = os.path.join(self.output_dir, f"{self.prefix}_tacs.npz")
+
+    def _rerun_config_snapshot(self) -> Dict[str, Any]:
+        """Return the PBPK settings that must match for cached TACs to remain valid."""
+        return build_pbpk_rerun_snapshot(
+            self.context.config,
+            synthetic_enabled=bool(getattr(self.context, "synthetic_lesions_enabled", False)),
+        )
 
     # ------------------------------------------------------------------
     # helpers
@@ -316,7 +338,11 @@ class PbpkTacStage:
         tac_data: Dict[str, Dict[str, Any]],
     ) -> None:
         """Save PBPK TAC stage metadata for debugging / provenance."""
-        metadata: Dict[str, Any] = {
+        outputs: Dict[str, Any] = {
+            "tac_json_path": self.tac_json_path,
+            "tac_npz_path": self.tac_npz_path,
+        }
+        extra: Dict[str, Any] = {
             "stage": "pbpk_tac_stage",
             "phase_output_dir": self.phase_output_dir,
             "output_dir": self.output_dir,
@@ -337,8 +363,15 @@ class PbpkTacStage:
             "tac_npz_path": self.tac_npz_path,
             "downstream_roi_subset": list(self.downstream_roi_subset),
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
+        metadata = build_stage_metadata(
+            stage_name="pbpk_tac_stage",
+            config_snapshot=self._rerun_config_snapshot(),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints={},
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
     # ------------------------------------------------------------------
     # main
@@ -351,6 +384,15 @@ class PbpkTacStage:
         -------
         context : Context-like
         """
+        assert_stage_rerun_safe(
+            stage_name="pbpk_tac_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=[self.tac_json_path, self.tac_npz_path],
+            current_config_snapshot=self._rerun_config_snapshot(),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints={},
+        )
+
         if os.path.exists(self.tac_json_path) and os.path.exists(self.tac_npz_path):
             if self.debug:
                 print("[PbpkTacStage] TAC outputs already exist, loading from disk.")

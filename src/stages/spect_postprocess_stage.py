@@ -48,6 +48,14 @@ import SimpleITK as sitk
 import torch
 import pytomography
 
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_spect_rerun_snapshot,
+    fingerprint_optional_file,
+    stage_metadata_path,
+    write_json,
+)
 from src.utils.nifti_utils import voxel_volume_ml
 
 from pytomography.algorithms import OSEM
@@ -64,6 +72,12 @@ class SpectPostprocessStage:
     """
 
     def __init__(self, context: Any) -> None:
+        context.require(
+            "subdir_paths",
+            "config",
+            "output_folder_path",
+            "ct_input_identity",
+        )
         self.context = context
         self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"             
 
@@ -77,7 +91,8 @@ class SpectPostprocessStage:
         os.makedirs(self.output_dir, exist_ok=True)
         self.work_dir: str = os.path.join(self.output_dir, "work_dir")
         os.makedirs(self.work_dir, exist_ok=True)
-        self.metadata_path: str = os.path.join(self.work_dir, "spect_postprocess_metadata.json") 
+        self.metadata_path: str = stage_metadata_path(context.output_folder_path, "spect_postprocess_stage")
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
         self.prefix: str = self.stage_cfg.get("file_prefix", "spect_postprocess")      
         self.mode: str = context.mode
@@ -129,6 +144,30 @@ class SpectPostprocessStage:
             self.simind_output_pixel_width_cm,
             self.simind_output_slice_width_cm,
         )
+
+    def _rerun_config_snapshot(self) -> Dict[str, Any]:
+        """Return the SPECT post-processing settings that must match for reruns."""
+        return build_spect_rerun_snapshot(self.context.config)
+
+    def _current_dependency_fingerprints(self) -> Dict[str, Any]:
+        """Return fingerprints for the upstream artifacts that feed this stage."""
+        return {
+            "simind_stage_metadata": fingerprint_optional_file(self.context.simind_metadata_path),
+            "pbpk_tac_json": fingerprint_optional_file(self.context.pbpk_tac_json_path),
+            "pbpk_tac_npz": fingerprint_optional_file(self.context.pbpk_tac_npz_path),
+        }
+
+    def _cache_marker_paths(self) -> List[str]:
+        """Return representative output files whose presence means rerun metadata must match."""
+        markers: List[str] = []
+        for window_paths in self._build_pbpk_projection_paths().values():
+            markers.extend(window_paths.values())
+        if self.apply_reconstruction:
+            for frame in self.frame_start:
+                frame_label = f"{float(frame)/60.0:.6f}".rstrip("0").rstrip(".")
+                markers.append(os.path.join(self.phase_output_dir, f"reconstructed_SPECT_{frame_label}.nii.gz"))
+            markers.append(os.path.join(self.output_dir, "recon_atn_img.nii.gz"))
+        return markers
 
     # ------------------------------------------------------------------
     # helpers — projection I/O
@@ -306,7 +345,11 @@ class SpectPostprocessStage:
         recon_paths: Dict[str, str],
     ) -> None:
         """Save post-processing stage metadata for debugging / provenance."""
-        metadata: Dict[str, Any] = {
+        outputs: Dict[str, Any] = {
+            "pbpk_projection_paths": pbpk_projection_paths,
+            "reconstructed_spect_paths": recon_paths,
+        }
+        extra: Dict[str, Any] = {
             "stage": "spect_postprocess_stage",                                        
             "phase_output_dir": self.phase_output_dir,
             "output_dir": self.output_dir,
@@ -326,8 +369,15 @@ class SpectPostprocessStage:
             "header_dir": self.header_dir,                                             
             "calibration_file": self.calibration_file,                                 
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
+        metadata = build_stage_metadata(
+            stage_name="spect_postprocess_stage",
+            config_snapshot=self._rerun_config_snapshot(),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints=self._current_dependency_fingerprints(),
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
     # ------------------------------------------------------------------
     # main
@@ -349,6 +399,15 @@ class SpectPostprocessStage:
             "pbpk_tac_values",                                                         
             "mask_roi_body",                                                           
             "roi_body_seg_arr",                                                        
+        )
+
+        assert_stage_rerun_safe(
+            stage_name="spect_postprocess_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=self._cache_marker_paths(),
+            current_config_snapshot=self._rerun_config_snapshot(),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints=self._current_dependency_fingerprints(),
         )
 
         # Remove "background" label if present (not a real ROI).  

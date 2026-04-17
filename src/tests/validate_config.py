@@ -13,7 +13,7 @@ Checks performed
 - ``roi_subset`` (seg.)     — non-empty list of strings
 - ``pbpk_tac_stage.isotope``— string; must be in pipeline_options.json allowed list
 - ``pbpk_tac_stage.VOIs``   — non-empty list
-- Synthetic-lesion specs   — validated when ``--synthetic_lesions`` is set
+- Synthetic-lesion specs   — validated when ``phase_1.synthetic_lesions_stage.specs`` is set
 - ``SIMINDDirectory``       — read from ``pipeline_paths.json`` input_paths; path must exist (``--spect`` only)
 - SIMIND ``roi_subset``     — subset of segmentation ``roi_subset``
 - SIMIND ``Collimator``     — string; must be in allowed list
@@ -99,7 +99,6 @@ def validate_config(
     run_spect: bool = False,
     run_dosimetry: bool = False,
     run_postprocess: bool = False,
-    synthetic_lesions: bool = False,
     repo_root: str | None = None,
 ) -> None:
     """
@@ -118,8 +117,6 @@ def validate_config(
         True when ``--dosimetry`` was passed; enables OpenGATE checks.
     run_postprocess : bool
         True when ``--postprocess`` was passed; enables Phase-3 checks.
-    synthetic_lesions : bool
-        True when ``--synthetic_lesions`` was passed; validates lesion params.
     repo_root : str or None
         Absolute path to the repository root used to locate
         ``src/data/pipeline_options.json``.  Defaults to the grandparent
@@ -378,9 +375,9 @@ def validate_config(
             "PyCNO VOI name strings"
         )
 
-    # Synthetic lesions stage (only validated when the flag is active)
-    if synthetic_lesions:
-        sl = p1.get("synthetic_lesions_stage", {})
+    # Synthetic lesions stage — validated whenever specs are present in config
+    sl = p1.get("synthetic_lesions_stage", {})
+    if sl.get("specs"):
         for int_field in (
             "default_seed", "auto_max_shrink_iters", "max_lesion_placement_attempts"
         ):

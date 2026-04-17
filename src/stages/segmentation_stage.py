@@ -39,6 +39,14 @@ from torch.cuda.amp import GradScaler as _GradScaler
 from totalsegmentator.python_api import totalsegmentator
 from json_minify import json_minify
 
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_segmentation_rerun_snapshot,
+    fingerprint_optional_file,
+    stage_metadata_path,
+    write_json,
+)
 from src.utils.nifti_utils import load_int_seg
 
 # ---------------------------------------------------------------------------
@@ -104,11 +112,12 @@ class SegmentationStage:
     """
 
     def __init__(self, context: Any) -> None:
-        context.require("ct_input_path", "config", "subdir_paths")
+        context.require("ct_input_path", "config", "subdir_paths", "output_folder_path", "ct_input_identity")
         self.context = context
         self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"             
 
         self.ct_input_path: str = context.ct_input_path
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
         self.roi_subset: Union[str, Sequence[str]] = context.config["phase_1"]["segmentation_stage"]["roi_subset"]
         self.ml: bool = True  # always use multilabel output
 
@@ -125,12 +134,12 @@ class SegmentationStage:
         self.body_ml_path: Optional[str] = None
         self.head_glands_cavities_ml_path: Optional[str] = None
         self.total_ml_path: Optional[str] = None
-        self.metadata_path: str = os.path.join(self.work_dir, f"{self.prefix}_metadata.json")
+        self.metadata_path: str = stage_metadata_path(context.output_folder_path, "segmentation_stage")
 
         # Phase handoff: overwritten by every run so downstream stages always have a clean path. 
         self.final_output_path: str = os.path.join(self.phase_output_dir, "digital_twin.nii.gz") 
         self.stage_output_path: str = os.path.join(self.output_dir, f"{self.unification_prefix}.nii.gz") 
-        self.unification_metadata_path: str = os.path.join(self.work_dir, f"{self.unification_prefix}_metadata.json") 
+        self.unification_metadata_path: str = os.path.join(self.output_dir, f"{self.unification_prefix}_metadata.json") 
 
         # Load label map for ROI unification 
         self.ts_map_path: str = context.config["phase_1"]["segmentation_stage"]["label_map_path"] 
@@ -150,6 +159,16 @@ class SegmentationStage:
         self.tdt_name2id: Dict[str, int] = { 
             name: int(lab) for lab, name in ts_map_json["TDT_Pipeline"].items() 
         } 
+
+    def _rerun_config_snapshot(self, plan: TotSegPlan) -> Dict[str, Any]:
+        """Return the config subset that must match for cached outputs to remain valid."""
+        return build_segmentation_rerun_snapshot(self.context.config)
+
+    def _current_upstream_fingerprints(self) -> Dict[str, Any]:
+        """Return fingerprints for small upstream inputs that affect segmentation outputs."""
+        return {
+            "label_map_json": fingerprint_optional_file(self.ts_map_path),
+        }
 
     # ------------------------------------------------------------------
     # helpers — segmentation
@@ -387,12 +406,21 @@ class SegmentationStage:
             "final_output_path": self.final_output_path,                               
             "plan": dict(plan),                                                        
         }                                                                              
-        with open(self.unification_metadata_path, "w", encoding="utf-8") as f:         
-            json.dump(unification_metadata, f, indent=4)                               
+        with open(self.unification_metadata_path, "w", encoding="utf-8") as f:
+            json.dump(unification_metadata, f, indent=4)
 
     def _save_stage_metadata(self, plan: TotSegPlan) -> None:
         """Save stage-specific metadata for debugging / provenance."""
-        metadata: Dict[str, Any] = {
+        outputs: Dict[str, Any] = {
+            "body_ml_path": self.body_ml_path,
+            "total_ml_path": self.total_ml_path if plan["run_total"] else None,
+            "head_glands_cavities_ml_path": (
+                self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None
+            ),
+            "stage_output_path": self.stage_output_path,
+            "final_output_path": self.final_output_path,
+        }
+        extra: Dict[str, Any] = {
             "stage": "segmentation_stage",
             "ct_input_path": self.ct_input_path,
             "ct_nii_path": self.ct_nii_path,
@@ -410,8 +438,15 @@ class SegmentationStage:
             "final_output_path": self.final_output_path,                               
             "stage_output_path": self.stage_output_path,                               
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
+        metadata = build_stage_metadata(
+            stage_name="segmentation_stage",
+            config_snapshot=self._rerun_config_snapshot(plan),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints=self._current_upstream_fingerprints(),
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
     # ------------------------------------------------------------------
     # main
@@ -431,6 +466,21 @@ class SegmentationStage:
 
         plan = self._pre_totalsegmentation_checks()
         body_ml_done, head_glands_cavities_ml_done, total_ml_done = self._files_exist()
+
+        assert_stage_rerun_safe(
+            stage_name="segmentation_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=[
+                self.body_ml_path,
+                self.total_ml_path if plan["run_total"] else None,
+                self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None,
+                self.stage_output_path,
+                self.final_output_path,
+            ],
+            current_config_snapshot=self._rerun_config_snapshot(plan),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints=self._current_upstream_fingerprints(),
+        )
 
         if plan["run_body"] and not body_ml_done:
             print("Running TotalSegmentator for task: BODY...")

@@ -49,6 +49,25 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.io.config_paths import inject_pipeline_paths, load_pipeline_paths, strip_developer_fields
+from src.io.rerun_guard import (
+    STAGE_LABELS,
+    build_ct_identity,
+    build_dosemap_rerun_snapshot,
+    build_opengate_rerun_snapshot,
+    build_pbpk_rerun_snapshot,
+    build_segmentation_rerun_snapshot,
+    build_spect_rerun_snapshot,
+    build_synthetic_lesions_rerun_snapshot,
+    build_simind_rerun_snapshot,
+    compare_stage_rerun_state,
+    ct_input_metadata_path,
+    fingerprint_optional_file,
+    fingerprint_path,
+    fingerprints_equal,
+    load_json,
+    stage_metadata_path,
+    synthetic_lesions_enabled,
+)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).parent.parent.resolve()
@@ -383,7 +402,8 @@ async def create_output_dirs(req: CreateDirsRequest) -> Dict:
 
     Returns `existed`: a per-patient flag indicating whether the directory
     already contained pipeline outputs (subdirectories) before this call.
-    The frontend uses this to warn the user that completed stages will be skipped.
+    The frontend uses this to warn the user that prior outputs exist and will be
+    reused only if the CT and effective stage config still match the saved metadata.
     """
     name = req.project_name.strip()
     if not name:
@@ -505,8 +525,11 @@ async def check_completion(output_dir: str) -> Dict:
     return {
         # Phase 1 segmentation: unified label map written
         "phase1_segmentation": _any_file("digital_twin/segmentation_stage/unified_labels*.nii*"),
-        # Phase 1 synthetic lesions stage output
-        "phase1_synthetic_lesions": _any_file("digital_twin/synthetic_lesions_stage/*.nii*"),
+        # Phase 1 synthetic lesions: global outputs now live in the stage dir (not work_dir)
+        "phase1_synthetic_lesions": (
+            _any_file("digital_twin/synthetic_lesions_stage/*_all_lesions_binary.nii*")
+            or _any_file("pipeline_metadata/synthetic_lesions_stage.json")
+        ),
         # Phase 1 PBPK TAC
         "phase1_pbpk": _any_file("digital_twin/pbpk_tac_stage/*.json"),
         # Phase 2 SIMIND simulation outputs
@@ -526,6 +549,413 @@ async def check_completion(output_dir: str) -> Dict:
             _any_file("post_processing/*_total_dose.nii*")
             or _any_file("post_processing/dosemap_postprocess/**/*.nii*")
         ),
+    }
+
+
+def _resolve_patient_ct_path(output_dir: Path, patient: Dict[str, Any]) -> Path:
+    """Resolve the live CT path for a patient, falling back to the saved copy on rerun."""
+    ct_path = Path(str(patient.get("path", "")))
+    if ct_path.exists():
+        return ct_path
+    candidate = output_dir / ct_path.name
+    if candidate.exists():
+        return candidate
+    raise FileNotFoundError(
+        f"CT source for '{patient.get('name', 'unknown')}' not found at '{patient.get('path')}' "
+        f"and no saved copy exists in '{output_dir}'."
+    )
+
+
+def _load_effective_patient_config(
+    output_dir: Path,
+    user_config: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return the effective full config for one patient with developer fields injected."""
+    if user_config is not None:
+        return inject_pipeline_paths(user_config, repo_root=REPO_ROOT, include_input_paths=True)
+
+    cfg_path = output_dir / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"No config.json found in {output_dir}")
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    return inject_pipeline_paths(cfg, repo_root=REPO_ROOT, include_input_paths=True)
+
+
+def _format_rerun_stage_message(stage_name: str, reasons: List[str], metadata_path: Path) -> str:
+    """Format a user-facing rerun-validation message for one stage."""
+    label = STAGE_LABELS.get(stage_name, stage_name)
+    lines = [f"{label}: existing outputs are not safe to reuse."]
+    lines.extend(f"- {reason}" for reason in reasons)
+    lines.append(f"Delete the old stage outputs for this patient (and '{metadata_path}') and rerun.")
+    return "\n".join(lines)
+
+
+def _compare_ct_provenance(output_dir: Path, ct_path: Path) -> tuple[Dict[str, Any], List[str]]:
+    """Return the current CT identity plus any provenance mismatches for this output folder."""
+    current_fp = fingerprint_path(ct_path)
+    saved_copy_path = output_dir / ct_path.name
+    reasons: List[str] = []
+
+    if saved_copy_path.exists():
+        saved_fp = fingerprint_path(saved_copy_path)
+        if not fingerprints_equal(current_fp, saved_fp):
+            reasons.append("the selected CT does not match the CT copy already saved in this output folder")
+
+    meta_path = Path(ct_input_metadata_path(output_dir))
+    if meta_path.exists():
+        try:
+            meta = load_json(meta_path)
+            stored_fp = meta.get("ct_identity", {}).get("fingerprint")
+            if stored_fp and not fingerprints_equal(stored_fp, current_fp):
+                reasons.append("the selected CT does not match the recorded CT provenance for this output folder")
+        except Exception as exc:
+            reasons.append(f"the CT provenance metadata could not be read: {exc}")
+
+    ct_identity = build_ct_identity(
+        current_input_path=str(ct_path),
+        saved_copy_path=str(saved_copy_path),
+        fingerprint=current_fp,
+        input_type="dicom" if ct_path.is_dir() else "nii",
+    )
+    return ct_identity, reasons
+
+
+def _validate_stage_rerun_state(
+    *,
+    stage_name: str,
+    output_dir: Path,
+    has_outputs: bool,
+    config_snapshot: Dict[str, Any],
+    ct_identity: Dict[str, Any],
+    dependency_fingerprints: Dict[str, Any],
+) -> Optional[str]:
+    """Return a user-facing conflict message when a stage cache is unsafe to reuse."""
+    if not has_outputs:
+        return None
+
+    metadata_path = Path(stage_metadata_path(output_dir, stage_name))
+    if not metadata_path.exists():
+        return _format_rerun_stage_message(
+            stage_name,
+            ["cached outputs exist but the persistent stage metadata file is missing"],
+            metadata_path,
+        )
+
+    try:
+        reasons = compare_stage_rerun_state(
+            stage_name=stage_name,
+            metadata_path=metadata_path,
+            current_config_snapshot=config_snapshot,
+            current_ct_identity=ct_identity,
+            current_upstream_fingerprints=dependency_fingerprints,
+        )
+    except Exception as exc:
+        reasons = [f"the stage metadata could not be validated: {exc}"]
+
+    if reasons:
+        return _format_rerun_stage_message(stage_name, reasons, metadata_path)
+    return None
+
+
+def _validate_patient_rerun(
+    *,
+    patient: Dict[str, Any],
+    output_dir: Path,
+    config_full: Dict[str, Any],
+    flags: Dict[str, bool],
+    ct_path: Path,
+) -> List[Dict[str, str]]:
+    """Return rerun conflicts for one patient/output directory."""
+    conflicts: List[Dict[str, str]] = []
+    ct_identity, ct_reasons = _compare_ct_provenance(output_dir, ct_path)
+    if ct_reasons:
+        conflicts.append(
+            {
+                "stage": "ct_input",
+                "message": "\n".join(["CT provenance mismatch:"] + [f"- {r}" for r in ct_reasons]),
+            }
+        )
+
+    synthetic_enabled = synthetic_lesions_enabled(config_full)
+
+    phase1_dir = output_dir / config_full["phase_1"]["sub_dir_name"]
+    phase2_dir = output_dir / config_full["phase_2"]["sub_dir_name"]
+    phase3_dir = output_dir / config_full["phase_3"]["sub_dir_name"]
+
+    seg_cfg = config_full["phase_1"]["segmentation_stage"]
+    seg_prefix = seg_cfg["file_prefix"]
+    seg_stage_dir = phase1_dir / "segmentation_stage"
+    expected_tdt_handoff = (
+        phase1_dir / "digital_twin.nii.gz"
+        if synthetic_enabled
+        else seg_stage_dir / f"{seg_cfg['unification_prefix']}.nii.gz"
+    )
+    seg_markers = [
+        seg_stage_dir / f"{seg_prefix}_body_ml.nii.gz",
+        seg_stage_dir / f"{seg_prefix}_total_ml.nii.gz",
+        seg_stage_dir / f"{seg_prefix}_head_glands_cavities_ml.nii.gz",
+        seg_stage_dir / f"{seg_cfg['unification_prefix']}.nii.gz",
+        phase1_dir / "digital_twin.nii.gz",
+    ]
+    seg_message = _validate_stage_rerun_state(
+        stage_name="segmentation_stage",
+        output_dir=output_dir,
+        has_outputs=any(p.exists() for p in seg_markers),
+        config_snapshot=build_segmentation_rerun_snapshot(config_full),
+        ct_identity=ct_identity,
+        dependency_fingerprints={
+            "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
+        },
+    )
+    if seg_message:
+        conflicts.append({"stage": "segmentation_stage", "message": seg_message})
+
+    syn_cfg = config_full["phase_1"]["synthetic_lesions_stage"]
+    syn_prefix = syn_cfg["file_prefix"]
+    syn_stage_dir = phase1_dir / "synthetic_lesions_stage" / "work_dir"
+    syn_markers = [
+        syn_stage_dir / f"{syn_prefix}_pre_lesions.nii.gz",
+        syn_stage_dir / f"{syn_prefix}_all_lesions_binary.nii.gz",
+        syn_stage_dir / f"{syn_prefix}_all_lesions_labels.nii.gz",
+    ]
+    if synthetic_enabled:
+        syn_message = _validate_stage_rerun_state(
+            stage_name="synthetic_lesions_stage",
+            output_dir=output_dir,
+            has_outputs=any(p.exists() for p in syn_markers),
+            config_snapshot=build_synthetic_lesions_rerun_snapshot(config_full),
+            ct_identity=ct_identity,
+            dependency_fingerprints={
+                "segmentation_stage_metadata": fingerprint_optional_file(
+                    stage_metadata_path(output_dir, "segmentation_stage")
+                ),
+                "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
+                "lesioned_seg_handoff": fingerprint_optional_file(phase1_dir / "digital_twin.nii.gz"),
+            },
+        )
+        if syn_message:
+            conflicts.append({"stage": "synthetic_lesions_stage", "message": syn_message})
+
+    pbpk_cfg = config_full["phase_1"]["pbpk_tac_stage"]
+    pbpk_stage_dir = phase1_dir / pbpk_cfg.get("sub_dir_name", "pbpk_tac_stage")
+    pbpk_markers = [
+        pbpk_stage_dir / f"{pbpk_cfg['file_prefix']}_tacs.json",
+        pbpk_stage_dir / f"{pbpk_cfg['file_prefix']}_tacs.npz",
+    ]
+    pbpk_message = _validate_stage_rerun_state(
+        stage_name="pbpk_tac_stage",
+        output_dir=output_dir,
+        has_outputs=any(p.exists() for p in pbpk_markers),
+        config_snapshot=build_pbpk_rerun_snapshot(config_full, synthetic_enabled=synthetic_enabled),
+        ct_identity=ct_identity,
+        dependency_fingerprints={},
+    )
+    if pbpk_message:
+        conflicts.append({"stage": "pbpk_tac_stage", "message": pbpk_message})
+
+    if flags.get("spect", False):
+        simind_cfg = config_full["phase_2"]["simind_stage"]
+        simind_prefix = simind_cfg["file_prefix"]
+        simind_stage_dir = phase2_dir / simind_cfg.get("sub_dir_name", "simind_simulation")
+        simind_pre = simind_stage_dir / "preprocess"
+        simind_work = simind_stage_dir / "work_dir"
+        simind_snapshot = build_simind_rerun_snapshot(config_full, synthetic_enabled=synthetic_enabled)
+        simind_markers = [
+            simind_pre / f"{simind_prefix}_preprocess_meta.json",
+            simind_pre / f"{simind_prefix}_atn_av.bin",
+            simind_pre / f"{simind_prefix}_body_seg.bin",
+            simind_pre / f"{simind_prefix}_roi_body_seg.bin",
+            phase2_dir / "calib.res",
+            phase2_dir / f"{simind_prefix}_tot_w1.a00",
+            phase2_dir / f"{simind_prefix}_tot_w2.a00",
+            phase2_dir / f"{simind_prefix}_tot_w3.a00",
+        ]
+        for roi_name in ["remaining_body", *simind_snapshot["resolved_roi_subset"]]:
+            simind_markers.extend(
+                [
+                    simind_work / f"{simind_prefix}_{roi_name}_tot_w1.a00",
+                    simind_work / f"{simind_prefix}_{roi_name}_tot_w2.a00",
+                    simind_work / f"{simind_prefix}_{roi_name}_tot_w3.a00",
+                ]
+            )
+        simind_deps = {
+            "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
+            "tdt_roi_seg": fingerprint_optional_file(expected_tdt_handoff),
+            "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
+            "segmentation_stage_metadata": fingerprint_optional_file(
+                stage_metadata_path(output_dir, "segmentation_stage")
+            ),
+        }
+        if synthetic_enabled:
+            simind_deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
+                stage_metadata_path(output_dir, "synthetic_lesions_stage")
+            )
+        simind_message = _validate_stage_rerun_state(
+            stage_name="simind_simulation_stage",
+            output_dir=output_dir,
+            has_outputs=any(p.exists() for p in simind_markers),
+            config_snapshot=simind_snapshot,
+            ct_identity=ct_identity,
+            dependency_fingerprints=simind_deps,
+        )
+        if simind_message:
+            conflicts.append({"stage": "simind_simulation_stage", "message": simind_message})
+
+    if flags.get("dosimetry", False):
+        og_cfg = config_full["phase_2"]["opengate_stage"]
+        og_prefix = og_cfg["file_prefix"]
+        og_stage_dir = phase2_dir / og_cfg.get("sub_dir_name", "opengate_simulation")
+        og_work = og_stage_dir / "work_dir"
+        og_snapshot = build_opengate_rerun_snapshot(config_full, synthetic_enabled=synthetic_enabled)
+        og_markers: List[Path] = [
+            og_stage_dir / f"{og_prefix}_dose_sum.nii.gz",
+            og_work / f"{og_prefix}_material_labels.nii.gz",
+        ]
+        for roi_name in og_snapshot["resolved_roi_subset"]:
+            og_markers.append(og_work / f"{og_prefix}_dose_{roi_name}.nii.gz")
+            og_markers.append(og_work / f"{og_prefix}_unc_{roi_name}.nii.gz")
+        og_deps = {
+            "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
+            "tdt_roi_seg": fingerprint_optional_file(expected_tdt_handoff),
+            "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
+            "segmentation_stage_metadata": fingerprint_optional_file(
+                stage_metadata_path(output_dir, "segmentation_stage")
+            ),
+        }
+        if synthetic_enabled:
+            og_deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
+                stage_metadata_path(output_dir, "synthetic_lesions_stage")
+            )
+        og_message = _validate_stage_rerun_state(
+            stage_name="opengate_simulation_stage",
+            output_dir=output_dir,
+            has_outputs=any(p.exists() for p in og_markers),
+            config_snapshot=og_snapshot,
+            ct_identity=ct_identity,
+            dependency_fingerprints=og_deps,
+        )
+        if og_message:
+            conflicts.append({"stage": "opengate_simulation_stage", "message": og_message})
+
+    if flags.get("spect", False) and flags.get("postprocess", False):
+        spect_cfg = config_full["phase_3"]["spect_postprocess_stage"]
+        spect_prefix = spect_cfg["file_prefix"]
+        spect_stage_dir = phase3_dir / spect_cfg.get("sub_dir_name", "spect_postprocess")
+        spect_markers: List[Path] = []
+        for frame in spect_cfg.get("FrameStartTimes", []) or []:
+            frame_label = f"{float(frame)/60.0:.6f}".rstrip("0").rstrip(".")
+            spect_markers.extend(
+                [
+                    spect_stage_dir / f"{spect_prefix}_{frame_label}_tot_w1.nii.gz",
+                    spect_stage_dir / f"{spect_prefix}_{frame_label}_tot_w2.nii.gz",
+                    spect_stage_dir / f"{spect_prefix}_{frame_label}_tot_w3.nii.gz",
+                    phase3_dir / f"reconstructed_SPECT_{frame_label}.nii.gz",
+                ]
+            )
+        spect_markers.append(spect_stage_dir / "recon_atn_img.nii.gz")
+        spect_message = _validate_stage_rerun_state(
+            stage_name="spect_postprocess_stage",
+            output_dir=output_dir,
+            has_outputs=any(p.exists() for p in spect_markers),
+            config_snapshot=build_spect_rerun_snapshot(config_full),
+            ct_identity=ct_identity,
+            dependency_fingerprints={
+                "simind_stage_metadata": fingerprint_optional_file(
+                    stage_metadata_path(output_dir, "simind_simulation_stage")
+                ),
+                "pbpk_tac_json": fingerprint_optional_file(pbpk_markers[0]),
+                "pbpk_tac_npz": fingerprint_optional_file(pbpk_markers[1]),
+            },
+        )
+        if spect_message:
+            conflicts.append({"stage": "spect_postprocess_stage", "message": spect_message})
+
+    if flags.get("dosimetry", False) and flags.get("postprocess", False):
+        dose_cfg = config_full["phase_3"]["dosemap_postprocess_stage"]
+        dose_markers = [
+            phase3_dir / f"{dose_cfg['file_prefix']}_total_dose.nii.gz",
+        ]
+        dose_message = _validate_stage_rerun_state(
+            stage_name="dosemap_postprocess_stage",
+            output_dir=output_dir,
+            has_outputs=any(p.exists() for p in dose_markers),
+            config_snapshot=build_dosemap_rerun_snapshot(config_full),
+            ct_identity=ct_identity,
+            dependency_fingerprints={
+                "opengate_stage_metadata": fingerprint_optional_file(
+                    stage_metadata_path(output_dir, "opengate_simulation_stage")
+                ),
+                "pbpk_tac_json": fingerprint_optional_file(pbpk_markers[0]),
+                "pbpk_tac_npz": fingerprint_optional_file(pbpk_markers[1]),
+            },
+        )
+        if dose_message:
+            conflicts.append({"stage": "dosemap_postprocess_stage", "message": dose_message})
+
+    return conflicts
+
+
+def _validate_reruns_for_request(
+    *,
+    patients: List[Dict[str, Any]],
+    project_dirs: Dict[str, str],
+    flags: Dict[str, bool],
+    patient_configs: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, List[Dict[str, str]]]:
+    """Validate rerun compatibility for every patient in a request payload."""
+    conflicts_by_patient: Dict[str, List[Dict[str, str]]] = {}
+    patient_configs = patient_configs or {}
+
+    for patient in patients:
+        patient_name = patient["name"]
+        output_dir = Path(project_dirs.get(patient_name, ""))
+        if not output_dir.is_dir():
+            conflicts_by_patient[patient_name] = [
+                {
+                    "stage": "setup",
+                    "message": f"Output directory not found: {output_dir}",
+                }
+            ]
+            continue
+
+        try:
+            ct_path = _resolve_patient_ct_path(output_dir, patient)
+            config_full = _load_effective_patient_config(output_dir, patient_configs.get(patient_name))
+            conflicts = _validate_patient_rerun(
+                patient=patient,
+                output_dir=output_dir,
+                config_full=config_full,
+                flags=flags,
+                ct_path=ct_path,
+            )
+        except Exception as exc:
+            conflicts = [{"stage": "setup", "message": str(exc)}]
+
+        if conflicts:
+            conflicts_by_patient[patient_name] = conflicts
+
+    return conflicts_by_patient
+
+
+class ValidateRerunRequest(BaseModel):
+    patients: List[Dict[str, Any]]
+    project_dirs: Dict[str, str]
+    flags: Dict[str, bool]
+    patient_configs: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+@app.post("/api/validate-rerun")
+async def validate_rerun(req: ValidateRerunRequest) -> Dict:
+    """Check whether existing patient outputs can be safely reused on rerun."""
+    conflicts_by_patient = _validate_reruns_for_request(
+        patients=req.patients,
+        project_dirs=req.project_dirs,
+        flags=req.flags,
+        patient_configs=req.patient_configs,
+    )
+    return {
+        "ok": not conflicts_by_patient,
+        "conflicts_by_patient": conflicts_by_patient,
     }
 
 
@@ -870,6 +1300,7 @@ class RunRequest(BaseModel):
     patients: List[Dict[str, Any]]        # [{name, type, path}] — original CT paths
     project_dirs: Dict[str, str]           # {patient_name: output_dir_path}
     flags: Dict[str, bool]
+    patient_configs: Optional[Dict[str, Dict[str, Any]]] = None
     mode: str = "PRODUCTION"
 
 
@@ -897,6 +1328,23 @@ async def start_run(req: RunRequest) -> Dict:
     """
     if not req.patients:
         raise HTTPException(400, "No patients provided.")
+
+    conflicts_by_patient = _validate_reruns_for_request(
+        patients=req.patients,
+        project_dirs=req.project_dirs,
+        flags=req.flags,
+        patient_configs=req.patient_configs,
+    )
+    if conflicts_by_patient:
+        summary_lines: List[str] = []
+        for patient_name, conflicts in conflicts_by_patient.items():
+            summary_lines.append(f"{patient_name}:")
+            summary_lines.extend(f"  - {c['message'].splitlines()[0]}" for c in conflicts)
+        raise HTTPException(
+            400,
+            "Rerun validation failed. Delete the conflicting old outputs before running again.\n"
+            + "\n".join(summary_lines),
+        )
 
     _prune_finished_runs()
     run_id = str(uuid.uuid4())[:8]
@@ -962,7 +1410,6 @@ async def _execute_run(run_id: str) -> None:
         "spect": "--spect",
         "dosimetry": "--dosimetry",
         "postprocess": "--postprocess",
-        "synthetic_lesions": "--synthetic_lesions",
         "logging_on": "--logging_on",
         "save_config": "--save_config",
     }

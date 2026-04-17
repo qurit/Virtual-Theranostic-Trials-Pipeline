@@ -32,8 +32,11 @@ class Context:
         self.mode: Optional[str] = None                        # "DEBUG" or "PRODUCTION"
         self.ct_input_path: Optional[str] = None               # Raw CT input (NIfTI or DICOM directory)
         self.ct_input_type: Optional[str] = None               # "nii" or "dicom"
+        self.ct_input_identity: Optional[Dict[str, Any]] = None # Fingerprinted CT provenance for rerun safety
+        self.ct_saved_copy_path: Optional[str] = None          # Saved CT copy inside the patient output folder
         self.ct_index: Optional[int] = None                    # Batch index used in output naming
         self.output_folder_path: Optional[str] = None          # Root output folder for this CT
+        self.metadata_dir: Optional[str] = None                # Persistent metadata dir (survives work_dir cleanup)
         self.subdir_paths: Optional[Dict[str, str]] = None     # {phase_key: absolute path}
         self.subdir_names: Optional[Dict[str, str]] = None     # {phase_key: directory name}
         self.synthetic_lesions_enabled: Optional[bool] = None  # Whether the synthetic lesions stage will run

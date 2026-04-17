@@ -51,20 +51,18 @@ const STAGE_LABELS = {
   num_cpu:'CPU Cores / Threads',
 };
 const CLI_FLAGS = [
-  {key:'spect',          label:'SPECT Simulation',  desc:'Run SIMIND Monte Carlo SPECT projection simulation (Phase 2)'},
-  {key:'dosimetry',      label:'Dosimetry',          desc:'Run OpenGATE Monte Carlo absorbed-dose simulation (Phase 2)'},
-  {key:'postprocess',    label:'Post-Processing',    desc:'Apply TAC weighting, Poisson noise, OSEM reconstruction (Phase 3)'},
-  {key:'synthetic_lesions',label:'Synthetic Lesions',desc:'Insert synthetic tumour lesions before simulation (Phase 1)'},
-  {key:'logging_on',     label:'Logging',            desc:"Write a detailed pipeline log file to each patient's output directory"},
+  {key:'spect',      label:'SPECT Simulation', desc:'Run SIMIND Monte Carlo SPECT projection simulation (Phase 2)'},
+  {key:'dosimetry',  label:'Dosimetry',         desc:'Run OpenGATE Monte Carlo absorbed-dose simulation (Phase 2)'},
+  {key:'postprocess',label:'Post-Processing',   desc:'Apply TAC weighting, Poisson noise, OSEM reconstruction (Phase 3)'},
+  {key:'logging_on', label:'Logging',           desc:"Write a detailed pipeline log file to each patient's output directory"},
 ];
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
 // Maps each stage key to the flag that gates it (stage hidden + cleared when flag is OFF)
 const STAGE_FLAG_MAP = {
-  synthetic_lesions_stage:    'synthetic_lesions',
-  simind_stage:               'spect',
-  opengate_stage:             'dosimetry',
-  spect_postprocess_stage:    'postprocess',
-  dosemap_postprocess_stage:  'postprocess',
+  simind_stage:              'spect',
+  opengate_stage:            'dosimetry',
+  spect_postprocess_stage:   'postprocess',
+  dosemap_postprocess_stage: 'postprocess',
 };
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -1175,8 +1173,6 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
       setPatientConfigs(prev=>{
         const updated={...prev};
         Object.keys(updated).forEach(nm=>{
-          if(key==='synthetic_lesions'&&updated[nm]?.phase_1?.synthetic_lesions_stage)
-            updated[nm]=deepSet(updated[nm],['phase_1','synthetic_lesions_stage','specs'],null);
           if(key==='spect'&&updated[nm]?.phase_2?.simind_stage)
             updated[nm]=deepSet(updated[nm],['phase_2','simind_stage','roi_subset'],[]);
           if(key==='dosimetry'&&updated[nm]?.phase_2?.opengate_stage)
@@ -1260,7 +1256,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
           {Object.values(existedDirs).some(Boolean)&&(
             <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5 mb-4 text-xs text-amber-800">
               <span className="flex-shrink-0 mt-0.5">⚠</span>
-              <span>Prior pipeline outputs detected for one or more patients. Completed stages will be skipped automatically; only stages without existing outputs will re-run.</span>
+              <span>Prior pipeline outputs detected for one or more patients. Existing outputs are only reusable when the CT and effective stage config still match the saved metadata.</span>
             </div>
           )}
           <div className="space-y-2">
@@ -1287,7 +1283,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
                       {hasPrior&&existedDirs[p.name]&&Object.keys(completionStatus[p.name]||{}).some(k=>completionStatus[p.name][k])&&(
                         <div className="flex items-start gap-2 bg-blue-50 border border-blue-200 rounded-xl px-3 py-2 text-xs text-blue-800">
                           <span className="flex-shrink-0 mt-0.5">ℹ</span>
-                          <span>Config auto-filled from previous run. Completed stages will be skipped; only stages without existing outputs will re-run.</span>
+                          <span>Config auto-filled from the previous run. The Run page will compare these settings and the selected CT against the saved stage metadata before allowing a rerun.</span>
                         </div>
                       )}
                       {/* Config-change warnings for completed phases */}
@@ -1297,7 +1293,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
                           <div className="flex-1">
                             <span className="font-semibold">Changed params for already-completed stages: </span>
                             <span>{[...phaseWarnings[p.name]].join(', ')}</span>
-                            <span>. Those stages will be skipped on rerun. Delete the relevant output folders to force them to re-execute.</span>
+                            <span>. The Run page will block any unsafe rerun until the conflicting old outputs are deleted.</span>
                           </div>
                           <button className="flex-shrink-0 text-orange-500 hover:text-orange-700 font-bold leading-none"
                             onClick={()=>setPhaseWarnings(w=>{const nw={...w};delete nw[p.name];return nw;})}>✕</button>
@@ -1377,7 +1373,7 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir}){
         {flags.spect&&<Badge label="SPECT Simulation" color="blue"/>}
         {flags.dosimetry&&<Badge label="Dosimetry" color="purple"/>}
         {flags.postprocess&&<Badge label="Post-Processing" color="teal"/>}
-        {flags.synthetic_lesions&&<Badge label="Synthetic Lesions" color="orange"/>}
+        {synth?.specs&&Object.keys(synth.specs).length>0&&<Badge label="Synthetic Lesions" color="orange"/>}
       </div>
 
       {tac&&(
@@ -1387,9 +1383,9 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir}){
           {kv('ROI subset', tac.roi_subset)}
         </Section>
       )}
-      {flags.synthetic_lesions&&synth&&(
+      {synth?.specs&&Object.keys(synth.specs).length>0&&(
         <Section title="Synthetic Lesions (Phase 1)">
-          {kv('Organ specs', synth.specs?Object.keys(synth.specs).join(', '):'—')}
+          {kv('Organ specs', Object.keys(synth.specs).join(', '))}
         </Section>
       )}
       {flags.spect&&simind&&(
@@ -1423,6 +1419,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
   const [status,setStatus]=useState('idle'); // idle | starting | launched | error
   const [errorMsg,setErrorMsg]=useState('');
   const [validation,setValidation]=useState(null);
+  const [rerunValidation,setRerunValidation]=useState({checking:true,ok:true,conflictsByPatient:{}});
 
   // Pre-run validation
   useEffect(()=>{
@@ -1440,12 +1437,6 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
         if(fst.length!==fd.length) issues.push(`[${p.name}] FrameStartTimes (${fst.length}) ≠ FrameDurations (${fd.length})`);
         fst.forEach((v,i)=>{if(typeof v!=='number'||isNaN(v)) issues.push(`[${p.name}] FrameStartTimes[${i}] must be a number`);});
         fd.forEach((v,i)=>{ if(typeof v!=='number'||isNaN(v)) issues.push(`[${p.name}] FrameDurations[${i}] must be a number`);});
-      }
-      // Synthetic lesions: at least 1 spec required
-      if(flags.synthetic_lesions){
-        const specs=cfg?.phase_1?.synthetic_lesions_stage?.specs;
-        if(!specs||typeof specs!=='object'||Object.keys(specs).length===0)
-          issues.push(`[${p.name}] Synthetic Lesions is ON but no organ specs are configured — add at least one spec in Phase 1`);
       }
       // SPECT: simind must have at least one ROI selected
       if(flags.spect){
@@ -1469,16 +1460,59 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
     setValidation({ok:!issues.length,issues});
   },[patientConfigs,flags,patients,projectName,projectDirs]);
 
+  useEffect(()=>{
+    let cancelled=false;
+    const readyForCheck=patients.length>0&&patients.every(p=>projectDirs[p.name]);
+    if(!readyForCheck){
+      setRerunValidation({checking:false,ok:true,conflictsByPatient:{}});
+      return;
+    }
+    setRerunValidation(prev=>({...prev,checking:true}));
+    apiFetch('/api/validate-rerun',{
+      method:'POST',
+      body:JSON.stringify({patients,project_dirs:projectDirs,flags,patient_configs:patientConfigs}),
+    })
+      .then(async res=>{
+        if(!res.ok){
+          const err=await res.json().catch(()=>({detail:'Rerun validation failed'}));
+          throw new Error(err.detail||'Rerun validation failed');
+        }
+        return res.json();
+      })
+      .then(data=>{
+        if(cancelled) return;
+        setRerunValidation({
+          checking:false,
+          ok:!!data.ok,
+          conflictsByPatient:data.conflicts_by_patient||{},
+        });
+      })
+      .catch(err=>{
+        if(cancelled) return;
+        setRerunValidation({
+          checking:false,
+          ok:false,
+          conflictsByPatient:{_global:[{stage:'setup',message:err.message}]},
+        });
+      });
+    return()=>{cancelled=true;};
+  },[patients,projectDirs,flags,patientConfigs]);
+
   const startRun=async()=>{
     setStatus('starting');setErrorMsg('');
     try{
-      const res=await apiFetch('/api/run',{method:'POST',body:JSON.stringify({project_name:projectName,patients,project_dirs:projectDirs,flags,mode})});
+      const res=await apiFetch('/api/run',{method:'POST',body:JSON.stringify({project_name:projectName,patients,project_dirs:projectDirs,flags,patient_configs:patientConfigs,mode})});
       if(!res.ok){const err=await res.json();setErrorMsg(err.detail||'Unknown server error');setStatus('error');return;}
       setStatus('launched');
     }catch(e){setErrorMsg(e.message);setStatus('error');}
   };
 
-  const canRun=validation?.ok&&status==='idle';
+  const rerunIssues=Object.entries(rerunValidation.conflictsByPatient||{}).flatMap(([patientName,conflicts])=>
+    (conflicts||[]).map(conflict=>`[${patientName}] ${conflict.message}`)
+  );
+  const combinedIssues=[...(validation?.issues||[]),...rerunIssues];
+  const allChecksPassed=(validation?.ok??false)&&!rerunValidation.checking&&rerunValidation.ok&&combinedIssues.length===0;
+  const canRun=allChecksPassed&&status==='idle';
 
   // ── Launched screen ────────────────────────────────────────────────────────
   if(status==='launched'){
@@ -1516,18 +1550,32 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
 
       {/* Validation panel */}
       {validation&&(
-        <div className={`rounded-2xl p-4 mb-6 border ${validation.ok?'bg-emerald-50 border-emerald-200':'bg-red-50 border-red-200'}`}>
-          <p className={`font-semibold mb-2 ${validation.ok?'text-emerald-800':'text-red-700'}`}>
-            {validation.ok?'✓ All checks passed — ready to run':'✗ Fix these issues before running'}
+        <div className={`rounded-2xl p-4 mb-6 border ${
+          rerunValidation.checking?'bg-slate-50 border-slate-200':
+          allChecksPassed?'bg-emerald-50 border-emerald-200':'bg-red-50 border-red-200'
+        }`}>
+          <p className={`font-semibold mb-2 ${
+            rerunValidation.checking?'text-slate-700':
+            allChecksPassed?'text-emerald-800':'text-red-700'
+          }`}>
+            {rerunValidation.checking
+              ?'Checking rerun compatibility…'
+              :allChecksPassed
+                ?'✓ All checks passed — ready to run'
+                :'✗ Fix these issues before running'}
           </p>
-          {validation.ok?(
+          {rerunValidation.checking?(
+            <div className="text-sm text-slate-600 space-y-0.5">
+              <p>· Comparing the selected CT and current config against any existing stage metadata</p>
+            </div>
+          ):allChecksPassed?(
             <div className="text-sm text-emerald-700 space-y-0.5">
               <p>· {patients.length} patient{patients.length!==1?'s':''} queued</p>
               <p>· Mode: <span className="font-semibold">{mode}</span></p>
               <p>· Logging: <span className="font-semibold">{flags.logging_on?'On':'Off'}</span></p>
             </div>
           ):(
-            <ul className="space-y-1">{validation.issues.map((iss,i)=><li key={i} className="text-sm text-red-700">· {iss}</li>)}</ul>
+            <ul className="space-y-1">{combinedIssues.map((iss,i)=><li key={i} className="text-sm text-red-700 whitespace-pre-line">· {iss}</li>)}</ul>
           )}
         </div>
       )}
@@ -1569,7 +1617,7 @@ function App(){
   const [projectDirs,setProjectDirs]=useState({});
   const [patientConfigs,setPatientConfigs]=useState({});
   const [mode,setMode]=useState('PRODUCTION');
-  const [flags,setFlags]=useState({spect:true,dosimetry:true,postprocess:true,synthetic_lesions:false,logging_on:true});
+  const [flags,setFlags]=useState({spect:true,dosimetry:true,postprocess:true,logging_on:true});
   const [systemCpuCount,setSystemCpuCount]=useState(null);
 
   useEffect(()=>{

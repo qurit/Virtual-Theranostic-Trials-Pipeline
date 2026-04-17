@@ -59,6 +59,14 @@ import numpy as np
 from scipy.ndimage import zoom
 from json_minify import json_minify
 
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_simind_rerun_snapshot,
+    fingerprint_optional_file,
+    stage_metadata_path,
+    write_json,
+)
 from src.utils.label_utils import load_tdt_label_map, build_class_map, build_label_masks
 from src.utils.resize_utils import resolve_simulation_grid
 
@@ -464,9 +472,17 @@ class SimindSimulationStage:
 """
 
     def __init__(self, context: Any) -> None:
-        context.require("subdir_paths", "config", "ct_nii_path", "tdt_roi_seg_path")   
+        context.require(
+            "subdir_paths",
+            "config",
+            "ct_nii_path",
+            "tdt_roi_seg_path",
+            "output_folder_path",
+            "ct_input_identity",
+        )
         self.context = context
         self.config: Dict[str, Any] = context.config
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
         # Repository root: one level above this stage file (src/stages/ -> repo root).
         self.repo_root: str = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -492,7 +508,7 @@ class SimindSimulationStage:
         self.header_dir: str = os.path.join(self.stage_output_dir, "headers") 
         os.makedirs(self.header_dir, exist_ok=True) 
 
-        self.metadata_path: str = os.path.join(self.work_dir, "simind_metadata.json")
+        self.metadata_path: str = stage_metadata_path(context.output_folder_path, "simind_simulation_stage")
         self.calibration_path: str = os.path.join(self.output_dir, "calib.res")
 
         self.prefix: str = self.stage_cfg["file_prefix"]
@@ -556,6 +572,43 @@ class SimindSimulationStage:
 
         if not os.path.exists(self.simind_exe):
             raise FileNotFoundError(f"SIMIND executable not found: {self.simind_exe}")
+
+    def _rerun_config_snapshot(self) -> Dict[str, Any]:
+        """Return the SIMIND settings that must match for cached outputs to remain valid."""
+        return build_simind_rerun_snapshot(
+            self.context.config,
+            synthetic_enabled=bool(getattr(self.context, "synthetic_lesions_enabled", False)),
+        )
+
+    def _current_dependency_fingerprints(self) -> Dict[str, Any]:
+        """Return fingerprints for the current stage inputs that affect SIMIND outputs."""
+        deps = {
+            "ct_nii": fingerprint_optional_file(self.context.ct_nii_path),
+            "tdt_roi_seg": fingerprint_optional_file(self.context.tdt_roi_seg_path),
+            "label_map_json": fingerprint_optional_file(self.ts_map_path),
+            "segmentation_stage_metadata": fingerprint_optional_file(
+                stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
+            ),
+        }
+        if getattr(self.context, "synthetic_lesions_enabled", False):
+            deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
+                stage_metadata_path(self.context.output_folder_path, "synthetic_lesions_stage")
+            )
+        return deps
+
+    def _cache_marker_paths(self) -> List[str]:
+        """Return representative cache files whose presence means a rerun guard is needed."""
+        markers = [
+            os.path.join(self.preprocess_dir, f"{self.prefix}_preprocess_meta.json"),
+            os.path.join(self.preprocess_dir, f"{self.prefix}_atn_av.bin"),
+            os.path.join(self.preprocess_dir, f"{self.prefix}_body_seg.bin"),
+            os.path.join(self.preprocess_dir, f"{self.prefix}_roi_body_seg.bin"),
+            self.calibration_path,
+        ]
+        markers.extend(self._get_summed_projection_paths().values())
+        for organ_name in ["remaining_body", *self.simind_roi_subset]:
+            markers.extend(self._get_projection_paths_for_organ(organ_name).values())
+        return markers
 
     # ------------------------------------------------------------------
     # helpers
@@ -868,7 +921,14 @@ class SimindSimulationStage:
         summed_projection_paths: Dict[str, str],                                       
     ) -> None:
         """Save stage-specific metadata for debugging / provenance."""
-        metadata: Dict[str, Any] = {
+        outputs: Dict[str, Any] = {
+            "simind_projection_paths": simind_projection_paths,
+            "summed_projection_paths": summed_projection_paths,
+            "calibration_path": self.calibration_path,
+            "header_dir": self.header_dir,
+            "preprocess_dir": self.preprocess_dir,
+        }
+        extra: Dict[str, Any] = {
             "stage": "simind_simulation_stage",
             "phase_output_dir": self.phase_output_dir,
             "output_dir": self.output_dir,
@@ -905,8 +965,15 @@ class SimindSimulationStage:
             "arr_px_spacing_cm": list(preprocess_results["arr_px_spacing_cm"]),         
             "arr_shape_new": list(preprocess_results["arr_shape_new"]),                 
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
+        metadata = build_stage_metadata(
+            stage_name="simind_simulation_stage",
+            config_snapshot=self._rerun_config_snapshot(),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints=self._current_dependency_fingerprints(),
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
     # ------------------------------------------------------------------
     # main
@@ -921,6 +988,15 @@ class SimindSimulationStage:
         """
         if self.debug:
             print(f"[SimindSimulationStage] Running preprocessing with xyz_dim={self.resize}")
+
+        assert_stage_rerun_safe(
+            stage_name="simind_simulation_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=self._cache_marker_paths(),
+            current_config_snapshot=self._rerun_config_snapshot(),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints=self._current_dependency_fingerprints(),
+        )
 
         preprocessor = _SimindPreprocessor(
             ct_nii_path=self.context.ct_nii_path,

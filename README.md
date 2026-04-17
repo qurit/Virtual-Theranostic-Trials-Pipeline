@@ -77,7 +77,7 @@ echo $SMC_DIR
 
 ## Running the Pipeline
 
-Two interfaces are available — both call the same `main.py` entry point and produce identical outputs.
+Two interfaces are available — both call the same `main.py` entry point and now number patients from `CT_1` upward by default.
 
 | | Web UI | Command Line (CLI) |
 |---|---|---|
@@ -107,7 +107,7 @@ Pass `--port PORT` to change the port, or `--no-browser` to skip auto-open.
 |------|------------|
 | **1-Intro** | Read the pipeline overview and prerequisite checklist, then click **Get Started**. |
 | **2 — CT Input** | Click **Choose CT Folder** to open a native folder picker, or type an absolute path into the text field and click **Scan** (useful on remote/Azure servers where a local desktop picker is unavailable). Patients are detected automatically — DICOM subdirectories and `.nii` / `.nii.gz` files both work. Axial, coronal, and sagittal previews are generated for each CT. |
-| **3 — Configure** | Enter a project name (determines the output folder). Toggle pipeline stages: **SPECT**, **Dosimetry**, **Post-Processing**, **Synthetic Lesions**. Choose **PRODUCTION** or **DEBUG** mode. Expand each patient card to adjust per-patient parameters — every field has a tooltip and changes auto-save. The synthetic lesion editor supports automatic radii, manual per-lesion radii, and fully user-defined centres. If output directories from a previous run are detected, a warning is shown and completed stages are skipped automatically. |
+| **3 — Configure** | Enter a project name (determines the output folder). Toggle pipeline stages: **SPECT**, **Dosimetry**, **Post-Processing**. Choose **PRODUCTION** or **DEBUG** mode. Expand each patient card to adjust per-patient parameters — every field has a tooltip and changes auto-save. Synthetic lesions are configured per-patient by adding organ specs in Phase 1 — the stage runs automatically for any patient whose config includes specs, and is skipped for patients without specs. The synthetic lesion editor supports automatic radii, manual per-lesion radii, and fully user-defined centres. If output directories from a previous run are detected, the UI compares the selected CT and effective stage config against saved rerun metadata before allowing a rerun. |
 | **4 — Run** | Review the per-patient configuration summary, then click **Run Pipeline**. |
 
 #### Web UI dependencies
@@ -138,6 +138,9 @@ cp config_template.json inputs/my_config.json
 - `phase_3.spect_postprocess_stage.FrameStartTimes` and `FrameDurations` — frame timing for SPECT reconstruction.
 - `src/data/pipeline_paths.json` → `input_paths.SIMINDDirectory` — path to your SIMIND install (set once, shared across all runs).
 
+**Synthetic lesions (optional, per-patient)**
+- `phase_1.synthetic_lesions_stage.specs` — add an organ-keyed dict to enable synthetic lesion generation for a patient. The stage runs automatically when specs are present and is skipped when `specs` is absent or `null`. This means different patients in the same batch can have different lesion configurations.
+
 **Common tweaks (runtime / quality)**
 - `phase_2.simind_stage.NumPhotons`, `NumProjections`, `EnergyWindowWidth` — simulation fidelity vs. runtime. `NumProjections` must be ≥ 64; fewer projections causes angular undersampling and streak artifacts in OSEM reconstruction. The constraint `Subsets × Iterations ≤ NumProjections` must also hold.
 - `phase_2.simind_stage.num_cpu` — CPU cores for parallel SIMIND (`0` = use all available).
@@ -167,8 +170,7 @@ Each top-level item is treated as one patient — a DICOM folder or a NIfTI file
 | `--input_ct PATH` | required* | Single CT input — a NIfTI file or a DICOM directory |
 | `--mode {DEBUG,PRODUCTION}` | `PRODUCTION` | Verbosity and intermediate file cleanup |
 | `--logging_on / --no-logging_on` | on | Write per-CT log file |
-| `--ct_index_start N` | `0` | Starting index for output folder naming (e.g. `2` → `_CT_2`, `_CT_3`, …) |
-| `--synthetic_lesions` | off | Run synthetic lesion generation (requires `specs` in config) |
+| `--ct_index_start N` | `1` | Starting index for output folder naming (e.g. `2` → `_CT_2`, `_CT_3`, …) |
 | `--spect` | off | Run SIMIND SPECT projection simulation |
 | `--dosimetry` | off | Run OpenGATE dosimetry simulation |
 | `--postprocess` | off | Run post-processing for whichever simulations ran |
@@ -181,14 +183,14 @@ Each top-level item is treated as one patient — a DICOM folder or a NIfTI file
 **Phase 1 only (digital twin + TACs):**
 ```bash
 python -u main.py \
-  --config_file inputs/config.json \
+  --config_file inputs/my_config.json \
   --input_ct_dir inputs/ct_input
 ```
 
 **Full SPECT pipeline:**
 ```bash
 python -u main.py \
-  --config_file inputs/config.json \
+  --config_file inputs/my_config.json \
   --input_ct_dir inputs/ct_input \
   --spect --postprocess
 ```
@@ -196,20 +198,19 @@ python -u main.py \
 **Full dosimetry pipeline:**
 ```bash
 python -u main.py \
-  --config_file inputs/config.json \
+  --config_file inputs/my_config.json \
   --input_ct_dir inputs/ct_input \
   --dosimetry --postprocess
 ```
 
-**Run everything:**
+**Run everything (synthetic lesions auto-enabled when specs are in config):**
 ```bash
 python -u main.py \
-  --config_file inputs/config.json \
+  --config_file inputs/my_config.json \
   --input_ct_dir inputs/ct_input \
   --mode DEBUG \
   --logging_on \
   --save_config \
-  --synthetic_lesions \
   --spect --dosimetry --postprocess
 ```
 
@@ -222,7 +223,15 @@ Each CT input generates an output folder under `<output_folder_title>_CT_<index>
 ### Example Structure
 
 ```
-test_run_CT_0/
+test_run_CT_1/
+  pipeline_metadata/                         <- persistent rerun metadata (survives work_dir cleanup)
+    ct_input.json                           <- saved CT identity / provenance
+    segmentation_stage.json                 <- stage-level rerun guard + debug metadata
+    pbpk_tac_stage.json
+    simind_simulation_stage.json
+    opengate_simulation_stage.json
+    spect_postprocess_stage.json
+    dosemap_postprocess_stage.json
   digital_twin/                              <- Phase 1
     ct.nii.gz                                <- standardized CT handoff
     digital_twin.nii.gz                      <- unified VTT multilabel segmentation handoff
@@ -249,9 +258,9 @@ test_run_CT_0/
       <prefix>_<t_hr>_tot_w1/w2/w3.nii.gz   <- PBPK-weighted projections per frame
     reconstructed_SPECT_<t_hr>.nii.gz        <- reconstructed SPECT image per frame
     dosemap_postprocess/                     <- (if --dosimetry --postprocess)
-      work_dir/                              <- metadata
+      work_dir/                              <- per-ROI dose contributions / scratch outputs
     <prefix>_total_dose.nii.gz               <- total absorbed dose map (Gy)
-  logging_file_CT_0.log                      <- per-CT pipeline log
+  logging_file_CT_1.log                      <- per-CT pipeline log
 ```
 
 **Notes:**
@@ -260,7 +269,8 @@ test_run_CT_0/
 - All dose maps are saved in native CT resolution. If `xyz_dim` was set for OpenGATE, the simulation runs on the downsampled grid and outputs are resampled back automatically.
 - The total dose map is computed using per-ROI weighting: each ROI's dose-per-decay map is multiplied by that ROI's own cumulated activity (TAC integrated from t=0 over 10x the isotope half-life, capturing >99.9% of all decays), then summed across ROIs. This avoids unphysical cross-terms.
 - PBPK TAC simulation length is derived automatically from the configured isotope half-life (10x multiplier). If any SPECT frame time extends beyond this, the TAC is extended to cover it.
-- In `PRODUCTION` mode, SIMIND `work_dir` is deleted after post-processing to save disk space.
+- In `PRODUCTION` mode, SIMIND `work_dir` is deleted after post-processing to save disk space, but rerun metadata is preserved in `pipeline_metadata/`.
+- Existing outputs are reused only when the saved CT provenance and the relevant stage config still match the persistent metadata. If they do not match, delete the old stage outputs for that patient before rerunning.
 - SIMIND header files are preserved in `headers/` to support reconstruction.
 - PBPK TACs are saved as JSON + npz in Phase 1 and reused by both SPECT and dosimetry post-processing.
 
