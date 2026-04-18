@@ -145,10 +145,8 @@ class OpenGateSimulationStage:
         self.save_material_label_image: bool = bool(self.stage_cfg.get("save_material_label_image", True))
         self.write_mhd_outputs: bool = bool(self.stage_cfg.get("write_mhd_outputs", False))
 
-        # Optional downsampling — supports xyz_dim=[x,y,z] tuple or legacy xy_dim scalar
-        _xyz = self.stage_cfg.get("xyz_dim", None)
-        _xy  = self.stage_cfg.get("xy_dim", None)
-        self.xy_dim = _xyz if _xyz is not None else _xy  # kept as-is (list or int or None)
+        # Target voxel spacing in mm [x, y, z], or null to use native CT spacing
+        self.xyz_spacing_mm = self.stage_cfg.get("xyz_spacing_mm", None)
 
         # OpenGATE execution controls
         gate_cfg = self.stage_cfg.get("gate", {})
@@ -347,14 +345,14 @@ class OpenGateSimulationStage:
 
     def _compute_resampled_geometry(self, img: sitk.Image) -> Optional[Tuple[Tuple[int, ...], Tuple[float, ...]]]:
         """
-        Resolve the xyz_dim parameter to a target grid and new voxel spacings.
+        Resolve the xyz_spacing_mm parameter to a target grid and new voxel spacings.
 
         Returns None when downsampling is disabled or unnecessary.
         """
         sx, sy, sz = img.GetSize()
         spx, spy, spz = img.GetSpacing()
 
-        result = resolve_simulation_grid(self.xy_dim, (sx, sy, sz))
+        result = resolve_simulation_grid(self.xyz_spacing_mm, (sx, sy, sz), (spx, spy, spz))
         if result is None:
             return None
 
@@ -396,6 +394,13 @@ class OpenGateSimulationStage:
         """
         sim_ct_path = Path(self.resample_dir) / "ct_sim.nii.gz"
         sim_seg_path = Path(self.resample_dir) / "seg_sim.nii.gz"
+
+        if self.xyz_spacing_mm is not None:
+            native_sp = ct.GetSpacing()
+            self._log(
+                f"Native CT spacing (x,y,z): ({native_sp[0]:.3f}, {native_sp[1]:.3f}, {native_sp[2]:.3f}) mm  →  "
+                f"target spacing: {tuple(self.xyz_spacing_mm)} mm"
+            )
 
         geometry = self._compute_resampled_geometry(ct)
         was_resampled = False
@@ -726,7 +731,7 @@ class OpenGateSimulationStage:
             "simulated_roi_names": list(roi_names),
             "roi_voxel_counts": {k: int(v) for k, v in roi_counts.items()},
             "downsampling": {
-                "xyz_dim": self.xy_dim,
+                "xyz_spacing_mm": self.xyz_spacing_mm,
                 "was_resampled": was_resampled,
                 "sim_ct_path": sim_ct_path,
                 "sim_seg_path": sim_seg_path,

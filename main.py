@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from src.io.config_paths import inject_pipeline_paths
 from src.io.context import Context
+from src.io.profiler import StageProfiler
 from src.io.rerun_guard import ensure_ct_matches_saved_copy, ensure_metadata_dir
 from src.tests.validate_config import validate_config
 
@@ -76,6 +77,9 @@ class TdtPipeline:
         If True, runs OpenGATE dosimetry simulation in Phase 2.
     run_postprocess : bool, default=False
         If True, runs post-processing in Phase 3 for whichever simulations ran.
+    profile : bool, default=False
+        If True, samples CPU % and RAM every 2 s per stage and writes
+        ``profiling_CT_<ct_index>.json`` into the output folder.
     """
 
     def __init__(
@@ -91,6 +95,7 @@ class TdtPipeline:
         run_postprocess: bool = False,
         launched_via: str = "cli",
         startup_banner_lines: Optional[List[str]] = None,
+        profile: bool = False,
     ) -> None:
         self.config_path: str = config_path
         self.ct_input: str = ct_input
@@ -105,6 +110,7 @@ class TdtPipeline:
         self.run_dosimetry: bool = run_dosimetry
         self.run_postprocess: bool = run_postprocess
         self.startup_banner_lines: List[str] = startup_banner_lines or []
+        self.profile: bool = profile
 
         self.config: Dict[str, Any] = {}
         self.output_folder_path: str = ""
@@ -476,6 +482,7 @@ class TdtPipeline:
         """
         logger = self.logger
         t_pipeline = time.perf_counter()
+        profiler = StageProfiler() if self.profile else None
 
         self._patient_banner()
 
@@ -494,7 +501,9 @@ class TdtPipeline:
         t_stage = time.perf_counter()
         print("Running Segmentation + ROI Unification Stage...")
         logger.info("Stage start: Segmentation + ROI Unification")
+        if profiler: profiler.start_stage("segmentation")
         context = SegmentationStage(context).run()
+        if profiler: profiler.end_stage()
         print("Segmentation + ROI Unification Stage completed.")
         logger.info("Stage end: Segmentation + ROI Unification | elapsed=%.2fs", time.perf_counter() - t_stage)
 
@@ -502,14 +511,18 @@ class TdtPipeline:
             t_stage = time.perf_counter()
             print("Running Synthetic Lesions Generation Stage...")
             logger.info("Stage start: Synthetic Lesions Generation")
+            if profiler: profiler.start_stage("synthetic_lesions")
             context = SyntheticLesionsStage(context).run()
+            if profiler: profiler.end_stage()
             print("Synthetic Lesions Generation Stage completed.")
             logger.info("Stage end: Synthetic Lesions Generation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
         t_stage = time.perf_counter()
         print("Running PBPK TAC Generation Stage...")
         logger.info("Stage start: PBPK TAC Generation")
+        if profiler: profiler.start_stage("pbpk_tac")
         context = PbpkTacStage(context).run()
+        if profiler: profiler.end_stage()
         print("PBPK TAC Generation Stage completed.")
         logger.info("Stage end: PBPK TAC Generation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
@@ -524,7 +537,9 @@ class TdtPipeline:
             t_stage = time.perf_counter()
             print("Running SIMIND Simulation Stage...")
             logger.info("Stage start: SIMIND Simulation")
+            if profiler: profiler.start_stage("simind")
             context = SimindSimulationStage(context).run()
+            if profiler: profiler.end_stage()
             print("SIMIND Simulation Stage completed.")
             logger.info("Stage end: SIMIND Simulation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
@@ -532,7 +547,9 @@ class TdtPipeline:
             t_stage = time.perf_counter()
             print("Running OpenGATE Simulation Stage...")
             logger.info("Stage start: OpenGATE Simulation")
+            if profiler: profiler.start_stage("opengate")
             context = OpenGateSimulationStage(context).run()
+            if profiler: profiler.end_stage()
             print("OpenGATE Simulation Stage completed.")
             logger.info("Stage end: OpenGATE Simulation | elapsed=%.2fs", time.perf_counter() - t_stage)
 
@@ -550,7 +567,9 @@ class TdtPipeline:
             t_stage = time.perf_counter()
             print("Running SPECT Post-Processing Stage...")
             logger.info("Stage start: SPECT Post-Processing")
+            if profiler: profiler.start_stage("spect_postprocess")
             context = SpectPostprocessStage(context).run()
+            if profiler: profiler.end_stage()
             print("SPECT Post-Processing Stage completed.")
             logger.info("Stage end: SPECT Post-Processing | elapsed=%.2fs", time.perf_counter() - t_stage)
 
@@ -558,7 +577,9 @@ class TdtPipeline:
             t_stage = time.perf_counter()
             print("Running Dosimetry Post-Processing Stage...")
             logger.info("Stage start: Dosimetry Post-Processing")
+            if profiler: profiler.start_stage("dosemap_postprocess")
             context = DosemapPostprocessStage(context).run()
+            if profiler: profiler.end_stage()
             print("Dosimetry Post-Processing Stage completed.")
             logger.info("Stage end: Dosimetry Post-Processing | elapsed=%.2fs", time.perf_counter() - t_stage)
 
@@ -568,7 +589,16 @@ class TdtPipeline:
             if simind_work and os.path.exists(simind_work):
                 self._cleanup_work_dir(simind_work)
 
-        logger.info("Pipeline end | total_elapsed=%.2fs", time.perf_counter() - t_pipeline)
+        pipeline_elapsed = time.perf_counter() - t_pipeline
+        logger.info("Pipeline end | total_elapsed=%.2fs", pipeline_elapsed)
+
+        if profiler:
+            profile_path = os.path.join(
+                self.output_folder_path, f"profiling_CT_{self.ct_index}.json"
+            )
+            profiler.save(profile_path, pipeline_elapsed, self.config)
+            print(f"Profiling data saved to: {profile_path}")
+
         print("VTT pipeline completed successfully.")
         return context
 
@@ -635,6 +665,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="cli",
         choices=["cli", "web_ui"],
         help="How the pipeline was invoked — recorded in the log file. Default: cli.",
+    )
+    parser.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Sample CPU %% and RAM every 2 s per stage and write "
+            "profiling_CT_<index>.json into each CT output folder. "
+            "Requires psutil. Default: disabled."
+        ),
     )
 
     return parser
@@ -788,6 +828,7 @@ def main() -> int:
                 run_postprocess=args.postprocess,
                 launched_via=args.launched_via,
                 startup_banner_lines=_banner_lines,
+                profile=args.profile,
             )
             pipeline.run()
         except Exception:

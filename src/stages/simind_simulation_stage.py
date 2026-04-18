@@ -24,7 +24,7 @@ Simulation:
 Expected Context interface
 --------------------------
 Incoming `context` is expected to provide:
-- context.config["phase_2"]["simind_stage"] : dict (including roi_subset, xyz_dim)
+- context.config["phase_2"]["simind_stage"] : dict (including roi_subset, xyz_spacing_mm)
 - context.config["phase_1"]["segmentation_stage"]["label_map_path"] : str
 - context.subdir_paths["phase_2"] : str
 - context.mode : str  ("DEBUG" or "PRODUCTION")
@@ -112,16 +112,16 @@ class _SimindPreprocessor:
         roi_subset: Sequence[str],
         output_dir: str,
         prefix: str,
-        resize: Optional[int],
+        xyz_spacing_mm: Optional[list],
         debug: bool = False,
     ) -> None:
-        self.ct_nii_path = ct_nii_path                                                 
-        self.tdt_roi_seg_path = tdt_roi_seg_path                                       
-        self.tdt_name2id = tdt_name2id                                                 
-        self.roi_subset = roi_subset                                                   
-        self.output_dir = output_dir                                                   
-        self.prefix = prefix                                                           
-        self.resize = resize                                                           
+        self.ct_nii_path = ct_nii_path
+        self.tdt_roi_seg_path = tdt_roi_seg_path
+        self.tdt_name2id = tdt_name2id
+        self.roi_subset = roi_subset
+        self.output_dir = output_dir
+        self.prefix = prefix
+        self.xyz_spacing_mm = xyz_spacing_mm
         self.debug = debug                                                             
     @staticmethod
     def _hu_to_mu(
@@ -226,22 +226,21 @@ class _SimindPreprocessor:
     @staticmethod
     def _to_simind_grid(
         nii_obj: nib.Nifti1Image,
-        resize: Optional[int] = None,
+        xyz_spacing_mm: Optional[list] = None,
         transpose_tuple: Tuple[int, int, int] = (2, 1, 0),
         zoom_order: int = 0,
     ) -> Tuple[np.ndarray, float, float, float]:
         """
-        Convert a NIfTI object to SIMIND grid format with optional resizing.
+        Convert a NIfTI object to SIMIND grid format with optional resampling.
 
         Convention: transpose to (z, y, x), then flip y.
 
         Parameters
         ----------
         nii_obj : nib.Nifti1Image
-        resize : Optional[int | list[int]]
-            Passed directly to :func:`~src.utils.resize_utils.resolve_simulation_grid`.
-            ``[x, y, z]`` for per-axis targets; ``int`` for legacy isotropic scalar;
-            ``None`` for no resizing.
+        xyz_spacing_mm : list[float] | None
+            Target voxel spacing in mm as ``[sx, sy, sz]``.  Each value must be
+            >= the native CT spacing on that axis.  ``None`` = no resampling.
         transpose_tuple : tuple[int,int,int]
         zoom_order : int  0 = nearest (seg), 1 = linear (CT)
 
@@ -254,7 +253,8 @@ class _SimindPreprocessor:
 
         # arr is (sz, sy, sx); present as (sx, sy, sz) for resolve_simulation_grid
         sz, sy, sx = arr.shape
-        result = resolve_simulation_grid(resize, (sx, sy, sz))
+        zooms_nii_mm = np.array(nii_obj.header.get_zooms()[:3], dtype=float)  # (x, y, z)
+        result = resolve_simulation_grid(xyz_spacing_mm, (sx, sy, sz), tuple(zooms_nii_mm))
 
         scale_x = scale_y = scale_z = 1.0
         if result is not None:
@@ -395,10 +395,17 @@ class _SimindPreprocessor:
         ct_nii = nib.load(self.ct_nii_path)
         roi_nii = nib.load(self.tdt_roi_seg_path)
 
-        # Convert to SIMIND grid (z, y, x) with optional resize.
+        # Convert to SIMIND grid (z, y, x) with optional resampling.
         # CT uses linear interpolation; seg uses nearest-neighbour.
-        ct_arr, scale_x, scale_y, scale_z = self._to_simind_grid(ct_nii, resize=self.resize, zoom_order=1)
-        roi_arr_full, _, _, _ = self._to_simind_grid(roi_nii, resize=self.resize, zoom_order=0)
+        native_zooms_mm = tuple(float(v) for v in ct_nii.header.get_zooms()[:3])  # (x, y, z)
+        if self.xyz_spacing_mm is not None:
+            print(
+                f"[SimindPreprocessor] Native CT spacing (x,y,z): "
+                f"({native_zooms_mm[0]:.3f}, {native_zooms_mm[1]:.3f}, {native_zooms_mm[2]:.3f}) mm  →  "
+                f"target spacing: {tuple(self.xyz_spacing_mm)} mm"
+            )
+        ct_arr, scale_x, scale_y, scale_z = self._to_simind_grid(ct_nii, xyz_spacing_mm=self.xyz_spacing_mm, zoom_order=1)
+        roi_arr_full, _, _, _ = self._to_simind_grid(roi_nii, xyz_spacing_mm=self.xyz_spacing_mm, zoom_order=0)
         roi_arr_full = roi_arr_full.astype(np.int16)
 
         body_label = self.tdt_name2id.get("remaining_body")
@@ -529,9 +536,8 @@ class SimindSimulationStage:
         self.detector_width: float = self.stage_cfg["DetectorWidth"]
         self.detector_length: float = self.stage_cfg["DetectorLength"]
 
-        # Preprocessing parameters — supports xyz_dim (list/tuple) or legacy xy_dim (int)
-        xyz = self.stage_cfg.get("xyz_dim")
-        self.resize = xyz if xyz is not None else self.stage_cfg.get("xy_dim")
+        # Preprocessing parameters — target voxel spacing in mm [x, y, z], or null for native CT
+        self.xyz_spacing_mm = self.stage_cfg.get("xyz_spacing_mm")
 
         # SIMIND ROI subset (independent from phase_1 roi_subset) 
         simind_roi_subset = self.stage_cfg.get("roi_subset")                           
@@ -952,7 +958,7 @@ class SimindSimulationStage:
             "energy_window_width": self.energy_window_width,
             "num_cpu": self.num_cpu,
             "simind_roi_subset": list(self.simind_roi_subset),                         
-            "xyz_dim": self.resize,
+            "xyz_spacing_mm": self.xyz_spacing_mm,
             "roi_list": roi_list,
             "geometry": geometry,
             "total_num_voxels": total_num_voxels,
@@ -987,7 +993,7 @@ class SimindSimulationStage:
         context : Context-like
         """
         if self.debug:
-            print(f"[SimindSimulationStage] Running preprocessing with xyz_dim={self.resize}")
+            print(f"[SimindSimulationStage] Running preprocessing with xyz_spacing_mm={self.xyz_spacing_mm}")
 
         assert_stage_rerun_safe(
             stage_name="simind_simulation_stage",
@@ -1005,7 +1011,7 @@ class SimindSimulationStage:
             roi_subset=self.simind_roi_subset,
             output_dir=self.preprocess_dir,
             prefix=self.prefix,
-            resize=self.resize,
+            xyz_spacing_mm=self.xyz_spacing_mm,
             debug=self.debug,
         )
         preprocess_results = preprocessor.run()

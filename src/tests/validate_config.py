@@ -19,7 +19,7 @@ Checks performed
 - SIMIND ``Collimator``     — string; must be in allowed list
 - SIMIND ``Isotope``        — string
 - SIMIND numeric fields     — ``NumPhotons``, ``NumProjections``, etc. must be numbers
-- ``xyz_dim``               — null or a list of 3 positive ints
+- ``xyz_spacing_mm``        — null or a list of 3 positive floats (mm)
 - OpenGATE ``roi_subset``   — subset of segmentation ``roi_subset``
 - OpenGATE gate numerics    — ``total_histories``, ``num_cpu`` must be numbers
 - ``FrameStartTimes`` /
@@ -157,22 +157,20 @@ def validate_config(
                 f"got {type(val).__name__}: {val!r}"
             )
 
-    def _check_xyz_dim(xyz: Any, field: str) -> None:
-        """Validate xyz_dim: must be null or a list of 3 positive integers."""
-        if xyz is None:
+    def _check_xyz_spacing_mm(val: Any, field: str) -> None:
+        """Validate xyz_spacing_mm: must be null or a list of 3 positive floats."""
+        if val is None:
             return
-        if not isinstance(xyz, list) or len(xyz) != 3:
+        if not isinstance(val, list) or len(val) != 3:
             _err(
-                f"'{field}' must be null or a list of exactly 3 integers "
-                f"[x, y, z], got: {xyz!r}"
+                f"'{field}' must be null or a list of exactly 3 positive numbers "
+                f"[sx, sy, sz] in mm, got: {val!r}"
             )
             return
-        for i, v in enumerate(xyz):
-            if v is not None and (
-                isinstance(v, bool) or not isinstance(v, int) or v <= 0
-            ):
+        for i, v in enumerate(val):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or float(v) <= 0:
                 _err(
-                    f"'{field}[{i}]' must be a positive integer or null, "
+                    f"'{field}[{i}]' must be a positive number (mm), "
                     f"got {type(v).__name__}: {v!r}"
                 )
 
@@ -398,10 +396,8 @@ def validate_config(
     if run_spect:
         simind = p2.get("simind_stage", {})
 
-        # SIMINDDirectory is no longer in the user config — it is set once in
-        # src/data/pipeline_paths.json under "input_paths.SIMINDDirectory".
-        # Check that source directly; fall back to the config field for any
-        # legacy configs that still carry it.
+        # SIMINDDirectory is set once in src/data/pipeline_paths.json under
+        # "input_paths.SIMINDDirectory"; fall back to the config field if absent.
         simind_dir = (
             get_pipeline_input_paths(repo_root).get("SIMINDDirectory", "")
             or simind.get("SIMINDDirectory", "")
@@ -495,7 +491,7 @@ def validate_config(
                 "NumProjections, and NumProjections must be >= 64."
             )
 
-        _check_xyz_dim(simind.get("xyz_dim"), "phase_2.simind_stage.xyz_dim")
+        _check_xyz_spacing_mm(simind.get("xyz_spacing_mm"), "phase_2.simind_stage.xyz_spacing_mm")
 
     # OpenGATE dosimetry simulation (only when --dosimetry is set)
     if run_dosimetry:
@@ -541,7 +537,7 @@ def validate_config(
                 f"got {og_num_cpu}"
             )
 
-        _check_xyz_dim(og.get("xyz_dim"), "phase_2.opengate_stage.xyz_dim")
+        _check_xyz_spacing_mm(og.get("xyz_spacing_mm"), "phase_2.opengate_stage.xyz_spacing_mm")
 
     # ── Phase 3 ────────────────────────────────────────────────────────────────
 

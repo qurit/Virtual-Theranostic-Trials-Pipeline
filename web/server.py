@@ -199,7 +199,7 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "isotope": "Radionuclide for PBPK and simulation. Currently only 'lu177' (Lutetium-177) is supported",
     "VOIs": "PBPK volumes of interest to model. These are PyCNO observable names. Must cover all segmented ROIs",
     "Randomization_Kidney_SG_Para": "Randomize kidney and salivary-gland PBPK parameters via lognormal sampling — simulates patient-to-patient variability",
-    "xyz_dim": "Target voxel counts [x, y, z] for downsampling the CT and segmentation before simulation. Each axis is scaled independently, preserving the correct physical voxel spacing per axis. Each value must be smaller than the corresponding CT dimension. Null = native CT resolution (no downsampling).",
+    "xyz_spacing_mm": "Target voxel spacing in mm as [sx, sy, sz]. Each value must be >= the native CT spacing on that axis (only coarser grids allowed). The pipeline logs the native CT spacing at runtime. Null = native CT resolution (no downsampling).",
     "Collimator": "SIMIND collimator code (e.g. 'si-me' = Siemens medium-energy parallel-hole). Must match your SIMIND install",
     "Isotope": "Isotope code for SIMIND collimator lookup (e.g. 'lu177')",
     "NumProjections": "Number of SPECT angular projection views. Minimum: 64 — fewer causes angular undersampling and streak artifacts in OSEM reconstruction. Rule: Subsets × Iterations must not exceed NumProjections.",
@@ -1412,6 +1412,7 @@ async def _execute_run(run_id: str) -> None:
         "postprocess": "--postprocess",
         "logging_on": "--logging_on",
         "save_config": "--save_config",
+        "profile": "--profile",
     }
     flag_args: List[str] = []
     for key, cli_flag in flag_map.items():

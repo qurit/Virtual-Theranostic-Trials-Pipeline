@@ -55,6 +55,7 @@ const CLI_FLAGS = [
   {key:'dosimetry',  label:'Dosimetry',         desc:'Run OpenGATE Monte Carlo absorbed-dose simulation (Phase 2)'},
   {key:'postprocess',label:'Post-Processing',   desc:'Apply TAC weighting, Poisson noise, OSEM reconstruction (Phase 3)'},
   {key:'logging_on', label:'Logging',           desc:"Write a detailed pipeline log file to each patient's output directory"},
+  {key:'profile',    label:'Profiling',         desc:'Sample CPU % and RAM every 2 s per stage and save profiling_CT_<index>.json in each patient output folder'},
 ];
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
 // Maps each stage key to the flag that gates it (stage hidden + cleared when flag is OFF)
@@ -1617,7 +1618,7 @@ function App(){
   const [projectDirs,setProjectDirs]=useState({});
   const [patientConfigs,setPatientConfigs]=useState({});
   const [mode,setMode]=useState('PRODUCTION');
-  const [flags,setFlags]=useState({spect:true,dosimetry:true,postprocess:true,logging_on:true});
+  const [flags,setFlags]=useState({spect:true,dosimetry:true,postprocess:true,logging_on:true,profile:false});
   const [systemCpuCount,setSystemCpuCount]=useState(null);
 
   useEffect(()=>{

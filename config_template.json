@@ -106,11 +106,12 @@
       // ROIs to simulate. Must be a subset of segmentation_stage.roi_subset.
       "roi_subset": ["liver", "kidney", "salivary_glands"],
 
-      // Simulation grid: [x, y, z] voxel counts, or null for native CT resolution.
-      // Each axis is scaled independently — x, y, and z each use their own scale factor
-      // so physical voxel spacings are exact per axis. Values must be smaller than the
-      // corresponding CT dimension. Example: [128, 128, 128] for faster simulation.
-      "xyz_dim": null,
+      // Target voxel spacing in mm as [sx, sy, sz], or null to use native CT spacing.
+      // Each value must be >= the corresponding native CT spacing (only coarser grids allowed).
+      // The pipeline logs the native CT spacing at runtime so you know the baseline.
+      // Example: native CT is [0.977, 0.977, 3.0] mm — set [2.0, 2.0, 3.0] to halve in-plane.
+      // The resulting voxel counts are derived automatically from the physical CT extent.
+      "xyz_spacing_mm": null,
 
       // Collimator code. Must match a *.col file in your SIMIND installation.
       "Collimator": "si-me",
@@ -173,10 +174,11 @@
       // Also write outputs as MetaImage (.mhd/.raw) in addition to NIfTI.
       "write_mhd_outputs": false,
 
-      // Simulation grid: [x, y, z] voxel counts, or null for native CT resolution.
-      // Each axis is scaled independently. Dose maps are resampled back to native
-      // CT resolution after simulation. Values must be smaller than the CT dimension.
-      "xyz_dim": null,
+      // Target voxel spacing in mm as [sx, sy, sz], or null to use native CT spacing.
+      // Each value must be >= the corresponding native CT spacing (only coarser grids allowed).
+      // The pipeline logs the native CT spacing at runtime so you know the baseline.
+      // Dose maps are always resampled back to native CT resolution after simulation.
+      "xyz_spacing_mm": null,
 
       // Enable forced-detection variance reduction (valid for Lu-177 when voxel size << photon mean-free path).
       "variance_reduction": true,
