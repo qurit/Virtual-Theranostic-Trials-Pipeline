@@ -255,12 +255,12 @@ test_run_CT_1/
       work_dir/                              <- per-core SIMIND outputs
     <prefix>_tot_w1/w2/w3.a00                <- summed projection totals (all ROIs)
     calib.res                                <- SIMIND calibration (sensitivity)
+    <prefix>_dose_sum.nii.gz                 <- summed dose map (Gy/decay, if --dosimetry)
     opengate_simulation/                     <- (if --dosimetry)
+      <prefix>_dose_<roi>.nii.gz             <- per-ROI dose maps (Gy/decay)
       work_dir/
         source_masks/
         resampled_inputs/
-        <prefix>_dose_<roi>.nii.gz           <- per-ROI dose maps (Gy/decay)
-      <prefix>_dose_sum.nii.gz               <- summed dose map (Gy/decay)
   post_processing/                           <- Phase 3
     spect_postprocess/                       <- (if --spect --postprocess)
       <prefix>_<t_hr>_tot_w1/w2/w3.nii.gz   <- PBPK-weighted projections per frame
@@ -353,7 +353,7 @@ src/
 
 | Notebook | Description |
 |----------|-------------|
-| `paper_analysis.ipynb` | **Multi-patient analysis** — iterates all CT outputs, visualises every pipeline stage, runs a PBPK vs Recon-SPECT TAC comparison study, and plots CPU/RAM profiling data across patients. Set `OUTPUT_ROOT`, `OUTPUT_PREFIX`, `PARAMETER_LABEL`, and `PROFILE_PHASE` at the top. |
+| `paper_analysis.ipynb` | **Multi-patient analysis** — iterates all CT outputs, visualises every pipeline stage, runs a PBPK vs Recon-SPECT TAC comparison study, and plots CPU/RAM profiling data across patients. Set `CT_DIR`, `OUTPUT_TITLE`, `OUTPUT_ROOT`, `PARAM_LABEL`, and `PROFILE_PHASE` at the top. |
 | `scripts/single_patient_script.ipynb` | Detailed single-patient deep-dive. |
 | `scripts/multi_patient_analysis_script.ipynb` | Legacy multi-patient analysis (older pipeline format). |
 | `scripts/synthetic_lesions.ipynb` | Synthetic lesion visualisation. |
