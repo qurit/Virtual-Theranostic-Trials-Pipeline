@@ -63,6 +63,7 @@ from src.io.rerun_guard import (
     build_stage_metadata,
     build_simind_rerun_snapshot,
     fingerprint_optional_file,
+    load_json,
     stage_metadata_path,
     write_json,
 )
@@ -661,6 +662,38 @@ class SimindSimulationStage:
             self.context.simind_metadata_path = self.metadata_path
             self.context.simind_calibration_path = self.calibration_path
             self.context.simind_header_dir = self.header_dir
+            # Restore path dicts and scalars from metadata.
+            meta = load_json(self.metadata_path)
+            self.context.simind_projection_paths = meta.get("simind_projection_paths", {})
+            self.context.simind_summed_projection_paths = meta.get("summed_projection_paths", {})
+            self.context.simind_num_cpu = self.num_cpu
+            self.context.simind_geometry = meta.get("geometry")
+            self.context.simind_total_num_voxels = meta.get("total_num_voxels")
+            self.context.simind_scale_factor = meta.get("scale_factor")
+            self.context.simind_switches_by_organ = meta.get("simind_switches_by_organ")
+            # Re-run the deterministic preprocessor to rebuild in-memory numpy arrays
+            # (body/ROI segmentation arrays and masks) needed by SpectPostprocessStage.
+            preprocessor = _SimindPreprocessor(
+                ct_nii_path=self.context.ct_nii_path,
+                vtt_roi_seg_path=self.context.vtt_roi_seg_path,
+                vtt_name2id=self.vtt_name2id,
+                roi_subset=self.simind_roi_subset,
+                output_dir=self.preprocess_dir,
+                prefix=self.prefix,
+                xyz_spacing_mm=self.xyz_spacing_mm,
+                mu_water=self._mu_water,
+                mu_bone=self._mu_bone,
+                debug=self.debug,
+            )
+            preprocess_results = preprocessor.run()
+            self.context.body_seg_arr = preprocess_results["body_seg_arr"]
+            self.context.roi_body_seg_arr = preprocess_results["roi_body_seg_arr"]
+            self.context.mask_roi_body = preprocess_results["masks"]
+            self.context.class_seg = preprocess_results["class_seg"]
+            self.context.atn_av_path = preprocess_results["atn_av_path"]
+            self.context.binary_roi_act_map_paths = preprocess_results["binary_roi_act_map_paths"]
+            self.context.arr_px_spacing_cm = preprocess_results["arr_px_spacing_cm"]
+            self.context.arr_shape_new = preprocess_results["arr_shape_new"]
             return self.context
 
         preprocessor = _SimindPreprocessor(

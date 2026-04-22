@@ -282,17 +282,6 @@ class SpectPostprocessStage:
         -------
         context : Context-like
         """
-        self.context.require(                                                          
-            "class_seg",
-            "arr_px_spacing_cm",
-            "simind_projection_paths",
-            "simind_header_dir",                                                       
-            "pbpk_tac_time",                                                           
-            "pbpk_tac_values",                                                         
-            "mask_roi_body",                                                           
-            "roi_body_seg_arr",                                                        
-        )
-
         assert_stage_rerun_safe(
             stage_name="spect_postprocess_stage",
             metadata_path=self.metadata_path,
@@ -305,6 +294,17 @@ class SpectPostprocessStage:
         if self.context.stage_skipped:
             self.context.reconstruction_output_dir = self.phase_output_dir
             return self.context
+
+        self.context.require(
+            "class_seg",
+            "arr_px_spacing_cm",
+            "simind_projection_paths",
+            "simind_header_dir",
+            "pbpk_tac_time",
+            "pbpk_tac_values",
+            "mask_roi_body",
+            "roi_body_seg_arr",
+        )
 
         # Remove "background" label if present (not a real ROI).  
         class_seg = {k: v for k, v in self.context.class_seg.items() if k != "background"}

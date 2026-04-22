@@ -74,6 +74,7 @@ from src.io.rerun_guard import (
     build_stage_metadata,
     build_opengate_rerun_snapshot,
     fingerprint_optional_file,
+    load_json,
     stage_metadata_path,
     write_json,
 )
@@ -669,6 +670,13 @@ class OpenGateSimulationStage:
             self.context.dosimetry_stage_output_dir = self.stage_output_dir
             self.context.dosimetry_work_dir = self.work_dir
             self.context.dosimetry_metadata_path = self.metadata_path
+            meta = load_json(self.metadata_path)
+            paths = meta.get("paths", {})
+            self.context.dosimetry_raw_dose_paths = paths.get("doses", {})
+            self.context.dosimetry_raw_uncertainty_paths = paths.get("uncertainties", {})
+            self.context.dosimetry_sum_dose_path = paths.get("sum_dose")
+            self.context.dosimetry_material_label_path = paths.get("material_labels")
+            self.context.dosimetry_mask_paths = paths.get("masks", {})
             return self.context
 
         # Lazy import: opengate is only available on compatible platforms.
