@@ -100,6 +100,7 @@ profiler.save(path, pipeline_elapsed_s, config)
     def start_stage(self, name: str) -> None:
         """Begin sampling for a new stage.  Ends any in-progress stage first."""
         self._stop_sampling()
+        self._proc_cache = {self._root_proc.pid: self._root_proc}
         self._current = {
             "name": name,
             "_start": time.perf_counter(),
@@ -173,18 +174,30 @@ profiler.save(path, pipeline_elapsed_s, config)
         )
 
     def _iter_process_tree(self) -> List[Any]:
-        procs: Dict[int, Any] = {}
+        # Reuse cached Process objects so cpu_percent() history accumulates across
+        # samples. Children() returns new objects each call — always 0.0 on first use.
+        live_pids: Dict[int, Any] = {self._root_proc.pid: self._root_proc}
         try:
-            procs[self._root_proc.pid] = self._root_proc
             for child in self._root_proc.children(recursive=True):
-                procs[child.pid] = child
+                pid = child.pid
+                if pid not in self._proc_cache:
+                    self._proc_cache[pid] = child
+                    try:
+                        child.cpu_percent(interval=None)  # prime — first call always 0
+                    except self._psutil_errors():
+                        pass
+                live_pids[pid] = self._proc_cache[pid]
         except self._psutil_errors():
             pass
-        return list(procs.values())
+        # Drop dead processes from cache
+        for pid in list(self._proc_cache):
+            if pid not in live_pids:
+                del self._proc_cache[pid]
+        return list(live_pids.values())
 
     def _prime_cpu_counters(self) -> None:
         self._psutil.cpu_percent(interval=None)
-        for proc in self._iter_process_tree():
+        for proc in list(self._proc_cache.values()):
             try:
                 proc.cpu_percent(interval=None)
             except self._psutil_errors():
