@@ -5,7 +5,8 @@ Both the SIMIND and OpenGATE stages accept an ``xyz_spacing_mm`` parameter
 that specifies a target voxel spacing (in mm) for downsampling the CT and
 segmentation before simulation.  This module provides the single source of
 truth for resolving that parameter into concrete per-axis target voxel counts
-and scale factors.
+and scale factors.  The pipeline currently requires square in-plane spacing,
+so ``x`` and ``y`` must be set to the same value.
 
 The caller is responsible for applying the resulting scales using its own
 backend (scipy.ndimage.zoom for SIMIND, SimpleITK for OpenGATE).
@@ -28,9 +29,10 @@ def resolve_simulation_grid(
     Parameters
     ----------
     xyz_spacing_mm : list[float] | None
-        Target voxel spacing in mm as ``[sx, sy, sz]`` (x, y, z order).
-        Each value must be >= the corresponding native CT spacing (i.e. only
-        coarser grids are allowed).  ``None`` means no resampling.
+        Target voxel spacing in mm as ``[sxy, sxy, sz]`` (x, y, z order).
+        The x/y values must match. Each value must be >= the corresponding
+        native CT spacing (i.e. only coarser grids are allowed). ``None``
+        means no resampling.
 
     current_size_xyz : (int, int, int)
         Current voxel counts in ``(x, y, z)`` order.
@@ -51,7 +53,8 @@ def resolve_simulation_grid(
     Raises
     ------
     ValueError
-        If any target spacing is finer than the corresponding native spacing.
+        If x/y spacing does not match or any target spacing is finer than the
+        corresponding native spacing.
     """
     if xyz_spacing_mm is None:
         return None
@@ -64,6 +67,11 @@ def resolve_simulation_grid(
     target_spz = float(xyz_spacing_mm[2])
 
     _tol = 1e-6
+    if abs(target_spx - target_spy) > _tol:
+        raise ValueError(
+            f"xyz_spacing_mm requires matching X/Y spacing for square in-plane voxels, "
+            f"got x={target_spx} mm and y={target_spy} mm."
+        )
     if target_spx < spx - _tol:
         raise ValueError(
             f"xyz_spacing_mm[0]={target_spx} mm is finer than native CT x-spacing "

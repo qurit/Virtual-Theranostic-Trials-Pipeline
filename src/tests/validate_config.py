@@ -19,7 +19,7 @@ Checks performed
 - SIMIND ``Collimator``     — string; must be in allowed list
 - SIMIND ``Isotope``        — string
 - SIMIND numeric fields     — ``NumPhotons``, ``NumProjections``, etc. must be numbers
-- ``xyz_spacing_mm``        — null or a list of 3 positive floats (mm)
+- ``xyz_spacing_mm``        — null or a list of 3 positive floats ``[sxy, sxy, sz]`` (mm)
 - OpenGATE ``roi_subset``   — subset of segmentation ``roi_subset``
 - OpenGATE gate numerics    — ``total_histories``, ``num_cpu`` must be numbers
 - ``FrameStartTimes`` /
@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import warnings
 from typing import Any, Dict, List
 
 from json_minify import json_minify
@@ -79,7 +80,6 @@ def _load_allowed_options(repo_root: str) -> Dict[str, List]:
 
         _flatten(raw)
     except Exception:
-        import warnings
         warnings.warn(
             f"Could not read pipeline_options.json at '{opts_path}'. "
             "Enum validation (collimator, isotope, reconstruction algorithm) will be skipped.",
@@ -158,21 +158,34 @@ def validate_config(
             )
 
     def _check_xyz_spacing_mm(val: Any, field: str) -> None:
-        """Validate xyz_spacing_mm: must be null or a list of 3 positive floats."""
+        """Validate xyz_spacing_mm: must be null or a [sxy, sxy, sz] list of positive floats."""
         if val is None:
             return
         if not isinstance(val, list) or len(val) != 3:
             _err(
                 f"'{field}' must be null or a list of exactly 3 positive numbers "
-                f"[sx, sy, sz] in mm, got: {val!r}"
+                f"[sxy, sxy, sz] in mm, got: {val!r}"
             )
             return
         for i, v in enumerate(val):
-            if isinstance(v, bool) or not isinstance(v, (int, float)) or float(v) <= 0:
+            if (
+                isinstance(v, bool)
+                or not isinstance(v, (int, float))
+                or not math.isfinite(float(v))
+                or float(v) <= 0
+            ):
                 _err(
                     f"'{field}[{i}]' must be a positive number (mm), "
                     f"got {type(v).__name__}: {v!r}"
                 )
+        if (
+            all(not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(float(v)) for v in val)
+            and abs(float(val[0]) - float(val[1])) > 1e-6
+        ):
+            _err(
+                f"'{field}' must use the same value for X and Y spacing "
+                f"(square in-plane voxels), got x={float(val[0])!r} mm and y={float(val[1])!r} mm"
+            )
 
     def _is_finite_number(val: Any) -> bool:
         """Return True for finite ints/floats and False for bools or non-numbers."""
@@ -375,6 +388,7 @@ def validate_config(
 
     # Synthetic lesions stage — validated whenever specs are present in config
     sl = p1.get("synthetic_lesions_stage", {})
+    lesion_rois: List[str] = []
     if sl.get("specs"):
         for int_field in (
             "default_seed", "auto_max_shrink_iters", "max_lesion_placement_attempts"
@@ -387,6 +401,7 @@ def validate_config(
             if v is not None:
                 _check_number(v, f"phase_1.synthetic_lesions_stage.{num_field}")
         _check_synthetic_lesion_specs(sl.get("specs"), roi_subset)
+        lesion_rois = [r for r in sl["specs"] if isinstance(r, str)]
 
     # ── Phase 2 ────────────────────────────────────────────────────────────────
 
@@ -425,6 +440,17 @@ def validate_config(
                     f"'phase_1.segmentation_stage.roi_subset': {bad}. "
                     "Add them to segmentation roi_subset or remove them here."
                 )
+            if lesion_rois:
+                picked_lesion = [r for r in simind_rois if r in lesion_rois]
+                missing_lesion = [r for r in lesion_rois if r not in simind_rois]
+                if picked_lesion and missing_lesion:
+                    _err(
+                        f"'phase_2.simind_stage.roi_subset' includes ROIs with synthetic "
+                        f"lesions ({picked_lesion}) but is missing other ROIs that also "
+                        f"have synthetic lesions ({missing_lesion}). Either include all "
+                        f"synthetic-lesion ROIs or none — partial selection leaves those "
+                        "lesions absorbed into remaining_body, corrupting the simulation."
+                    )
 
         collimator = simind.get("Collimator")
         if not isinstance(collimator, str):
@@ -438,10 +464,10 @@ def validate_config(
                 f"not in the allowed list: {_allowed['collimator']}"
             )
 
-        isotope_simind = simind.get("Isotope")
+        isotope_simind = simind.get("isotope")
         if not isinstance(isotope_simind, str):
             _err(
-                "'phase_2.simind_stage.Isotope' must be a string, "
+                "'phase_2.simind_stage.isotope' must be a string, "
                 f"got {type(isotope_simind).__name__}: {isotope_simind!r}"
             )
 
@@ -508,6 +534,17 @@ def validate_config(
                     f"'phase_1.segmentation_stage.roi_subset': {bad}. "
                     "Add them to segmentation roi_subset or remove them here."
                 )
+            if lesion_rois:
+                picked_lesion = [r for r in og_rois if r in lesion_rois]
+                missing_lesion = [r for r in lesion_rois if r not in og_rois]
+                if picked_lesion and missing_lesion:
+                    _err(
+                        f"'phase_2.opengate_stage.roi_subset' includes ROIs with synthetic "
+                        f"lesions ({picked_lesion}) but is missing other ROIs that also "
+                        f"have synthetic lesions ({missing_lesion}). Either include all "
+                        f"synthetic-lesion ROIs or none — partial selection leaves those "
+                        "lesions absorbed into remaining_body, corrupting the simulation."
+                    )
 
         gate = og.get("gate", {})
         for nf in ("total_histories", "num_cpu"):
@@ -615,6 +652,25 @@ def validate_config(
                 "required to convert OpenGATE Gy/decay outputs to absolute dose (Gy). "
                 "There is no other post-processing applied to the dose map."
             )
+
+    # ── Cross-stage isotope consistency ───────────────────────────────────────
+
+    pbpk_iso = pbpk.get("isotope")
+    if isinstance(pbpk_iso, str):
+        if run_spect:
+            simind_iso = p2.get("simind_stage", {}).get("isotope", "")
+            if isinstance(simind_iso, str) and pbpk_iso.lower() != simind_iso.lower():
+                _err(
+                    f"Isotope mismatch: 'phase_1.pbpk_tac_stage.isotope' ({pbpk_iso!r}) must "
+                    f"match 'phase_2.simind_stage.isotope' ({simind_iso!r})"
+                )
+        if run_dosimetry:
+            og_iso = p2.get("opengate_stage", {}).get("source", {}).get("isotope", "lu177")
+            if isinstance(og_iso, str) and pbpk_iso.lower() != og_iso.lower():
+                _err(
+                    f"Isotope mismatch: 'phase_1.pbpk_tac_stage.isotope' ({pbpk_iso!r}) must "
+                    f"match 'phase_2.opengate_stage.source.isotope' ({og_iso!r})"
+                )
 
     # ── Raise with full error summary ──────────────────────────────────────────
 

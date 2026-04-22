@@ -8,6 +8,7 @@ intermediate results without rebuilding state.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, Optional
 
 
@@ -27,6 +28,9 @@ class Context:
 
         # Free-form storage for debugging, provenance, and stage metadata.
         self.extras: Dict[str, Any] = {}
+
+        # Set to True by assert_stage_rerun_safe when a stage is fully skipped.
+        self.stage_skipped: bool = False
 
         # Runtime metadata
         self.mode: Optional[str] = None                        # "DEBUG" or "PRODUCTION"
@@ -54,7 +58,7 @@ class Context:
         self.head_glands_cavities_ml_path: Optional[str] = None       # Head-gland task multilabel mask
         self.total_ml_path: Optional[str] = None                      # Total task multilabel mask
         self.totseg_plan: Optional[Dict[str, Any]] = None             # TotalSegmentator execution plan
-        self.tdt_roi_seg_path: Optional[str] = None                   # Unified label map handoff
+        self.vtt_roi_seg_path: Optional[str] = None                   # Unified label map handoff
 
         # Phase 1.2: Synthetic lesions
         self.synthetic_lesions_outdir: Optional[str] = None
@@ -123,6 +127,57 @@ class Context:
         # Phase 3.2: Dosimetry post-processing
         self.dosemap_postprocess_output_dir: Optional[str] = None
         self.dosemap_postprocess_dose_path: Optional[str] = None
+
+    @classmethod
+    def from_pipeline_run(
+        cls,
+        *,
+        logger: Optional[Any],
+        config: Dict[str, Any],
+        subdir_paths: Dict[str, str],
+        subdir_names: Dict[str, str],
+        mode: str,
+        ct_input_path: str,
+        ct_input_type: str,
+        ct_input_identity: Dict[str, Any],
+        ct_saved_copy_path: str,
+        ct_index: int,
+        output_folder_path: str,
+        metadata_dir: str,
+        synthetic_lesions_enabled: bool,
+        run_spect: bool,
+        run_dosimetry: bool,
+        run_postprocess: bool,
+    ) -> "Context":
+        """Build a fully initialized pipeline context for one CT run."""
+        context = cls(logger=logger)
+
+        context.config = copy.deepcopy(config)
+        context.subdir_paths = copy.deepcopy(subdir_paths)
+        context.subdir_names = copy.deepcopy(subdir_names)
+
+        context.mode = mode
+        context.ct_input_path = ct_input_path
+        context.ct_input_type = ct_input_type
+        context.ct_input_identity = copy.deepcopy(ct_input_identity)
+        context.ct_saved_copy_path = ct_saved_copy_path
+        context.ct_index = ct_index
+        context.output_folder_path = output_folder_path
+        context.metadata_dir = metadata_dir
+        context.synthetic_lesions_enabled = synthetic_lesions_enabled
+        context.run_spect = run_spect
+        context.run_dosimetry = run_dosimetry
+        context.run_postprocess = run_postprocess
+
+        roi_subset = config["phase_1"]["segmentation_stage"]["roi_subset"]
+        if isinstance(roi_subset, str):
+            roi_subset = [roi_subset]
+        normalized_roi_subset = [str(r).strip() for r in roi_subset if str(r).strip()]
+        if "remaining_body" not in normalized_roi_subset:
+            normalized_roi_subset.append("remaining_body")
+        context.downstream_roi_subset = normalized_roi_subset
+
+        return context
 
     def require(self, *names: str) -> None:
         """

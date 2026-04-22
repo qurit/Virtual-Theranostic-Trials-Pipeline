@@ -9,7 +9,9 @@ Two save helpers exist because different stages use different imaging libraries:
 from __future__ import annotations
 
 from typing import Optional, Sequence
+import nibabel as nib
 import numpy as np
+import SimpleITK as sitk
 
 
 # ---------------------------------------------------------------------------
@@ -30,12 +32,11 @@ def zyx_to_xyz(arr_zyx: np.ndarray) -> np.ndarray:
 # Spacing / geometry helpers
 # ---------------------------------------------------------------------------
 
-def get_spacing_zyx_mm(nii: "nib.Nifti1Image") -> np.ndarray:  # type: ignore[name-defined]
+def get_spacing_zyx_mm(nii: nib.Nifti1Image) -> np.ndarray:
     """
     Return voxel spacing in (Z, Y, X) order from a nibabel NIfTI image, in mm.
     NIfTI header zooms are stored in (X, Y, Z) order.
     """
-    import nibabel as nib  # noqa: F401 — kept local so nibabel is optional elsewhere
     spacing_xyz = np.array(nii.header.get_zooms()[:3], dtype=np.float64)
     return np.array([spacing_xyz[2], spacing_xyz[1], spacing_xyz[0]], dtype=np.float64)
 
@@ -54,14 +55,13 @@ def voxel_volume_ml(spacing_cm: Sequence[float]) -> float:
 
 def load_int_seg(path: str) -> np.ndarray:
     """Load a NIfTI segmentation and return it as int16 (sufficient for label IDs)."""
-    import nibabel as nib
     return nib.load(path).get_fdata().astype(np.int16)
 
 
 def save_nifti_nib(
     path: str,
     data_xyz: np.ndarray,
-    ref_nii: "nib.Nifti1Image",  # type: ignore[name-defined]
+    ref_nii: nib.Nifti1Image,
     dtype: "np.dtype",
 ) -> None:
     """
@@ -74,7 +74,6 @@ def save_nifti_nib(
     ref_nii   : nibabel image whose affine and header are copied
     dtype     : output data type (e.g. np.uint8, np.uint16, np.float32)
     """
-    import nibabel as nib
     out = nib.Nifti1Image(data_xyz.astype(dtype, copy=False), ref_nii.affine, ref_nii.header.copy())
     out.set_data_dtype(dtype)
     nib.save(out, path)
@@ -85,7 +84,7 @@ def save_nifti_nib(
 # ---------------------------------------------------------------------------
 
 def save_nii_sitk(
-    ref: "sitk.Image",  # type: ignore[name-defined]
+    ref: sitk.Image,
     arr: np.ndarray,
     path: str,
 ) -> str:
@@ -102,7 +101,6 @@ def save_nii_sitk(
     -------
     str  the output path (for chaining)
     """
-    import SimpleITK as sitk
     img = sitk.GetImageFromArray(np.asarray(arr, dtype=np.float32))
     img.CopyInformation(ref)
     sitk.WriteImage(img, str(path), imageIO="NiftiImageIO")

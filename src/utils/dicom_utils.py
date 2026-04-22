@@ -7,6 +7,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Tuple
 
+try:
+    import pydicom
+except ImportError:
+    pydicom = None  # type: ignore[assignment]
+
 
 def extract_height_weight(dicom_dir: str) -> Tuple[Optional[float], Optional[float]]:
     """
@@ -25,9 +30,7 @@ def extract_height_weight(dicom_dir: str) -> Tuple[Optional[float], Optional[flo
     -------
     (height_m, weight_kg) — either or both may be None if not found or unreadable.
     """
-    try:
-        import pydicom
-    except ImportError:
+    if pydicom is None:
         return None, None
 
     candidates = []

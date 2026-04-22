@@ -16,7 +16,7 @@ _trapezoid = getattr(np, "trapezoid", None) or np.trapz
 # ROI ↔ VOI name mapping
 # ---------------------------------------------------------------------------
 
-# Mapping from TDT segmentation ROI names to PyCNO PSMA model VOI observable names.
+# Mapping from VTT segmentation ROI names to PyCNO PSMA model VOI observable names.
 # Used by PbpkTacStage (to select VOIs to simulate) and by any downstream stage
 # that needs to look up a TAC by VOI name.
 # ROIs not in this map should fall back to "Rest" in the caller.
@@ -34,7 +34,7 @@ _ROI_TO_VOI: dict[str, str] = {
 
 def roi_to_voi(roi_name: str) -> Optional[str]:
     """
-    Map a TDT ROI name to its PyCNO PSMA VOI observable name.
+    Map a VTT ROI name to its PyCNO PSMA VOI observable name.
 
     Returns None if there is no explicit mapping (callers should fall back to "Rest").
     """

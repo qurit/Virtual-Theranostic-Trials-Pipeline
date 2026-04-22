@@ -9,7 +9,7 @@ resulting dose maps are optionally resampled back to the native CT space and sum
 Core responsibilities
 ---------------------
 - Validate required context fields and stage configuration.
-- Load the phase-1 CT and unified TDT ROI segmentation.
+- Load the phase-1 CT and unified VTT ROI segmentation.
 - Optionally downsample the simulation inputs for faster Monte Carlo execution.
 - Convert simulation inputs to OpenGATE's centered identity-direction convention.
 - Build one binary voxel-source mask per requested ROI.
@@ -42,7 +42,7 @@ Incoming `context` is expected to provide:
 - context.subdir_paths["phase_2"] : str
 - context.config["phase_2"]["opengate_stage"] : dict (including roi_subset)
 - context.ct_nii_path : str
-- context.tdt_roi_seg_path : str
+- context.vtt_roi_seg_path : str
 - context.downstream_roi_subset : list[str] | str
 - context.config["phase_1"]["segmentation_stage"]["label_map_path"] : str
 
@@ -68,7 +68,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import SimpleITK as sitk
-from json_minify import json_minify
 
 from src.io.rerun_guard import (
     assert_stage_rerun_safe,
@@ -79,17 +78,15 @@ from src.io.rerun_guard import (
     write_json,
 )
 from src.utils.nifti_utils import save_nii_sitk
-from src.utils.label_utils import load_tdt_label_map
+from src.utils.label_utils import load_vtt_label_map, filter_roi_seg_to_subset, load_isotope_config
+from src.utils.opengate_utils import (
+    cleanup_mhd,
+    find_hu_tables,
+    resample_image,
+    to_centered_identity,
+    upsample_array_to_native,
+)
 from src.utils.resize_utils import resolve_simulation_grid
-
-# opengate is imported lazily inside run() so that importing this module does not
-# crash the process on systems where opengate_core is unavailable (e.g. wrong OS
-# version).  All module-level references below use the global `gate` name which is
-# populated before any method that needs it is called.
-gate = None  # type: ignore[assignment]
-
-_LU177_Z = 71
-_LU177_A = 177
 
 
 class OpenGateSimulationStage:
@@ -99,7 +96,7 @@ class OpenGateSimulationStage:
     Notes
     -----
     - Simulation may run on the native CT grid or on an optional downsampled grid.
-    - Source masks are binary voxel maps derived from the unified TDT segmentation.
+    - Source masks are binary voxel maps derived from the unified VTT segmentation.
     - ROI dose outputs are accumulated into a summed dose map in native CT space.
     - If a per-ROI dose NIfTI already exists on disk the simulation for that ROI is
       skipped, allowing a crashed run to be resumed from where it left off.
@@ -110,7 +107,7 @@ class OpenGateSimulationStage:
             "subdir_paths",
             "config",
             "ct_nii_path",
-            "tdt_roi_seg_path",
+            "vtt_roi_seg_path",
             "downstream_roi_subset",
             "output_folder_path",
             "ct_input_identity",
@@ -161,8 +158,7 @@ class OpenGateSimulationStage:
         if requested_num_cpu < 0:
             raise ValueError("gate.num_cpu must be >= 0 (0 = use all available CPUs)")
         if requested_num_cpu == 0:
-            import os as _os
-            requested_num_cpu = _os.cpu_count() or 1
+            requested_num_cpu = os.cpu_count() or 1
         self.requested_num_threads: int = requested_num_cpu
 
         # OpenGATE source.n is set per thread, so convert requested total histories
@@ -178,12 +174,8 @@ class OpenGateSimulationStage:
                 f"{self.num_threads} threads). Loss: {self.history_rounding_loss} histories."
             )
 
-        # Only Lu-177 is currently supported in this stage.
         source_cfg = self.stage_cfg.get("source", {})
-        raw_isotope = str(source_cfg.get("isotope", "")).lower().strip()
-        if raw_isotope not in ("lu177", "lu-177"):
-            raise ValueError(f"source.isotope must be 'lu177'. Got: '{raw_isotope}'")
-        self.isotope_name: str = "lu177"
+        self.isotope: str = str(source_cfg.get("isotope", "lu177")).lower().strip().replace("-", "")
 
         # Physics / geometry controls
         self.variance_reduction: bool = bool(self.stage_cfg.get("variance_reduction", True))
@@ -195,9 +187,15 @@ class OpenGateSimulationStage:
 
         # Input paths
         self.ct_nii_path: Path = Path(context.ct_nii_path)
-        self.tdt_roi_seg_path: Path = Path(context.tdt_roi_seg_path)
+        self.vtt_roi_seg_path: Path = Path(context.vtt_roi_seg_path)
         self.label_map_path: Path = Path(context.config["phase_1"]["segmentation_stage"]["label_map_path"]) 
-        self.tdt_name2id: Dict[str, int] = load_tdt_label_map(self.label_map_path)
+        self.vtt_name2id: Dict[str, int] = load_vtt_label_map(self.label_map_path)
+
+        _nuclear = load_isotope_config()["nuclear"].get(self.isotope)
+        if _nuclear is None:
+            raise ValueError(f"Isotope '{self.isotope}' not found in isotope_config.json nuclear data.")
+        self._isotope_Z: int = _nuclear["Z"]
+        self._isotope_A: int = _nuclear["A"]
 
         # Build final ROI list from opengate_stage config (independent from phase_1) 
         opengate_roi_subset = self.stage_cfg.get("roi_subset")                         
@@ -218,7 +216,7 @@ class OpenGateSimulationStage:
             )                                                                          
 
         roi_list: List[str] = []
-        if "remaining_body" in self.tdt_name2id:
+        if "remaining_body" in self.vtt_name2id:
             roi_list.append("remaining_body")
         for roi_name in opengate_roi_subset:
             if roi_name not in roi_list:
@@ -242,7 +240,7 @@ class OpenGateSimulationStage:
         """Return fingerprints for the current stage inputs that affect dosimetry outputs."""
         deps = {
             "ct_nii": fingerprint_optional_file(self.ct_nii_path),
-            "tdt_roi_seg": fingerprint_optional_file(self.tdt_roi_seg_path),
+            "vtt_roi_seg": fingerprint_optional_file(self.vtt_roi_seg_path),
             "label_map_json": fingerprint_optional_file(self.label_map_path),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
@@ -255,16 +253,19 @@ class OpenGateSimulationStage:
         return deps
 
     def _cache_marker_paths(self) -> List[str]:
-        """Return representative output files whose presence means rerun metadata must match."""
+        """
+        Return stage-completion outputs that signal a full previous run finished.
+
+        Per-ROI dose NIfTIs are intentionally excluded: they serve as resume markers
+        within a run (the per-ROI skip logic in run()) but must not trigger the rerun
+        guard on partial runs, otherwise changing the config mid-run raises a false
+        conflict instead of allowing a clean restart.
+        """
         markers: List[str] = []
         if self.save_summed_dose_map:
-            markers.append(str(Path(self.output_dir) / f"{self.prefix}_dose_sum.nii.gz"))
+            markers.append(str(Path(self.phase_output_dir) / f"{self.prefix}_dose_sum.nii.gz"))
         if self.save_material_label_image:
             markers.append(str(Path(self.work_dir) / f"{self.prefix}_material_labels.nii.gz"))
-        for roi_name in self.requested_roi_subset:
-            markers.append(str(self._roi_dose_nii_path(roi_name)))
-            if self.save_uncertainty_map:
-                markers.append(str(Path(self.work_dir) / f"{self.prefix}_unc_{roi_name}.nii.gz"))
         return markers
 
     # ------------------------------------------------------------------
@@ -278,104 +279,7 @@ class OpenGateSimulationStage:
 
     def _roi_dose_nii_path(self, roi_name: str) -> Path:
         """Return the expected final NIfTI output path for a given ROI dose map."""
-        return Path(self.work_dir) / f"{self.prefix}_dose_{roi_name}.nii.gz"
-
-
-    @staticmethod
-    def _cleanup_mhd(path: Path) -> None:
-        """Delete an MHD file and its paired raw/zraw payload if they exist."""
-        for candidate in [path, path.with_suffix(".raw"), path.with_suffix(".zraw")]:
-            try:
-                candidate.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    @staticmethod
-    def _find_hu_tables() -> Tuple[Path, Path]:
-        """Locate OpenGATE Schneider HU-to-material conversion tables."""
-        pkg = Path(gate.__file__).resolve().parent
-        for root in [pkg, pkg.parent, *list(pkg.parents[:4])]:
-            for rel in [Path("tests/data"), Path("opengate/tests/data")]:
-                mat_table = root / rel / "Schneider2000MaterialsTable.txt"
-                den_table = root / rel / "Schneider2000DensitiesTable.txt"
-                if mat_table.exists() and den_table.exists():
-                    return mat_table, den_table
-        raise FileNotFoundError("Could not locate OpenGATE Schneider HU tables")
-
-    @staticmethod
-    def _to_centered_identity(img: sitk.Image, is_label: bool = False) -> Tuple[sitk.Image, List[int]]:
-        """
-        Convert an image to OpenGATE's centered identity-direction convention.
-
-        Behavior
-        --------
-        - Axes with negative direction cosines on the diagonal are flipped in numpy space.
-        - Output direction is set to identity.
-        - Output origin is set so the image is centered at the world origin.
-
-        Returns
-        -------
-        (converted_image, flipped_numpy_axes)
-        """
-        size = np.array(img.GetSize(), dtype=np.float64)
-        spacing = np.array(img.GetSpacing(), dtype=np.float64)
-        direction = np.array(img.GetDirection()).reshape(3, 3)
-
-        arr = sitk.GetArrayFromImage(img)
-        if is_label:
-            arr = arr.astype(np.int32)
-
-        flipped_axes: List[int] = []
-        col_to_npy = {0: 2, 1: 1, 2: 0}  # sitk (x,y,z) -> numpy (z,y,x)
-        for col in range(3):
-            if direction[col, col] < 0:
-                np_axis = col_to_npy[col]
-                arr = np.flip(arr, axis=np_axis).copy()
-                flipped_axes.append(np_axis)
-
-        out = sitk.GetImageFromArray(arr)
-        out.SetOrigin((-(size * spacing) / 2.0 + spacing / 2.0).tolist())
-        out.SetSpacing(spacing.tolist())
-        out.SetDirection([1, 0, 0, 0, 1, 0, 0, 0, 1])
-        return out, flipped_axes
-
-    # ------------------------------------------------------------------
-    # image preparation
-    # ------------------------------------------------------------------
-
-    def _compute_resampled_geometry(self, img: sitk.Image) -> Optional[Tuple[Tuple[int, ...], Tuple[float, ...]]]:
-        """
-        Resolve the xyz_spacing_mm parameter to a target grid and new voxel spacings.
-
-        Returns None when downsampling is disabled or unnecessary.
-        """
-        sx, sy, sz = img.GetSize()
-        spx, spy, spz = img.GetSpacing()
-
-        result = resolve_simulation_grid(self.xyz_spacing_mm, (sx, sy, sz), (spx, spy, spz))
-        if result is None:
-            return None
-
-        (nx, ny, nz), (scale_x, scale_y, scale_z) = result
-        return (nx, ny, nz), (spx / scale_x, spy / scale_y, spz / scale_z)
-
-    @staticmethod
-    def _resample(
-        img: sitk.Image,
-        size: Tuple[int, ...],
-        spacing: Tuple[float, ...],
-        is_label: bool = False,
-    ) -> sitk.Image:
-        """Resample an image onto a new grid, using NN for labels and linear for CT."""
-        resampler = sitk.ResampleImageFilter()
-        resampler.SetOutputSpacing(list(spacing))
-        resampler.SetSize(list(size))
-        resampler.SetOutputDirection(img.GetDirection())
-        resampler.SetOutputOrigin(img.GetOrigin())
-        resampler.SetTransform(sitk.Transform())
-        resampler.SetDefaultPixelValue(0)
-        resampler.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
-        return resampler.Execute(img)
+        return Path(self.stage_output_dir) / f"{self.prefix}_dose_{roi_name}.nii.gz"
 
     def _prepare_simulation_images(
         self,
@@ -395,29 +299,30 @@ class OpenGateSimulationStage:
         sim_ct_path = Path(self.resample_dir) / "ct_sim.nii.gz"
         sim_seg_path = Path(self.resample_dir) / "seg_sim.nii.gz"
 
+        was_resampled = False
         if self.xyz_spacing_mm is not None:
             native_sp = ct.GetSpacing()
             self._log(
                 f"Native CT spacing (x,y,z): ({native_sp[0]:.3f}, {native_sp[1]:.3f}, {native_sp[2]:.3f}) mm  →  "
                 f"target spacing: {tuple(self.xyz_spacing_mm)} mm"
             )
-
-        geometry = self._compute_resampled_geometry(ct)
-        was_resampled = False
-        if geometry is not None:
-            new_size, new_spacing = geometry
-            self._log(f"Downsampling to {new_size} (spacing {tuple(round(s, 2) for s in new_spacing)} mm)")
-            ct = self._resample(ct, new_size, new_spacing, is_label=False)
-            seg = self._resample(seg, new_size, new_spacing, is_label=True)
-            was_resampled = True
+            _grid = resolve_simulation_grid(self.xyz_spacing_mm, ct.GetSize(), native_sp)
+            if _grid is not None:
+                (nx, ny, nz), (sx, sy, sz) = _grid
+                new_size = (nx, ny, nz)
+                new_spacing = (native_sp[0] / sx, native_sp[1] / sy, native_sp[2] / sz)
+                self._log(f"Downsampling to {new_size} (spacing {tuple(round(s, 2) for s in new_spacing)} mm)")
+                ct = resample_image(ct, new_size, new_spacing, is_label=False)
+                seg = resample_image(seg, new_size, new_spacing, is_label=True)
+                was_resampled = True
 
         # Preserve the simulation-space geometry before centering so dose can later be
         # resampled or written back into a CT-aligned grid.
         self._original_sim_ct_img = sitk.GetImageFromArray(sitk.GetArrayFromImage(ct))
         self._original_sim_ct_img.CopyInformation(ct)
 
-        ct_centered, self._centering_flipped_axes = self._to_centered_identity(ct)
-        seg_centered, _ = self._to_centered_identity(seg, is_label=True)
+        ct_centered, self._centering_flipped_axes = to_centered_identity(ct)
+        seg_centered, _ = to_centered_identity(seg, is_label=True)
 
         self._log(
             f"Centered CT: origin={tuple(round(o, 1) for o in ct_centered.GetOrigin())}, "
@@ -435,59 +340,9 @@ class OpenGateSimulationStage:
             was_resampled,
         )
 
-    def _upsample_to_native(self, arr: np.ndarray, ref: sitk.Image, native: sitk.Image) -> np.ndarray:
-        """Resample a simulation-space dose/uncertainty array back to the native CT grid."""
-        img = sitk.GetImageFromArray(arr.astype(np.float32))
-        img.CopyInformation(ref)
-
-        resampler = sitk.ResampleImageFilter()
-        resampler.SetReferenceImage(native)
-        resampler.SetInterpolator(sitk.sitkLinear)
-        resampler.SetDefaultPixelValue(0.0)
-        resampler.SetTransform(sitk.Transform())
-        return sitk.GetArrayFromImage(resampler.Execute(img)).astype(np.float32)
-
     # ------------------------------------------------------------------
     # source masks
     # ------------------------------------------------------------------
-
-    def _filter_to_requested_rois(self, seg_arr: np.ndarray) -> np.ndarray:
-        """
-        Zero out labels not in the requested ROI subset, then recompute remaining_body.
-
-        remaining_body is always included and represents:
-            body_outline − union(this_stage_roi_masks)
-
-        Because the unified segmentation's remaining_body label was computed using the
-        phase-1 ROI subset, it may be too narrow when this stage's subset is smaller
-        (e.g. phase-1 had kidney+liver+heart but OpenGATE only uses kidney+liver — heart
-        voxels should then be included in remaining_body for OpenGATE).  We correct this
-        by recomputing remaining_body from the full non-background mask.
-        """
-        remaining_body_id = self.tdt_name2id.get("remaining_body")
-
-        roi_ids: set = set()
-        for roi_name in self.requested_roi_subset:
-            if roi_name == "remaining_body":
-                continue
-            lab = self.tdt_name2id.get(roi_name)
-            if lab is not None:
-                roi_ids.add(int(lab))
-
-        body_outline = seg_arr != 0
-
-        out = seg_arr.copy()
-        keep_ids = roi_ids.copy()
-        if remaining_body_id is not None:
-            keep_ids.add(int(remaining_body_id))
-        out[~np.isin(out, list(keep_ids))] = 0
-
-        if remaining_body_id is not None:
-            stage_roi_mask = np.isin(seg_arr, list(roi_ids)) if roi_ids else np.zeros_like(body_outline)
-            remaining_body_mask = body_outline & ~stage_roi_mask
-            out[remaining_body_mask] = int(remaining_body_id)
-
-        return out
 
     def _build_source_masks(
         self,
@@ -508,16 +363,16 @@ class OpenGateSimulationStage:
             Only ROIs with non-zero voxels are returned.
         """
         seg_arr = sitk.GetArrayFromImage(sim_seg).astype(np.int32)
-        seg_arr = self._filter_to_requested_rois(seg_arr)
+        seg_arr = filter_roi_seg_to_subset(seg_arr, self.requested_roi_subset, self.vtt_name2id)
 
         mask_paths: Dict[str, str] = {}
         counts: Dict[str, int] = {}
         names: List[str] = []
 
         for roi_name in self.requested_roi_subset:
-            label_id = self.tdt_name2id.get(roi_name)
+            label_id = self.vtt_name2id.get(roi_name)
             if label_id is None:
-                raise ValueError(f"ROI '{roi_name}' not in TDT label map")
+                raise ValueError(f"ROI '{roi_name}' not in VTT label map")
 
             mask = (seg_arr == int(label_id)).astype(np.uint8)
             n_vox = int(np.count_nonzero(mask))
@@ -590,7 +445,7 @@ class OpenGateSimulationStage:
         patient.image = str(sim_ct_path)
         patient.material = "G4_AIR"
 
-        mat_table, den_table = self._find_hu_tables()
+        mat_table, den_table = find_hu_tables(gate)
         voxel_materials, generated_materials = gate.geometry.materials.HounsfieldUnit_to_material(
             sim,
             self.density_tolerance_gcm3 * gcm3,
@@ -606,7 +461,7 @@ class OpenGateSimulationStage:
 
         # Lu-177 voxel source. `src.n` is per thread, so histories_per_thread is used.
         src = sim.add_source("VoxelSource", "src_lu177")
-        src.particle = f"ion {_LU177_Z} {_LU177_A} 0 0"
+        src.particle = f"ion {self._isotope_Z} {self._isotope_A} 0 0"
         src.n = self.histories_per_thread
         src.image = str(mask_path)
         src.direction.type = "iso"
@@ -725,7 +580,7 @@ class OpenGateSimulationStage:
             "stage": "opengate_simulation_stage",
             "dose_units": "Gy/decay",
             "ct_nii_path": str(self.ct_nii_path),
-            "tdt_roi_seg_path": str(self.tdt_roi_seg_path),
+            "vtt_roi_seg_path": str(self.vtt_roi_seg_path),
             "label_map_path": str(self.label_map_path),
             "requested_roi_subset": list(self.requested_roi_subset),
             "simulated_roi_names": list(roi_names),
@@ -740,7 +595,7 @@ class OpenGateSimulationStage:
                 "flipped_axes": self._centering_flipped_axes,
                 "original_origin": [round(o, 2) for o in self._original_sim_ct_img.GetOrigin()],
             },
-            "isotope": self.isotope_name,
+            "isotope": self.isotope,
             "save_options": {
                 "save_per_roi_dose_maps": self.save_per_roi_dose_maps,
                 "save_summed_dose_map": self.save_summed_dose_map,
@@ -807,7 +662,14 @@ class OpenGateSimulationStage:
             current_config_snapshot=self._rerun_config_snapshot(),
             current_ct_identity=self.ct_input_identity,
             current_upstream_fingerprints=self._current_dependency_fingerprints(),
+            context=self.context,
         )
+        if self.context.stage_skipped:
+            self.context.dosimetry_output_dir = self.output_dir
+            self.context.dosimetry_stage_output_dir = self.stage_output_dir
+            self.context.dosimetry_work_dir = self.work_dir
+            self.context.dosimetry_metadata_path = self.metadata_path
+            return self.context
 
         # Lazy import: opengate is only available on compatible platforms.
         # Importing it here (rather than at module level) lets the rest of the
@@ -816,7 +678,7 @@ class OpenGateSimulationStage:
         import opengate as gate  # noqa: F811
 
         native_ct = sitk.ReadImage(str(self.ct_nii_path))
-        native_seg = sitk.ReadImage(str(self.tdt_roi_seg_path))
+        native_seg = sitk.ReadImage(str(self.vtt_roi_seg_path))
 
         sim_ct, sim_seg, sim_ct_path, sim_seg_path, was_resampled = self._prepare_simulation_images(
             native_ct,
@@ -867,7 +729,7 @@ class OpenGateSimulationStage:
             dose_sim = np.asarray(res["dose_arr"], dtype=np.float64) / self.actual_total_histories
 
             dose_native = (
-                self._upsample_to_native(
+                upsample_array_to_native(
                     dose_sim.astype(np.float32),
                     self._original_sim_ct_img,
                     native_ct,
@@ -887,7 +749,7 @@ class OpenGateSimulationStage:
 
             if self.save_uncertainty_map and res["unc_arr"] is not None:
                 unc_out = (
-                    self._upsample_to_native(res["unc_arr"], self._original_sim_ct_img, native_ct)
+                    upsample_array_to_native(res["unc_arr"], self._original_sim_ct_img, native_ct)
                     if needs_upsample
                     else res["unc_arr"]
                 )
@@ -907,11 +769,11 @@ class OpenGateSimulationStage:
                 )
 
             if not self.write_mhd_outputs:
-                self._cleanup_mhd(Path(res["dose_mhd_path"]))
+                cleanup_mhd(Path(res["dose_mhd_path"]))
                 if res["unc_mhd_path"]:
-                    self._cleanup_mhd(Path(res["unc_mhd_path"]))
+                    cleanup_mhd(Path(res["unc_mhd_path"]))
                 if res["label_mhd_path"]:
-                    self._cleanup_mhd(Path(res["label_mhd_path"]))
+                    cleanup_mhd(Path(res["label_mhd_path"]))
 
             roi_meta[roi_name] = {
                 "work_dir": res["roi_work_dir"],
@@ -929,7 +791,7 @@ class OpenGateSimulationStage:
             sum_path = save_nii_sitk(
                 native_ct,
                 sum_arr.astype(np.float32),
-                Path(self.output_dir) / f"{self.prefix}_dose_sum.nii.gz",
+                Path(self.phase_output_dir) / f"{self.prefix}_dose_sum.nii.gz",
             )
 
         self._save_metadata(

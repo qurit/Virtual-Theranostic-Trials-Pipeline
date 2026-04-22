@@ -65,17 +65,7 @@ from src.io.rerun_guard import (
 )
 from src.utils.tac_utils import roi_to_voi
 from src.utils.dicom_utils import extract_height_weight
-
-# ---------------------------------------------------------------------------
-# Isotope half-life lookup table (values in minutes).
-# Add new isotopes here as they become supported.
-# ---------------------------------------------------------------------------
-ISOTOPE_HALF_LIVES_MIN: Dict[str, float] = {
-    "lu177": 6.647 * 24.0 * 60.0,   # 6.647 days = 9571.68 min
-}
-
-# Number of half-lives to simulate. 10 half-lives captures >99.9% of total decays.
-PBPK_HALF_LIFE_MULTIPLIER: int = 10
+from src.utils.label_utils import load_isotope_config
 
 
 class PbpkTacStage:
@@ -117,15 +107,17 @@ class PbpkTacStage:
         self.vois_pbpk: List[str] = list(self.stage_cfg["VOIs"])
         self.randomize_kidney_sg_para: bool = self.stage_cfg["Randomization_Kidney_SG_Para"]
 
-        # Isotope configuration
+        # Isotope configuration — loaded from src/data/isotope_config.json
         raw_isotope = str(self.stage_cfg.get("isotope", "lu177")).lower().strip().replace("-", "")
-        if raw_isotope not in ISOTOPE_HALF_LIVES_MIN:
+        _iso_cfg = load_isotope_config()
+        if raw_isotope not in _iso_cfg["half_life_min"]:
             raise ValueError(
                 f"Unsupported isotope '{raw_isotope}' in pbpk_tac_stage config. "
-                f"Supported: {sorted(ISOTOPE_HALF_LIVES_MIN.keys())}"
+                f"Supported: {sorted(_iso_cfg['half_life_min'])}"
             )
         self.isotope: str = raw_isotope
-        self.half_life_min: float = ISOTOPE_HALF_LIVES_MIN[self.isotope]
+        self.half_life_min: float = _iso_cfg["half_life_min"][raw_isotope]
+        self._half_life_multiplier: int = _iso_cfg["half_life_multiplier"]
 
         self.downstream_roi_subset: List[str] = list(context.downstream_roi_subset)
         if "remaining_body" not in self.downstream_roi_subset:
@@ -227,7 +219,7 @@ class PbpkTacStage:
         -------
         float  stop time in minutes
         """
-        stop = self.half_life_min * PBPK_HALF_LIFE_MULTIPLIER
+        stop = self.half_life_min * self._half_life_multiplier
 
         # Check if SPECT frame times require a longer TAC
         cfg = self.context.config
@@ -351,7 +343,7 @@ class PbpkTacStage:
             "model_type": self.model_type,
             "isotope": self.isotope,
             "half_life_min": self.half_life_min,
-            "half_life_multiplier": PBPK_HALF_LIFE_MULTIPLIER,
+            "half_life_multiplier": self._half_life_multiplier,
             "ct_input_path": self.ct_input_path,
             "vois_pbpk": list(self.vois_pbpk),
             "randomize_kidney_sg_para": bool(self.randomize_kidney_sg_para),
@@ -391,6 +383,7 @@ class PbpkTacStage:
             current_config_snapshot=self._rerun_config_snapshot(),
             current_ct_identity=self.ct_input_identity,
             current_upstream_fingerprints={},
+            context=self.context,
         )
 
         if os.path.exists(self.tac_json_path) and os.path.exists(self.tac_npz_path):

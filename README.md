@@ -107,7 +107,7 @@ Pass `--port PORT` to change the port, or `--no-browser` to skip auto-open.
 |------|------------|
 | **1-Intro** | Read the pipeline overview and prerequisite checklist, then click **Get Started**. |
 | **2 — CT Input** | Click **Choose CT Folder** to open a native folder picker, or type an absolute path into the text field and click **Scan** (useful on remote/Azure servers where a local desktop picker is unavailable). Patients are detected automatically — DICOM subdirectories and `.nii` / `.nii.gz` files both work. Axial, coronal, and sagittal previews are generated for each CT. |
-| **3 — Configure** | Enter a project name (determines the output folder). Toggle pipeline stages: **SPECT**, **Dosimetry**, **Post-Processing**. Choose **PRODUCTION** or **DEBUG** mode. Expand each patient card to adjust per-patient parameters — every field has a tooltip and changes auto-save. Synthetic lesions are configured per-patient by adding organ specs in Phase 1 — the stage runs automatically for any patient whose config includes specs, and is skipped for patients without specs. The synthetic lesion editor supports automatic radii, manual per-lesion radii, and fully user-defined centres. If output directories from a previous run are detected, the UI compares the selected CT and effective stage config against saved rerun metadata before allowing a rerun. |
+| **3 — Configure** | Enter a project name (determines the output folder). Toggle pipeline stages: **SPECT**, **Dosimetry**, **Post-Processing**. Choose **PRODUCTION** or **DEBUG** mode. Expand each patient card to adjust per-patient parameters — every field has a tooltip and changes auto-save. The voxel-spacing control is split into **XY** and **Z**: XY is applied to both X and Y, must stay square in-plane, and must be greater than or equal to the native CT in-plane spacing; Z must be greater than or equal to the native CT Z spacing. Synthetic lesions are configured per-patient by adding organ specs in Phase 1 — the stage runs automatically for any patient whose config includes specs, and is skipped for patients without specs. The synthetic lesion editor supports automatic radii, manual per-lesion radii, and fully user-defined centres. If profiling is enabled, the UI also exposes a sampling-interval dropdown (0.1-3.0 s, default 2.0 s). If output directories from a previous run are detected, the UI compares the selected CT and effective stage config against saved rerun metadata before allowing a rerun. |
 | **4 — Run** | Review the per-patient configuration summary, then click **Run Pipeline**. |
 
 #### Web UI dependencies
@@ -145,10 +145,12 @@ cp config_template.json inputs/my_config.json
 - `phase_2.simind_stage.NumPhotons`, `NumProjections`, `EnergyWindowWidth` — simulation fidelity vs. runtime. `NumProjections` must be ≥ 64; fewer projections causes angular undersampling and streak artifacts in OSEM reconstruction. The constraint `Subsets × Iterations ≤ NumProjections` must also hold.
 - `phase_2.simind_stage.num_cpu` — CPU cores for parallel SIMIND (`0` = use all available).
 - `phase_3.spect_postprocess_stage.Iterations`, `Subsets` — OSEM reconstruction settings. `Subsets × Iterations` must not exceed `NumProjections`.
-- `phase_2.simind_stage.xyz_spacing_mm` — target voxel spacing in mm as `[sx, sy, sz]`. Each value must be ≥ the native CT spacing on that axis (only coarser grids allowed). Voxel counts are derived automatically from the physical CT extent. The native CT spacing is logged at runtime. `null` = native CT resolution.
-- `phase_2.opengate_stage.xyz_spacing_mm` — same as above for dosimetry. Dose maps are always resampled back to native CT resolution after simulation.
+- `phase_2.simind_stage.xyz_spacing_mm` — target voxel spacing in mm as `[sxy, sxy, sz]`. X and Y must match. The shared XY value must be ≥ both native in-plane spacings; Z must be ≥ the native CT Z spacing (only coarser grids allowed). Voxel counts are derived automatically from the physical CT extent. The native CT spacing is logged at runtime. `null` = native CT resolution.
+- `phase_2.opengate_stage.xyz_spacing_mm` — same rule as above for dosimetry. Dose maps are always resampled back to native CT resolution after simulation.
 - `phase_2.opengate_stage.gate.total_histories` — Monte Carlo histories for dosimetry.
 - `phase_2.opengate_stage.gate.num_cpu` — OpenGATE threads (`0` = use all available).
+
+When `xyz_spacing_mm` is used, the pipeline preserves the physical CT extent and derives integer voxel counts from that extent. This means the realised spacing can be very close to, but not mathematically identical to, the requested value when the extent is not exactly divisible by the target spacing. In the web UI this is edited as `XY` + `Z`; in the JSON config it is still stored as `[sxy, sxy, sz]`.
 
 #### 2) CT Input
 
@@ -159,7 +161,11 @@ mkdir -p inputs/ct_input
 # add DICOM subfolders and/or .nii / .nii.gz files
 ```
 
-Each top-level item is treated as one patient — a DICOM folder or a NIfTI file.
+Each top-level DICOM folder or NIfTI file is treated as one patient. Other unsupported top-level entries are ignored in batch mode.
+
+CLI preflight now validates CT inputs before launching any patient run:
+- `src/tests/validate_ct.py` checks single CT paths and batch-directory entries.
+- `src/tests/validate_config.py` checks the run configuration after developer paths are injected.
 
 #### 3) Flags
 
@@ -175,6 +181,8 @@ Each top-level item is treated as one patient — a DICOM folder or a NIfTI file
 | `--dosimetry` | off | Run OpenGATE dosimetry simulation |
 | `--postprocess` | off | Run post-processing for whichever simulations ran |
 | `--save_config` | off | Copy config JSON into each CT output folder |
+| `--profile` | off | Write `profiling_CT_<index>.json` with per-stage pipeline CPU/RAM samples |
+| `--profile_interval_s FLOAT` | `2.0` | Profiler sampling interval in seconds when `--profile` is enabled. Allowed range: `0.1` to `3.0` |
 
 > \* `--input_ct_dir` and `--input_ct` are mutually exclusive; exactly one is required.
 
@@ -224,9 +232,9 @@ Each CT input generates an output folder under `<output_folder_title>_CT_<index>
 
 ```
 test_run_CT_1/
-  pipeline_metadata/                         <- persistent rerun metadata (survives work_dir cleanup)
+  pipeline_metadata/                         <- persistent rerun guard metadata (created on first run)
     ct_input.json                           <- saved CT identity / provenance
-    segmentation_stage.json                 <- stage-level rerun guard + debug metadata
+    segmentation_stage.json                 <- stage-level rerun guard snapshot
     pbpk_tac_stage.json
     simind_simulation_stage.json
     opengate_simulation_stage.json
@@ -260,13 +268,28 @@ test_run_CT_1/
     dosemap_postprocess/                     <- (if --dosimetry --postprocess)
       work_dir/                              <- per-ROI dose contributions / scratch outputs
     <prefix>_total_dose.nii.gz               <- total absorbed dose map (Gy)
-  logging_file_CT_1.log                      <- per-CT pipeline log
+  profiling_CT_1.json                        <- (if --profile) per-stage CPU/RAM samples
+  logging_file_CT_1.log                      <- per-CT pipeline log with timings + key stage summaries
 ```
 
 **Notes:**
 - `*_tot_w1/w2/w3.a00` are SIMIND energy-window projection totals (lower / photopeak / upper).
 - `calib.res` is produced by SIMIND Jaszczak calibration and converts counts -> activity.
 - All dose maps are saved in native CT resolution. If `xyz_spacing_mm` was set for OpenGATE, the simulation runs on the coarser grid and outputs are resampled back automatically.
+
+### Profiling Output
+
+If `--profile` is enabled, each patient output folder also contains `profiling_CT_<index>.json`.
+
+- Sampling cadence is 2 s by default and can be set in both the CLI (`--profile_interval_s`) and the web UI (0.1-3.0 s).
+- `cpu_pct_samples` is the summed CPU usage of the pipeline process tree. `100` means one fully used logical core, `800` means roughly eight fully used cores.
+- `ram_mb_samples` is the summed RSS memory of the pipeline process tree in MiB.
+- `system_cpu_pct_samples` is whole-machine CPU usage for context.
+- `process_count_samples` is the number of live processes in the sampled pipeline process tree.
+- `sample_times_s` gives the x-axis for plotting within each stage.
+- JSON is kept intentionally because it can hold the raw time series and effective config provenance in one portable file. If you later want CSV for plotting, it can be derived from this file without losing detail.
+
+This makes the profiler suitable for parameter sweeps where you want to compare how stage runtime, CPU load, and memory footprint change as you vary photon counts, histories, voxel spacing, reconstruction settings, or ROI selections.
 - The total dose map is computed using per-ROI weighting: each ROI's dose-per-decay map is multiplied by that ROI's own cumulated activity (TAC integrated from t=0 over 10x the isotope half-life, capturing >99.9% of all decays), then summed across ROIs. This avoids unphysical cross-terms.
 - PBPK TAC simulation length is derived automatically from the configured isotope half-life (10x multiplier). If any SPECT frame time extends beyond this, the TAC is extended to cover it.
 - In `PRODUCTION` mode, SIMIND `work_dir` is deleted after post-processing to save disk space, but rerun metadata is preserved in `pipeline_metadata/`.
@@ -276,18 +299,66 @@ test_run_CT_1/
 
 ---
 
-## Stage Files
+## Source Layout
 
 ```
-src/stages/
-  segmentation_stage.py         <- TotalSegmentator + ROI unification
-  synthetic_lesions_stage.py    <- Optional synthetic lesion generation
-  pbpk_tac_stage.py             <- PBPK TAC generation (isotope-aware stop time)
-  simind_simulation_stage.py    <- SIMIND preprocessing + Monte Carlo simulation
-  opengate_simulation_stage.py  <- OpenGATE voxel-source dosimetry
-  spect_postprocess_stage.py    <- TAC weighting + Poisson noise + OSEM reconstruction
-  dosemap_postprocess_stage.py  <- Per-ROI TAC-weighted total absorbed dose map
+src/
+  stages/
+    segmentation_stage.py           <- TotalSegmentator + ROI unification
+    synthetic_lesions_stage.py      <- Optional synthetic lesion generation
+    pbpk_tac_stage.py               <- PBPK TAC generation (isotope-aware stop time)
+    simind_simulation_stage.py      <- SIMIND preprocessing + Monte Carlo simulation
+    opengate_simulation_stage.py    <- OpenGATE voxel-source dosimetry
+    spect_postprocess_stage.py      <- TAC weighting + Poisson noise + OSEM reconstruction
+    dosemap_postprocess_stage.py    <- Per-ROI TAC-weighted total absorbed dose map
+
+  io/
+    context.py                      <- Shared Context object; inter-stage state handoff
+    runtime_config.py               <- Load + validate user JSON config
+    config_paths.py                 <- Load pipeline_paths.json; inject developer fields
+    pipeline_logging.py             <- Terminal + file logging: banners, summaries, progress
+    profiler.py                     <- Background CPU/RAM sampler; JSON output per stage
+    stage_metadata.py               <- Persistent per-stage rerun metadata (JSON)
+    rerun_guard.py                  <- Rerun safety: compare config/CT/upstream digests
+    rerun_snapshots.py              <- Per-stage rerun snapshot builders
+    rerun_fingerprints.py           <- File fingerprinting (SHA256) + JSON digest helpers
+
+  utils/
+    nifti_utils.py                  <- NIfTI I/O helpers; axis transposition; spacing/volume
+    label_utils.py                  <- VTT label map I/O; isotope config loader; class maps; ROI seg filtering
+    dicom_utils.py                  <- Patient height/weight extraction from DICOM tags
+    tac_utils.py                    <- TAC/PBPK helpers: ROI↔VOI mapping, cumulated activity
+    resize_utils.py                 <- Simulation grid resolution; voxel spacing validation
+    lesion_utils.py                 <- Synthetic lesion geometry: placement, overlap, labelmap
+    opengate_utils.py               <- SimpleITK helpers: centering, resampling, HU tables
+    simind_runtime_utils.py         <- SIMIND subprocess: env setup, aggregation, calibration
+    simind_projection_utils.py      <- SIMIND file I/O: header parsing, projection read/write
+
+  tests/
+    validate_config.py              <- Config validation (run before pipeline launch)
+    validate_ct.py                  <- CT input validation (single + batch mode)
+
+  data/
+    isotope_config.json             <- Isotope data: half-lives, attenuation coefficients, nuclear params
+    vtt_map.json                    <- VTT_Pipeline label space (unified ROI label map + TotalSegmentator mappings)
+    pipeline_paths.json             <- Developer-facing path configuration (SIMIND dir, output root)
+    pipeline_options.json           <- Stage defaults and UI option lists
+    smc.smc / scattwin.win          <- SIMIND template files
+    jaszak.smc                      <- SIMIND Jaszczak calibration template
 ```
+
+---
+
+## Analysis Notebooks
+
+| Notebook | Description |
+|----------|-------------|
+| `paper_analysis.ipynb` | **Multi-patient analysis** — iterates all CT outputs, visualises every pipeline stage, runs a PBPK vs Recon-SPECT TAC comparison study, and plots CPU/RAM profiling data across patients. Set `OUTPUT_ROOT`, `OUTPUT_PREFIX`, `PARAMETER_LABEL`, and `PROFILE_PHASE` at the top. |
+| `scripts/single_patient_script.ipynb` | Detailed single-patient deep-dive. |
+| `scripts/multi_patient_analysis_script.ipynb` | Legacy multi-patient analysis (older pipeline format). |
+| `scripts/synthetic_lesions.ipynb` | Synthetic lesion visualisation. |
+| `scripts/opengate_script.ipynb` | OpenGATE dosimetry outputs. |
+| `scripts/lesion_analysis.ipynb` | Per-lesion dose and activity analysis. |
 
 ---
 

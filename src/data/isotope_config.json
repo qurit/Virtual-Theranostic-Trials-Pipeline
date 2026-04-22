@@ -1,0 +1,12 @@
+{
+    "half_life_min": {
+        "lu177": 9571.68
+    },
+    "half_life_multiplier": 10,
+    "mu_table_cm_inv": {
+        "lu177": {"water": 0.1537, "bone": 0.2234}
+    },
+    "nuclear": {
+        "lu177": {"Z": 71, "A": 177}
+    }
+}

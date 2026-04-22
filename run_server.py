@@ -262,6 +262,8 @@ def main() -> None:
         print("  Run:  pip install 'uvicorn[standard]' fastapi")
         sys.exit(1)
 
+    pending_file = REPO_ROOT / ".vtt_pending_run.json"
+
     try:
         _write_pid_file(args.host, args.port)
         uvicorn.run(
@@ -272,9 +274,27 @@ def main() -> None:
             log_level="warning",
         )
     except KeyboardInterrupt:
-        print("\nServer stopped.")
+        pass
     finally:
         _remove_pid_file(args.port)
+
+    # After the server exits, run any pipeline jobs queued by /api/run.
+    if pending_file.exists():
+        try:
+            data = json.loads(pending_file.read_text(encoding="utf-8"))
+            pending_file.unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"[ERROR] Could not read pending run file: {exc}")
+            sys.exit(1)
+
+        jobs = data.get("jobs", [])
+        print(f"\nLaunching pipeline ({len(jobs)} patient(s))…\n")
+        any_failed = False
+        for job in jobs:
+            result = subprocess.run(job["cmd"], cwd=str(REPO_ROOT))
+            if result.returncode != 0:
+                any_failed = True
+        sys.exit(1 if any_failed else 0)
 
 
 if __name__ == "__main__":

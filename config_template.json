@@ -106,8 +106,9 @@
       // ROIs to simulate. Must be a subset of segmentation_stage.roi_subset.
       "roi_subset": ["liver", "kidney", "salivary_glands"],
 
-      // Target voxel spacing in mm as [sx, sy, sz], or null to use native CT spacing.
-      // Each value must be >= the corresponding native CT spacing (only coarser grids allowed).
+      // Target voxel spacing in mm as [sxy, sxy, sz], or null to use native CT spacing.
+      // X and Y must match (square in-plane voxels).
+      // XY must be >= both native in-plane spacings; Z must be >= native Z (only coarser grids allowed).
       // The pipeline logs the native CT spacing at runtime so you know the baseline.
       // Example: native CT is [0.977, 0.977, 3.0] mm — set [2.0, 2.0, 3.0] to halve in-plane.
       // The resulting voxel counts are derived automatically from the physical CT extent.
@@ -117,7 +118,7 @@
       "Collimator": "si-me",
 
       // Isotope code for SIMIND physics lookup.
-      "Isotope": "lu177",
+      "isotope": "lu177",
 
       // Angular projection views over a full 360° rotation.
       // Minimum: 64 — fewer causes angular undersampling and streak artifacts in OSEM.
@@ -174,8 +175,9 @@
       // Also write outputs as MetaImage (.mhd/.raw) in addition to NIfTI.
       "write_mhd_outputs": false,
 
-      // Target voxel spacing in mm as [sx, sy, sz], or null to use native CT spacing.
-      // Each value must be >= the corresponding native CT spacing (only coarser grids allowed).
+      // Target voxel spacing in mm as [sxy, sxy, sz], or null to use native CT spacing.
+      // X and Y must match (square in-plane voxels).
+      // XY must be >= both native in-plane spacings; Z must be >= native Z (only coarser grids allowed).
       // The pipeline logs the native CT spacing at runtime so you know the baseline.
       // Dose maps are always resampled back to native CT resolution after simulation.
       "xyz_spacing_mm": null,

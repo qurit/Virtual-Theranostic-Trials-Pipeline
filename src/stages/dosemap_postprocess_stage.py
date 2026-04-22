@@ -248,10 +248,9 @@ class DosemapPostprocessStage:
             current_config_snapshot=self._rerun_config_snapshot(),
             current_ct_identity=self.ct_input_identity,
             current_upstream_fingerprints=self._current_dependency_fingerprints(),
+            context=self.context,
         )
-
-        # Skip if output already exists
-        if os.path.exists(output_path):
+        if self.context.stage_skipped or os.path.exists(output_path):
             if self.debug:
                 print("[DosemapPostprocessStage] Total dose map already exists, skipping.")
             self.context.dosemap_postprocess_output_dir = self.stage_output_dir

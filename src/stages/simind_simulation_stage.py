@@ -6,7 +6,7 @@ This stage prepares inputs for SIMIND and runs Monte Carlo SPECT projection simu
 Preprocessing:
 - Converting CT + segmentation NIfTIs into the SIMIND grid convention (z, y, x with y-flip).
 - Optionally resizing to a target in-plane dimension via isotropic zoom.
-- Building ROI masks and a label->name class map from the unified TDT multilabel segmentation.
+- Building ROI masks and a label->name class map from the unified VTT multilabel segmentation.
 - Writing binary files used by SIMIND (attenuation map, body mask, per-ROI binary source maps).
 
 Simulation:
@@ -29,7 +29,7 @@ Incoming `context` is expected to provide:
 - context.subdir_paths["phase_2"] : str
 - context.mode : str  ("DEBUG" or "PRODUCTION")
 - context.ct_nii_path : str
-- context.tdt_roi_seg_path : str  (unified TDT ROI segmentation NIfTI)
+- context.vtt_roi_seg_path : str  (unified VTT ROI segmentation NIfTI)
 - context.downstream_roi_subset : list[str] | None
 
 On success, this stage sets:
@@ -57,7 +57,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import nibabel as nib
 import numpy as np
 from scipy.ndimage import zoom
-from json_minify import json_minify
 
 from src.io.rerun_guard import (
     assert_stage_rerun_safe,
@@ -67,26 +66,24 @@ from src.io.rerun_guard import (
     stage_metadata_path,
     write_json,
 )
-from src.utils.label_utils import load_tdt_label_map, build_class_map, build_label_masks
+from src.utils.label_utils import load_vtt_label_map, build_class_map, build_label_masks, filter_roi_seg_to_subset, load_isotope_config
 from src.utils.resize_utils import resolve_simulation_grid
-
-# Linear attenuation coefficients (1/cm) at each isotope's primary photopeak energy.
-# Values from NIST XCOM (https://physics.nist.gov/PhysRefData/Xcom/html/xcom1.html)
-# for liquid water and cortical bone.  Add a new entry here when supporting a new isotope.
-#
-#   lu177  : 208 keV primary photopeak  (water=0.1537, bone=0.2234)
-#   i131   : 364 keV primary photopeak  (water=0.1113, bone=0.1567)  — future example
-#
-# IMPORTANT: if you add a new isotope to the pipeline, add its attenuation values here
-# and ensure the preprocessor is initialised with the correct isotope key (currently
-# hard-coded to "lu177" in SimindSimulationStage — search for MU_TABLE_CM_INV to update).
-_MU_TABLE_CM_INV: dict = {
-    "lu177": {"water": 0.1537, "bone": 0.2234},
-}
-
-# Convenience aliases kept for any direct references elsewhere in the file.
-MU_WATER_CM_INV: float = _MU_TABLE_CM_INV["lu177"]["water"]
-MU_BONE_CM_INV:  float = _MU_TABLE_CM_INV["lu177"]["bone"]
+from src.utils.simind_runtime_utils import (
+    aggregate_core_projection_totals,
+    build_projection_path_dict,
+    build_simind_switches,
+    configure_simind_environment,
+    copy_simind_headers_to_dir,
+    copy_simind_templates,
+    derive_input_geometry,
+    get_projection_paths_for_organ,
+    get_summed_projection_paths,
+    hu_to_mu,
+    organ_headers_exist,
+    organ_totals_exist,
+    run_jaszczak_calibration,
+    sum_projections_across_organs,
+)
 
 
 class _SimindPreprocessor:                                                             
@@ -104,59 +101,29 @@ class _SimindPreprocessor:
     the in-plane dimension and applied to all three axes via scipy.ndimage.zoom.
     """
 
-    def __init__(                                                                      
+    def __init__(
         self,
         ct_nii_path: str,
-        tdt_roi_seg_path: str,
-        tdt_name2id: Dict[str, int],
+        vtt_roi_seg_path: str,
+        vtt_name2id: Dict[str, int],
         roi_subset: Sequence[str],
         output_dir: str,
         prefix: str,
         xyz_spacing_mm: Optional[list],
+        mu_water: float,
+        mu_bone: float,
         debug: bool = False,
     ) -> None:
         self.ct_nii_path = ct_nii_path
-        self.tdt_roi_seg_path = tdt_roi_seg_path
-        self.tdt_name2id = tdt_name2id
+        self.vtt_roi_seg_path = vtt_roi_seg_path
+        self.vtt_name2id = vtt_name2id
         self.roi_subset = roi_subset
         self.output_dir = output_dir
         self.prefix = prefix
         self.xyz_spacing_mm = xyz_spacing_mm
-        self.debug = debug                                                             
-    @staticmethod
-    def _hu_to_mu(
-        hu_arr: np.ndarray,
-        pixel_size_cm: float,
-        mu_water: float = MU_WATER_CM_INV,
-        mu_bone: float = MU_BONE_CM_INV,
-    ) -> np.ndarray:
-        """
-        Convert HU CT values to a linear attenuation map (mu) scaled to per-pixel units.
-
-        Two-segment model:
-          - HU <= 0  (soft tissue/air): mu = mu_water * (1 + HU/1000)
-          - HU  > 0  (bone):           mu = mu_water + (HU/1000) * (mu_bone - mu_water)
-
-        Parameters
-        ----------
-        hu_arr : np.ndarray
-        pixel_size_cm : float  mean in-plane voxel size in cm
-        mu_water : float  linear attenuation of water (1/cm) at ~208 keV
-        mu_bone : float   linear attenuation of bone  (1/cm) at ~208 keV
-
-        Returns
-        -------
-        np.ndarray  (float32)  mu per pixel (dimensionless)
-        """
-        mu_water_pixel = mu_water * pixel_size_cm
-        mu_bone_pixel = mu_bone * pixel_size_cm
-
-        mu_map = np.zeros_like(hu_arr, dtype=np.float32)
-        soft = hu_arr <= 0
-        bone = hu_arr > 0
-        mu_map[soft] = mu_water_pixel * (1 + hu_arr[soft] / 1000.0)
-        mu_map[bone] = mu_water_pixel + (hu_arr[bone] / 1000.0) * (mu_bone_pixel - mu_water_pixel)
-        return mu_map
+        self.mu_water = mu_water
+        self.mu_bone = mu_bone
+        self.debug = debug
 
     def _write_attenuation_bin(
         self,
@@ -170,58 +137,11 @@ class _SimindPreprocessor:
 
         The mu map is masked to the body so air outside the patient is zeroed.
         """
-        mu_map = self._hu_to_mu(np.asarray(ct_arr, dtype=np.float32), pixel_size_cm)
+        mu_map = hu_to_mu(np.asarray(ct_arr, dtype=np.float32), pixel_size_cm, self.mu_water, self.mu_bone)
         mu_map *= body_seg_arr  # zero outside body
         out_path = os.path.join(self.output_dir, filename)
         mu_map.tofile(out_path)
         return out_path
-
-    def _filter_to_requested_rois(self, roi_seg_arr: np.ndarray) -> np.ndarray:
-        """
-        Zero out labels not in the requested ROI subset, then recompute remaining_body.
-
-        remaining_body is always included and represents:
-            body_outline − union(this_stage_roi_masks)
-
-        Because the unified segmentation's remaining_body label was computed using the
-        phase-1 ROI subset, it may be too narrow when this stage's subset is smaller
-        (e.g. phase-1 had kidney+liver+heart but SIMIND only uses kidney+liver — heart
-        voxels should then be included in remaining_body for SIMIND).  We correct this
-        by recomputing remaining_body from the full non-background mask.
-
-        Raises
-        ------
-        ValueError  if a requested ROI name is not in the TDT label map.
-        """
-        remaining_body_id = self.tdt_name2id.get("remaining_body")
-
-        requested = set(self.roi_subset)
-        roi_ids: set = set()
-        for name in requested:
-            lab = self.tdt_name2id.get(name)
-            if lab is None:
-                raise ValueError(f"Requested ROI '{name}' not in TDT label map.")
-            roi_ids.add(lab)
-        roi_ids.discard(0)
-
-        # Body outline = all non-background voxels in the unified segmentation.
-        body_outline = roi_seg_arr != 0
-
-        out = roi_seg_arr.copy()
-        # Keep only the requested ROI labels; zero everything else.
-        keep_ids = roi_ids.copy()
-        if remaining_body_id is not None:
-            keep_ids.add(remaining_body_id)
-        out[~np.isin(out, list(keep_ids))] = 0
-
-        # Recompute remaining_body for this stage's specific ROI subset:
-        # remaining_body_stage = body_outline AND NOT any_requested_roi
-        if remaining_body_id is not None:
-            stage_roi_mask = np.isin(roi_seg_arr, list(roi_ids))
-            remaining_body_mask = body_outline & ~stage_roi_mask
-            out[remaining_body_mask] = remaining_body_id
-
-        return out
 
     @staticmethod
     def _to_simind_grid(
@@ -318,7 +238,7 @@ class _SimindPreprocessor:
         body_seg_arr = np.fromfile(body_path, dtype=np.float32).reshape(shape)
         roi_body_arr = np.fromfile(roi_body_path, dtype=np.float32).reshape(shape).astype(np.int16)
 
-        id_to_name = {v: k for k, v in self.tdt_name2id.items()}
+        id_to_name = {v: k for k, v in self.vtt_name2id.items()}
         class_seg = build_class_map(roi_body_arr, id_to_name)
         masks = build_label_masks(roi_body_arr)
 
@@ -354,8 +274,8 @@ class _SimindPreprocessor:
         """
         if self.ct_nii_path is None or not os.path.exists(self.ct_nii_path):
             raise FileNotFoundError(f"ct_nii_path not found: {self.ct_nii_path}")
-        if self.tdt_roi_seg_path is None or not os.path.exists(self.tdt_roi_seg_path):
-            raise FileNotFoundError(f"Unified TDT ROI seg not found: {self.tdt_roi_seg_path}")
+        if self.vtt_roi_seg_path is None or not os.path.exists(self.vtt_roi_seg_path):
+            raise FileNotFoundError(f"Unified VTT ROI seg not found: {self.vtt_roi_seg_path}")
         if not self.roi_subset:
             raise ValueError("No ROI subset provided for SIMIND preprocessing.")
 
@@ -393,7 +313,7 @@ class _SimindPreprocessor:
                 )
 
         ct_nii = nib.load(self.ct_nii_path)
-        roi_nii = nib.load(self.tdt_roi_seg_path)
+        roi_nii = nib.load(self.vtt_roi_seg_path)
 
         # Convert to SIMIND grid (z, y, x) with optional resampling.
         # CT uses linear interpolation; seg uses nearest-neighbour.
@@ -408,21 +328,21 @@ class _SimindPreprocessor:
         roi_arr_full, _, _, _ = self._to_simind_grid(roi_nii, xyz_spacing_mm=self.xyz_spacing_mm, zoom_order=0)
         roi_arr_full = roi_arr_full.astype(np.int16)
 
-        body_label = self.tdt_name2id.get("remaining_body")
+        body_label = self.vtt_name2id.get("remaining_body")
         if body_label is None:
-            raise ValueError("TDT label map does not contain a 'remaining_body' label.")
+            raise ValueError("VTT label map does not contain a 'remaining_body' label.")
         if not np.any(roi_arr_full != 0):
-            raise ValueError("Unified TDT segmentation is empty (no labelled voxels).")
+            raise ValueError("Unified VTT segmentation is empty (no labelled voxels).")
 
         # Body mask: all non-zero voxels in the unified seg (patient boundary).
         body_mask = (roi_arr_full != 0).astype(np.float32)
 
-        roi_arr = self._filter_to_requested_rois(roi_arr_full)
+        roi_arr = filter_roi_seg_to_subset(roi_arr_full, self.roi_subset, self.vtt_name2id)
         # Mask ROI labels to body to prevent out-of-body artifacts.
         roi_body_arr = (roi_arr * body_mask).astype(np.int16)
 
         masks = build_label_masks(roi_body_arr)
-        id_to_name = {v: k for k, v in self.tdt_name2id.items()}
+        id_to_name = {v: k for k, v in self.vtt_name2id.items()}
         class_seg = build_class_map(roi_body_arr, id_to_name)
 
         # Spacing: original NIfTI zooms (x, y, z) in mm, each divided by its own
@@ -483,7 +403,7 @@ class SimindSimulationStage:
             "subdir_paths",
             "config",
             "ct_nii_path",
-            "tdt_roi_seg_path",
+            "vtt_roi_seg_path",
             "output_folder_path",
             "ct_input_identity",
         )
@@ -524,7 +444,14 @@ class SimindSimulationStage:
 
         # SIMIND acquisition parameters from config
         self.collimator: str = self.stage_cfg["Collimator"]
-        self.isotope: str = self.stage_cfg["Isotope"]
+        self.isotope: str = self.stage_cfg["isotope"]
+
+        # Load attenuation coefficients for this isotope from isotope_config.json
+        _iso_cfg = load_isotope_config()
+        _mu_data = _iso_cfg["mu_table_cm_inv"].get(self.isotope, _iso_cfg["mu_table_cm_inv"]["lu177"])
+        self._mu_water: float = _mu_data["water"]
+        self._mu_bone: float = _mu_data["bone"]
+
         self.num_projections: int = self.stage_cfg["NumProjections"]
         self.detector_distance: float = self.stage_cfg["DetectorDistance"]
         self.output_img_size: int = self.stage_cfg["OutputImgSize"]
@@ -556,9 +483,9 @@ class SimindSimulationStage:
                 f"Available: {sorted(phase1_rois)}"                                    
             )                                                                          
 
-        # Load TDT label map
+        # Load VTT label map
         self.ts_map_path: str = context.config["phase_1"]["segmentation_stage"]["label_map_path"]
-        self.tdt_name2id: Dict[str, int] = load_tdt_label_map(self.ts_map_path)
+        self.vtt_name2id: Dict[str, int] = load_vtt_label_map(self.ts_map_path)
 
         # CPU count: 0 or invalid -> use all available cores
         _cfg_num_cpu = self.stage_cfg.get("num_cpu", 1)
@@ -590,7 +517,7 @@ class SimindSimulationStage:
         """Return fingerprints for the current stage inputs that affect SIMIND outputs."""
         deps = {
             "ct_nii": fingerprint_optional_file(self.context.ct_nii_path),
-            "tdt_roi_seg": fingerprint_optional_file(self.context.tdt_roi_seg_path),
+            "vtt_roi_seg": fingerprint_optional_file(self.context.vtt_roi_seg_path),
             "label_map_json": fingerprint_optional_file(self.ts_map_path),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
@@ -611,194 +538,10 @@ class SimindSimulationStage:
             os.path.join(self.preprocess_dir, f"{self.prefix}_roi_body_seg.bin"),
             self.calibration_path,
         ]
-        markers.extend(self._get_summed_projection_paths().values())
+        markers.extend(get_summed_projection_paths(self.output_dir, self.prefix).values())
         for organ_name in ["remaining_body", *self.simind_roi_subset]:
-            markers.extend(self._get_projection_paths_for_organ(organ_name).values())
+            markers.extend(get_projection_paths_for_organ(self.work_dir, self.prefix, organ_name).values())
         return markers
-
-    # ------------------------------------------------------------------
-    # helpers
-    # ------------------------------------------------------------------
-
-    def _set_simind_environment(self) -> None:
-        """
-        Set environment variables required by SIMIND at runtime.
-
-        SMC_DIR must point to the `smc_dir` resource folder and end with os.sep
-        (SIMIND requires this trailing separator).
-        """
-        smc_dir = os.path.join(self.simind_dir, "smc_dir")
-        if not os.path.isdir(smc_dir):
-            raise FileNotFoundError(f"SMC_DIR folder not found: {smc_dir}")
-        if not smc_dir.endswith(os.sep):
-            smc_dir += os.sep
-        os.environ["SMC_DIR"] = smc_dir
-        os.environ["PATH"] = self.simind_dir + os.pathsep + os.environ.get("PATH", "")
-
-    def _copy_templates(self) -> None:
-        """
-        Copy SIMIND template files from <repo_root>/data into the work directory.
-
-        Templates required:
-        - scattwin.win  -> <work_dir>/<prefix>.win
-        - smc.smc       -> <work_dir>/<prefix>.smc
-        """
-        shutil.copyfile(
-            os.path.join(self.repo_root, "data", "scattwin.win"),
-            os.path.join(self.work_dir, f"{self.prefix}.win"),
-        )
-        shutil.copyfile(
-            os.path.join(self.repo_root, "data", "smc.smc"),
-            os.path.join(self.work_dir, f"{self.prefix}.smc"),
-        )
-
-    def _get_projection_paths_for_organ(self, organ_name: str) -> Dict[str, str]:
-        """Return output projection paths (w1/w2/w3) for a single organ in work_dir.""" 
-        return {
-            "w1": os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_tot_w1.a00"), 
-            "w2": os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_tot_w2.a00"), 
-            "w3": os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_tot_w3.a00"), 
-        }
-
-    def _get_summed_projection_paths(self) -> Dict[str, str]:                          
-        """Return output paths for summed (across all ROIs) projection totals."""       
-        return {                                                                       
-            "w1": os.path.join(self.output_dir, f"{self.prefix}_tot_w1.a00"),          
-            "w2": os.path.join(self.output_dir, f"{self.prefix}_tot_w2.a00"),          
-            "w3": os.path.join(self.output_dir, f"{self.prefix}_tot_w3.a00"),          
-        }                                                                              
-
-    def _build_projection_path_dict(self, roi_list: List[str]) -> Dict[str, Dict[str, str]]:
-        """Return output projection paths for all organs."""
-        return {organ: self._get_projection_paths_for_organ(organ) for organ in roi_list}
-
-    def _organ_totals_exist(self, organ_name: str) -> bool:
-        """Return True if all three energy window total files exist for this organ."""
-        return all(
-            os.path.exists(p)
-            for p in self._get_projection_paths_for_organ(organ_name).values()
-        )
-
-    def _organ_headers_exist(self, organ_name: str) -> bool:
-        """Return True if the SIMIND header for core 0 exists (w2 photopeak window)."""
-        return os.path.exists(
-            os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_0_tot_w2.h00")
-        )
-
-    def _calibration_exists(self) -> bool:
-        """Return True if `calib.res` exists in the output directory."""
-        return os.path.exists(os.path.join(self.output_dir, "calib.res"))
-
-    def _run_jaszczak_calibration(self) -> None:
-        """
-        Run Jaszczak calibration in SIMIND to produce `calib.res`.
-
-        No-op if `calib.res` already exists.
-        Requires `jaszak.smc` (note: SIMIND uses this spelling) in <repo_root>/data.
-        """
-        if self._calibration_exists():
-            return
-
-        jaszak_file = os.path.join(self.repo_root, "data", "jaszak.smc") 
-        shutil.copyfile(jaszak_file, os.path.join(self.output_dir, "jaszak.smc"))
-
-        cmd = (
-            f"{self.simind_exe} jaszak calib"
-            f"/fi:{self.isotope}"
-            f"/cc:{self.collimator}"
-            "/29:1"
-            "/15:5"
-            "/fa:11"
-            "/fa:15"
-            "/fa:14"
-        )
-        subprocess.run(cmd, shell=True, cwd=self.output_dir, stdout=subprocess.DEVNULL)
-
-    def _get_input_geometry(
-        self,
-        arr_shape: tuple,
-        arr_px_spacing_cm: tuple,
-    ) -> Dict[str, float]:
-        """
-        Derive SIMIND input/output geometry values from preprocessing outputs.
-
-        All lengths in cm; lengths match the (z, y, x) array convention.
-        """
-        input_slice_width = float(arr_px_spacing_cm[0])
-        input_pixel_width = float(arr_px_spacing_cm[1])
-        input_half_length = float(input_slice_width * arr_shape[0] / 2.0)
-        output_img_length = float(input_slice_width * arr_shape[0] / self.output_slice_width)
-        detector_width_cm = float(self.detector_width)
-        detector_length_cm = (
-            float(arr_shape[0] * input_slice_width)
-            if self.detector_length == 0
-            else float(self.detector_length)
-        )
-        return {
-            "input_slice_width": input_slice_width,
-            "input_pixel_width": input_pixel_width,
-            "input_half_length": input_half_length,
-            "output_img_length": output_img_length,
-            "detector_width_cm": detector_width_cm,
-            "detector_length_cm": detector_length_cm,
-        }
-
-    def _build_simind_switches(
-        self,
-        atn_name: str,
-        act_name: str,
-        arr_shape: tuple,
-        geometry: Dict[str, float],
-        scale_factor: float,
-    ) -> str:
-        """
-        Build the SIMIND command-line switch string for a single organ simulation.
-
-        Key switches
-        ------------
-        /fd  attenuation map filename
-        /fs  activity source map filename
-        /nn  photons per voxel (scaled by num_cpu)
-        /cc  collimator
-        /fi  isotope
-        /02,/05  input half-length (z extent)
-        /08,/10  detector length and width
-        /14,/15  energy window lower bounds
-        /20,/21  energy window widths (signed negative = % of photopeak)
-        /28  output pixel width
-        /29  number of projections
-        /31  input pixel width
-        /34  input z pixels
-        /42  detector-to-patient distance
-        /76  output image size
-        /77  output image length
-        /78,/79  output z and x pixels
-        """
-        return (
-            f"/fd:{atn_name}"
-            f"/fs:{act_name}"
-            "/in:x22,3x"
-            f"/nn:{scale_factor}"
-            f"/cc:{self.collimator}"
-            f"/fi:{self.isotope}"
-            f"/02:{geometry['input_half_length']}"
-            f"/05:{geometry['input_half_length']}"
-            f"/08:{geometry['detector_length_cm']:.2f}"
-            f"/10:{geometry['detector_width_cm']:.2f}"
-            "/14:-7"
-            "/15:-7"
-            f"/20:{-1 * self.energy_window_width}"
-            f"/21:{-1 * self.energy_window_width}"
-            f"/28:{self.output_pixel_width}"
-            f"/29:{self.num_projections}"
-            f"/31:{geometry['input_pixel_width']}"
-            f"/34:{arr_shape[0]}"
-            f"/42:{self.detector_distance}"
-            f"/76:{self.output_img_size}"
-            f"/77:{geometry['output_img_length']}"
-            f"/78:{arr_shape[1]}"
-            f"/79:{arr_shape[2]}"
-        )
 
     def _run_simind_for_organ_cores(self, organ_name: str, simind_switches: str) -> None:
         """
@@ -819,99 +562,6 @@ class SimindSimulationStage:
 
         for p in processes:
             p.wait()
-
-    def _aggregate_core_totals_for_organ(self, organ_name: str) -> None:
-        """
-        Average projection totals across `num_cpu` SIMIND runs and write to work_dir.
-
-        Reads per-core files:  <work_dir>/<prefix>_<organ>_<j>_tot_w{1,2,3}.a00
-        Writes averaged totals: <work_dir>/<prefix>_<organ>_tot_w{1,2,3}.a00
-
-        Units after averaging: counts/MB/s (SIMIND convention).
-        In PRODUCTION mode, per-core files are deleted to save disk space.
-        """
-        xtot_w1 = xtot_w2 = xtot_w3 = 0.0
-
-        for j in range(self.num_cpu):
-            p1 = os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_{j}_tot_w1.a00")
-            p2 = os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_{j}_tot_w2.a00")
-            p3 = os.path.join(self.work_dir, f"{self.prefix}_{organ_name}_{j}_tot_w3.a00")
-
-            xtot_w1 += np.fromfile(p1, dtype=np.float32)
-            xtot_w2 += np.fromfile(p2, dtype=np.float32)
-            xtot_w3 += np.fromfile(p3, dtype=np.float32)
-
-            if self.mode == "PRODUCTION":
-                for p in (p1, p2, p3):
-                    try:
-                        os.remove(p)
-                    except FileNotFoundError:
-                        pass
-
-        # Average across cores
-        xtot_w1 /= self.num_cpu
-        xtot_w2 /= self.num_cpu
-        xtot_w3 /= self.num_cpu
-
-        organ_paths = self._get_projection_paths_for_organ(organ_name)
-        np.asarray(xtot_w1, dtype=np.float32).tofile(organ_paths["w1"])
-        np.asarray(xtot_w2, dtype=np.float32).tofile(organ_paths["w2"])
-        np.asarray(xtot_w3, dtype=np.float32).tofile(organ_paths["w3"])
-
-    def _copy_headers_to_header_dir(self, roi_list: List[str]) -> None:                
-        """
-        Copy SIMIND header files (.h00, .cor, .hct, .ict) from work_dir to header_dir.
-
-        These files are needed by reconstruction and must survive PRODUCTION cleanup.
-        Only copies from the first ROI (all ROIs share the same geometry).
-        The .ict file is the attenuation binary referenced by the .hct header —
-        PyTomography's simind.get_attenuation_map() reads .hct then loads .ict
-        from the same directory.
-        """
-        first_roi = roi_list[0]                                                        
-        extensions = [                                                                 
-            f"_{first_roi}_0_tot_w1.h00",                                              
-            f"_{first_roi}_0_tot_w2.h00",                                              
-            f"_{first_roi}_0_tot_w3.h00",                                              
-            f"_{first_roi}_0.cor",                                                     
-            f"_{first_roi}_0.hct",                                                     
-            f"_{first_roi}_0.ict",                                                     
-        ]                                                                              
-        for ext in extensions:                                                         
-            src = os.path.join(self.work_dir, f"{self.prefix}{ext}")                   
-            dst = os.path.join(self.header_dir, f"{self.prefix}{ext}")                 
-            if os.path.exists(src) and not os.path.exists(dst):                        
-                shutil.copyfile(src, dst)                                               
-
-    def _sum_projections_across_organs(self, roi_list: List[str]) -> Dict[str, str]:   
-        """
-        Sum per-organ projection totals into a single total per energy window.
-
-        Writes summed projections to the phase output directory.
-        Per-organ projections remain in work_dir for post-processing.
-        """
-        summed_paths = self._get_summed_projection_paths()                             
-
-        # Skip if summed projections already exist 
-        if all(os.path.exists(p) for p in summed_paths.values()):                      
-            return summed_paths                                                        
-
-        sum_w1 = sum_w2 = sum_w3 = None                                                
-        for organ_name in roi_list:                                                    
-            organ_paths = self._get_projection_paths_for_organ(organ_name)             
-            w1 = np.fromfile(organ_paths["w1"], dtype=np.float32)                      
-            w2 = np.fromfile(organ_paths["w2"], dtype=np.float32)                      
-            w3 = np.fromfile(organ_paths["w3"], dtype=np.float32)                      
-            sum_w1 = w1.copy() if sum_w1 is None else sum_w1 + w1                      
-            sum_w2 = w2.copy() if sum_w2 is None else sum_w2 + w2                      
-            sum_w3 = w3.copy() if sum_w3 is None else sum_w3 + w3                      
-
-        if sum_w1 is not None:                                                         
-            np.asarray(sum_w1, dtype=np.float32).tofile(summed_paths["w1"])             
-            np.asarray(sum_w2, dtype=np.float32).tofile(summed_paths["w2"])             
-            np.asarray(sum_w3, dtype=np.float32).tofile(summed_paths["w3"])             
-
-        return summed_paths                                                            
 
     def _save_stage_metadata(
         self,
@@ -1002,16 +652,27 @@ class SimindSimulationStage:
             current_config_snapshot=self._rerun_config_snapshot(),
             current_ct_identity=self.ct_input_identity,
             current_upstream_fingerprints=self._current_dependency_fingerprints(),
+            context=self.context,
         )
+        if self.context.stage_skipped:
+            self.context.spect_sim_output_dir = self.output_dir
+            self.context.simind_stage_output_dir = self.stage_output_dir
+            self.context.simind_work_dir = self.work_dir
+            self.context.simind_metadata_path = self.metadata_path
+            self.context.simind_calibration_path = self.calibration_path
+            self.context.simind_header_dir = self.header_dir
+            return self.context
 
         preprocessor = _SimindPreprocessor(
             ct_nii_path=self.context.ct_nii_path,
-            tdt_roi_seg_path=self.context.tdt_roi_seg_path,
-            tdt_name2id=self.tdt_name2id,
+            vtt_roi_seg_path=self.context.vtt_roi_seg_path,
+            vtt_name2id=self.vtt_name2id,
             roi_subset=self.simind_roi_subset,
             output_dir=self.preprocess_dir,
             prefix=self.prefix,
             xyz_spacing_mm=self.xyz_spacing_mm,
+            mu_water=self._mu_water,
+            mu_bone=self._mu_bone,
             debug=self.debug,
         )
         preprocess_results = preprocessor.run()
@@ -1040,11 +701,17 @@ class SimindSimulationStage:
         if not roi_list:
             raise ValueError("No ROI binary source maps found for SIMIND simulation.")
 
-        simind_projection_paths = self._build_projection_path_dict(roi_list)
-        geometry = self._get_input_geometry(arr_shape, arr_px_spacing_cm)
+        simind_projection_paths = build_projection_path_dict(self.work_dir, self.prefix, roi_list)
+        geometry = derive_input_geometry(
+            arr_shape,
+            arr_px_spacing_cm,
+            output_slice_width=self.output_slice_width,
+            detector_width=self.detector_width,
+            detector_length=self.detector_length,
+        )
 
-        self._set_simind_environment()
-        self._copy_templates()
+        configure_simind_environment(self.simind_dir)
+        copy_simind_templates(self.repo_root, self.work_dir, self.prefix)
 
         # Copy attenuation map into work_dir (SIMIND resolves input paths relative to cwd).
         # Always refresh so work_dir stays in sync with current preprocessing outputs.
@@ -1075,16 +742,23 @@ class SimindSimulationStage:
             if not os.path.exists(act_path):
                 raise FileNotFoundError(f"Binary ROI source map not found: {act_path}")
 
-            simind_switches = self._build_simind_switches(
+            simind_switches = build_simind_switches(
                 atn_name=atn_work_name,
                 act_name=act_work_name,
                 arr_shape=arr_shape,
                 geometry=geometry,
                 scale_factor=scale_factor,
+                collimator=self.collimator,
+                isotope=self.isotope,
+                energy_window_width=self.energy_window_width,
+                output_pixel_width=self.output_pixel_width,
+                num_projections=self.num_projections,
+                detector_distance=self.detector_distance,
+                output_img_size=self.output_img_size,
             )
             simind_switches_by_organ[organ_name] = simind_switches
 
-            if self._organ_totals_exist(organ_name) and self._organ_headers_exist(organ_name):
+            if organ_totals_exist(self.work_dir, self.prefix, organ_name) and organ_headers_exist(self.work_dir, self.prefix, organ_name):
                 if self.debug: 
                     print(f"[SimindSimulationStage] Organ '{organ_name}' projections already exist, skipping.") 
                 continue
@@ -1092,11 +766,28 @@ class SimindSimulationStage:
             if self.debug: 
                 print(f"[SimindSimulationStage] Simulating organ: {organ_name}") 
             self._run_simind_for_organ_cores(organ_name, simind_switches)
-            self._aggregate_core_totals_for_organ(organ_name)
+            aggregate_core_projection_totals(
+                self.work_dir,
+                self.prefix,
+                organ_name,
+                num_cpu=self.num_cpu,
+                mode=self.mode,
+            )
 
-        self._run_jaszczak_calibration()
-        self._copy_headers_to_header_dir(roi_list)
-        summed_projection_paths = self._sum_projections_across_organs(roi_list)
+        run_jaszczak_calibration(
+            self.output_dir,
+            self.repo_root,
+            self.simind_exe,
+            self.isotope,
+            self.collimator,
+        )
+        copy_simind_headers_to_dir(self.work_dir, self.header_dir, self.prefix, roi_list[0])
+        summed_projection_paths = sum_projections_across_organs(
+            self.work_dir,
+            self.output_dir,
+            self.prefix,
+            roi_list,
+        )
 
         self._save_stage_metadata(
             simind_projection_paths=simind_projection_paths,

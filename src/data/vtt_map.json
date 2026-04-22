@@ -1,9 +1,7 @@
-// Adjusted Total Segmentator classes for TDT pipeline use
+// VTT Pipeline label map and ROI configuration
 
-// IDs are based on Total Segmentator backend
-// TDT pipeline only uses a subset of these for ROIs
 {
-    "total": { // other roi -  - total segmentator backend
+    "total": { // TotalSegmentator "total" task label space
         "1": "spleen",
         "2": "kidney_right",
         "3": "kidney_left",
@@ -122,32 +120,32 @@
         "116": "sternum",
         "117": "costal_cartilages"
     },
-    "body": { // for body segmentation - total segmentator backend
+    "body": { // TotalSegmentator "body" task label space
         "1": "body_trunc",
         "2": "body_extremities"
     },
-    "head_glands_cavities": { // for head and cavitates  - total segmentator backend
-    "1": "eye_left",
-    "2": "eye_right",
-    "3": "eye_lens_left",
-    "4": "eye_lens_right",
-    "5": "optic_nerve_left",
-    "6": "optic_nerve_right",
-    "7": "parotid_gland_left", 
-    "8": "parotid_gland_right", 
-    "9": "submandibular_gland_right", 
-    "10": "submandibular_gland_left", 
-    "11": "nasopharynx",
-    "12": "oropharynx",
-    "13": "hypopharynx",
-    "14": "nasal_cavity_right",
-    "15": "nasal_cavity_left",
-    "16": "auditory_canal_right",
-    "17": "auditory_canal_left",
-    "18": "soft_palate",
-    "19": "hard_palate"
+    "head_glands_cavities": { // TotalSegmentator "head_glands_cavities" task label space
+        "1": "eye_left",
+        "2": "eye_right",
+        "3": "eye_lens_left",
+        "4": "eye_lens_right",
+        "5": "optic_nerve_left",
+        "6": "optic_nerve_right",
+        "7": "parotid_gland_left",
+        "8": "parotid_gland_right",
+        "9": "submandibular_gland_right",
+        "10": "submandibular_gland_left",
+        "11": "nasopharynx",
+        "12": "oropharynx",
+        "13": "hypopharynx",
+        "14": "nasal_cavity_right",
+        "15": "nasal_cavity_left",
+        "16": "auditory_canal_right",
+        "17": "auditory_canal_left",
+        "18": "soft_palate",
+        "19": "hard_palate"
     },
-    "TDT_Pipeline":{// Adjusted classes for TDT pipeline use (only ones possible to use as ROIs)
+    "VTT_Pipeline": { // VTT pipeline ROI label space (unified multilabel segmentation)
         "0": "background",
         "1": "remaining_body",
         "2": "kidney",
@@ -157,5 +155,27 @@
         "6": "heart",
         "7": "salivary_glands",
         "8": "synthetic_lesion"
+    },
+    "VTT_allowed_rois": [
+        "kidney",
+        "liver",
+        "prostate",
+        "spleen",
+        "heart",
+        "salivary_glands"
+    ],
+    "VTT_to_totseg": {
+        "kidney":          {"task": "total",               "totseg_rois": ["kidney_left", "kidney_right"]},
+        "liver":           {"task": "total",               "totseg_rois": ["liver"]},
+        "prostate":        {"task": "total",               "totseg_rois": ["prostate"]},
+        "spleen":          {"task": "total",               "totseg_rois": ["spleen"]},
+        "heart":           {"task": "total",               "totseg_rois": ["heart"]},
+        "salivary_glands": {"task": "head_glands_cavities","totseg_rois": [
+            "parotid_gland_left",
+            "parotid_gland_right",
+            "submandibular_gland_left",
+            "submandibular_gland_right"
+        ]},
+        "remaining_body":  {"task": "body",                "totseg_rois": []}
     }
 }

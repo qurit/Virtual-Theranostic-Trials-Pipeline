@@ -55,8 +55,9 @@ const CLI_FLAGS = [
   {key:'dosimetry',  label:'Dosimetry',         desc:'Run OpenGATE Monte Carlo absorbed-dose simulation (Phase 2)'},
   {key:'postprocess',label:'Post-Processing',   desc:'Apply TAC weighting, Poisson noise, OSEM reconstruction (Phase 3)'},
   {key:'logging_on', label:'Logging',           desc:"Write a detailed pipeline log file to each patient's output directory"},
-  {key:'profile',    label:'Profiling',         desc:'Sample CPU % and RAM every 2 s per stage and save profiling_CT_<index>.json in each patient output folder'},
+  {key:'profile',    label:'Profiling',         desc:'Sample per-stage pipeline CPU, RAM, and system CPU and save profiling_CT_<index>.json in each patient output folder'},
 ];
+const PROFILE_INTERVAL_OPTIONS = [0.1,0.2,0.5,1.0,2.0,3.0];
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
 // Maps each stage key to the flag that gates it (stage hidden + cleared when flag is OFF)
 const STAGE_FLAG_MAP = {
@@ -74,6 +75,31 @@ function deepSet(obj,path,value){
   const out=JSON.parse(JSON.stringify(obj));let cur=out;
   for(let i=0;i<path.length-1;i++) cur=cur[path[i]];
   cur[path[path.length-1]]=value;return out;
+}
+function validateProfileInterval(value){
+  return typeof value==='number' && Number.isFinite(value) && value>=0.1 && value<=3.0;
+}
+function validateXyzSpacingRule(xyz,nativeSpacing){
+  const issues=[];
+  if(xyz===null||xyz===undefined) return issues;
+  if(!Array.isArray(xyz)||xyz.length!==3){
+    issues.push('must be null or [XY, XY, Z]');
+    return issues;
+  }
+  const nums=xyz.map(v=>Number(v));
+  if(nums.some(v=>!Number.isFinite(v)||v<=0)){
+    issues.push('must contain positive numeric values');
+    return issues;
+  }
+  if(Math.abs(nums[0]-nums[1])>1e-6) issues.push('must use the same value for X and Y');
+  if(Array.isArray(nativeSpacing)&&nativeSpacing.length>=3){
+    const nativeXyMin=Math.max(nativeSpacing[0],nativeSpacing[1]);
+    if(nums[0]<nativeXyMin-1e-6||nums[1]<nativeXyMin-1e-6)
+      issues.push(`XY must be >= ${nativeXyMin.toFixed(4)} mm (native in-plane minimum)`);
+    if(nums[2]<nativeSpacing[2]-1e-6)
+      issues.push(`Z must be >= ${nativeSpacing[2].toFixed(4)} mm (native)`);
+  }
+  return issues;
 }
 // Strip ANSI escape codes so terminal output is clean
 function stripAnsi(str){
@@ -144,7 +170,7 @@ function Page1Welcome({onNext}){
 }
 
 // ─── Page 2 ───────────────────────────────────────────────────────────────────
-function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,onNext,onBack}){
+function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,patientSpacings,setPatientSpacings,onNext,onBack}){
   const [folderPath,setFolderPath]=useState('');
   const [typedPath,setTypedPath]=useState('');
   const [picking,setPicking]=useState(false);
@@ -155,7 +181,7 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,onNex
   // Shared scan logic — calls /api/scan-directory for any resolved path.
   const scanDirectory=async(path)=>{
     setScanning(true);setError('');
-    setPatients([]);setPreviews({});setPatientShapes({});
+    setPatients([]);setPreviews({});setPatientShapes({});setPatientSpacings({});
     try{
       const sres=await apiFetch('/api/scan-directory',{method:'POST',body:JSON.stringify({path})});
       if(!sres.ok){const err=await sres.json();setError(err.detail||'Scan failed');setScanning(false);return;}
@@ -192,6 +218,7 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,onNex
       const data=await res.json();
       setPreviews(prev=>({...prev,[patient.name]:{...data,loading:false}}));
       if(data.shape) setPatientShapes(prev=>({...prev,[patient.name]:data.shape}));
+      if(data.spacing) setPatientSpacings(prev=>({...prev,[patient.name]:data.spacing}));
     }catch(e){setPreviews(prev=>({...prev,[patient.name]:{error:e.message}}));}
   };
   const busy=picking||scanning;
@@ -201,7 +228,7 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,onNex
         <button onClick={onBack} className="text-slate-400 hover:text-slate-600 text-sm flex items-center gap-1">← Back</button>
         <h2 className="text-2xl font-bold text-slate-900">Select CT Input Folder</h2>
       </div>
-      <p className="text-slate-500 text-sm mb-6">Each top-level item is one patient — a DICOM subfolder or a <code className="bg-slate-100 px-1 rounded">.nii/.nii.gz</code> file.</p>
+      <p className="text-slate-500 text-sm mb-6">Each top-level DICOM subfolder or <code className="bg-slate-100 px-1 rounded">.nii/.nii.gz</code> file is treated as one patient. Unsupported top-level entries are ignored.</p>
       <div className="mb-6">
         <div className="flex items-center gap-4 mb-3">
           <button onClick={pickAndScan} disabled={busy}
@@ -299,56 +326,130 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,onNex
   );
 }
 
-// ─── XyzDimFieldInner ─────────────────────────────────────────────────────────
-function XyzDimFieldInner({value,onChange,desc,patientShape}){
-  const initNull=value===null||value===undefined;
-  const initXyz=(Array.isArray(value)&&value.length>=3)?[String(value[0]),String(value[1]),String(value[2])]:['','',''];
-  const [isNull,setIsNull]=useState(initNull);
-  const [xyz,setXyz]=useState(initXyz);
-  const [errors,setErrors]=useState(['','','']);
+// ─── XyzSpacingField ─────────────────────────────────────────────────────────
+function XyzSpacingField({value,path,patientName,onChange,desc,nativeSpacing,patientShape}){
+  const buildState=val=>{
+    const isNull=val===null||val===undefined;
+    const arr=Array.isArray(val)&&val.length>=3?val:null;
+    return{
+      isNull,
+      xy:arr?String(arr[0]):'',
+      z:arr?String(arr[2]):'',
+      mismatch:!!(arr&&Math.abs(Number(arr[0])-Number(arr[1]))>1e-6),
+    };
+  };
+  const init=buildState(value);
+  const [isNull,setIsNull]=useState(init.isNull);
+  const [xy,setXy]=useState(init.xy);
+  const [z,setZ]=useState(init.z);
+  const [errors,setErrors]=useState({xy:'',z:''});
+  const [loadedMismatch,setLoadedMismatch]=useState(init.mismatch);
   const [showDesc,setShowDesc]=useState(false);
-  const ax=['X','Y','Z'];
-  const validate=(idx,val)=>{
+  const nativeXyMin=nativeSpacing?Math.max(nativeSpacing[0],nativeSpacing[1]):null;
+
+  useEffect(()=>{
+    const next=buildState(value);
+    setIsNull(next.isNull);
+    setXy(next.xy);
+    setZ(next.z);
+    setLoadedMismatch(next.mismatch);
+    setErrors({xy:'',z:''});
+  },[value]);
+
+  const validateXY=val=>{
     if(val==='')return'Required';
-    const n=parseInt(val,10);
-    if(isNaN(n)||n<=0)return'Positive integer required';
-    if(patientShape&&n>=patientShape[idx])return`Must be < ${patientShape[idx]}`;
+    const n=parseFloat(val);
+    if(isNaN(n)||n<=0)return'Must be a positive number';
+    if(nativeXyMin!=null&&n<nativeXyMin-1e-6)return`Must be >= ${nativeXyMin.toFixed(4)} mm (native XY minimum)`;
     return'';
   };
-  const change=(idx,val)=>{const nx=xyz.map((v,i)=>i===idx?val:v);setXyz(nx);setErrors(errors.map((e,i)=>i===idx?validate(idx,val):e));};
-  const blur=(idx)=>{const e=validate(idx,xyz[idx]);const ne=errors.map((x,i)=>i===idx?e:x);setErrors(ne);if(ne.every(e=>!e)&&xyz.every(v=>v!==''))onChange(xyz.map(v=>parseInt(v,10)));};
-  const toggleNull=(c)=>{setIsNull(c);if(c){onChange(null);setErrors(['','','']);}else setXyz(['','','']);};
+  const validateZ=val=>{
+    if(val==='')return'Required';
+    const n=parseFloat(val);
+    if(isNaN(n)||n<=0)return'Must be a positive number';
+    if(nativeSpacing&&n<nativeSpacing[2]-1e-6)return`Must be >= ${nativeSpacing[2].toFixed(4)} mm (native)`;
+    return'';
+  };
+  const commit=(nextXy,nextZ)=>{
+    const nextErrors={xy:validateXY(nextXy),z:validateZ(nextZ)};
+    setErrors(nextErrors);
+    if(!nextErrors.xy&&!nextErrors.z&&nextXy!==''&&nextZ!==''){
+      setLoadedMismatch(false);
+      onChange(patientName,path,[parseFloat(nextXy),parseFloat(nextXy),parseFloat(nextZ)]);
+    }
+  };
+  const changeXy=val=>{setXy(val);setErrors(prev=>({...prev,xy:validateXY(val)}));};
+  const changeZ=val=>{setZ(val);setErrors(prev=>({...prev,z:validateZ(val)}));};
+  const toggleNull=(checked)=>{
+    setIsNull(checked);
+    if(checked){
+      onChange(patientName,path,null);
+      setErrors({xy:'',z:''});
+      setLoadedMismatch(false);
+    }else{
+      setXy(nativeXyMin!=null?nativeXyMin.toFixed(4):'');
+      setZ(nativeSpacing?nativeSpacing[2].toFixed(4):'');
+      setErrors({xy:'',z:''});
+    }
+  };
   return(
     <div className="py-2 border-b border-slate-100 last:border-0">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-1.5 flex-shrink-0 pt-0.5">
-          <span className="text-sm font-medium text-slate-700">xyz_dim</span>
+          <span className="text-sm font-medium text-slate-700">xyz_spacing_mm</span>
           {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
         </div>
         <div className="flex items-start gap-3 flex-wrap justify-end">
           <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer select-none pt-1">
             <input type="checkbox" checked={isNull} onChange={e=>toggleNull(e.target.checked)} className="accent-blue-600"/>
-            null&nbsp;<span className="text-slate-400">(native CT resolution)</span>
+            null&nbsp;<span className="text-slate-400">(native CT spacing)</span>
           </label>
           {!isNull&&(
-            <div className="flex items-start gap-1.5">
-              {ax.map((a,idx)=>(
-                <div key={a} className="flex flex-col items-center gap-0.5">
-                  <div className="flex items-center gap-0.5">
-                    <span className="text-[10px] font-semibold text-slate-500 w-3.5">{a}</span>
-                    <input type="number" value={xyz[idx]} min="1" max={patientShape?patientShape[idx]-1:undefined}
-                      placeholder={patientShape?`<${patientShape[idx]}`:'…'}
-                      onChange={e=>change(idx,e.target.value)} onBlur={()=>blur(idx)}
-                      className={`w-[72px] px-1.5 py-1 text-sm border rounded-lg text-right focus:outline-none focus:ring-2
-                        ${errors[idx]?'border-red-400 focus:ring-red-300 bg-red-50':'border-slate-300 focus:ring-blue-400'}`}/>
-                  </div>
-                  {errors[idx]&&<span className="text-[9px] text-red-500 text-center leading-tight max-w-[76px]">{errors[idx]}</span>}
+            <div className="flex items-start gap-2">
+              <div className="flex flex-col items-center gap-0.5">
+                <div className="flex items-center gap-0.5">
+                  <span className="text-[10px] font-semibold text-slate-500 w-5">XY</span>
+                  <input type="text" inputMode="decimal" value={xy}
+                    placeholder={nativeXyMin!=null?`>=${nativeXyMin.toFixed(2)}`:'mm'}
+                    onChange={e=>changeXy(e.target.value)} onBlur={()=>commit(xy,z)}
+                    className={`w-[92px] px-1.5 py-1 text-sm border rounded-lg text-right focus:outline-none focus:ring-2
+                      ${errors.xy?'border-red-400 focus:ring-red-300 bg-red-50':'border-slate-300 focus:ring-blue-400'}`}/>
                 </div>
-              ))}
+                {errors.xy&&<span className="text-[9px] text-red-500 text-center leading-tight max-w-[108px]">{errors.xy}</span>}
+              </div>
+              <div className="flex flex-col items-center gap-0.5">
+                <div className="flex items-center gap-0.5">
+                  <span className="text-[10px] font-semibold text-slate-500 w-5">Z</span>
+                  <input type="text" inputMode="decimal" value={z}
+                    placeholder={nativeSpacing?`>=${nativeSpacing[2].toFixed(2)}`:'mm'}
+                    onChange={e=>changeZ(e.target.value)} onBlur={()=>commit(xy,z)}
+                    className={`w-[92px] px-1.5 py-1 text-sm border rounded-lg text-right focus:outline-none focus:ring-2
+                      ${errors.z?'border-red-400 focus:ring-red-300 bg-red-50':'border-slate-300 focus:ring-blue-400'}`}/>
+                </div>
+                {errors.z&&<span className="text-[9px] text-red-500 text-center leading-tight max-w-[108px]">{errors.z}</span>}
+              </div>
             </div>
           )}
         </div>
       </div>
+      {!isNull&&nativeSpacing&&(
+        <div className="mt-1.5 text-[10px] text-slate-400 space-y-0.5">
+          <p>Native CT spacing — X:&nbsp;{nativeSpacing[0].toFixed(4)}&nbsp;mm&nbsp;&nbsp;Y:&nbsp;{nativeSpacing[1].toFixed(4)}&nbsp;mm&nbsp;&nbsp;Z:&nbsp;{nativeSpacing[2].toFixed(4)}&nbsp;mm&nbsp;·&nbsp;XY must be the same value and must be greater than or equal to the native in-plane spacing</p>
+          {loadedMismatch&&(
+            <p className="text-amber-600">Loaded config had different X/Y spacing. Saving this field will normalize it to [XY, XY, Z].</p>
+          )}
+          {patientShape&&!errors.xy&&!errors.z&&xy!==''&&z!==''&&(()=>{
+            const xyNum=parseFloat(xy);
+            const zNum=parseFloat(z);
+            const dim=[
+              Math.round(patientShape[0]*nativeSpacing[0]/xyNum),
+              Math.round(patientShape[1]*nativeSpacing[1]/xyNum),
+              Math.round(patientShape[2]*nativeSpacing[2]/zNum),
+            ];
+            return<p className="text-slate-500">Resulting grid: {dim[0]}&nbsp;×&nbsp;{dim[1]}&nbsp;×&nbsp;{dim[2]}&nbsp;voxels (pipeline computes this automatically from physical size)</p>;
+          })()}
+        </div>
+      )}
       {showDesc&&<p className="text-xs text-slate-400 mt-1.5 leading-relaxed">{desc}</p>}
     </div>
   );
@@ -837,7 +938,7 @@ function NumProjectionsField({value,onChange,desc,opts}){
 }
 
 // ─── FieldRenderer ────────────────────────────────────────────────────────────
-function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape,systemCpuCount,lesionSpecs}){
+function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape,nativeSpacing,systemCpuCount,lesionSpecs}){
   const desc=descriptions[fieldKey]||'';
   const opts=pipelineOptions&&pipelineOptions[fieldKey];
   const [showDesc,setShowDesc]=useState(false);
@@ -854,7 +955,7 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
   );
   const DescLine=()=>showDesc?<p className="text-xs text-slate-400 pb-2 -mt-1 leading-relaxed">{desc}</p>:null;
 
-  if(fieldKey==='xyz_dim') return<XyzDimFieldInner value={value} onChange={call} desc={desc} patientShape={patientShape}/>;
+  if(fieldKey==='xyz_spacing_mm') return<XyzSpacingField value={value} path={path} patientName={patientName} onChange={onChange} desc={desc} nativeSpacing={nativeSpacing} patientShape={patientShape}/>;
   if(fieldKey==='random_seed') return<RandomSeedField value={value} onChange={call} desc={desc}/>;
   if(fieldKey==='num_cpu') return<NumCpuField value={value} onChange={call} desc={desc} systemCpuCount={systemCpuCount}/>;
   if(fieldKey==='NumProjections') return<NumProjectionsField value={value} onChange={call} desc={desc} opts={opts}/>;
@@ -939,15 +1040,19 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
 }
 
 // ─── StageSection ─────────────────────────────────────────────────────────────
-function StageSection({stageKey,stageData,basePath,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape,systemCpuCount,lesionSpecs}){
+function StageSection({stageKey,stageData,basePath,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape,nativeSpacing,systemCpuCount,lesionSpecs}){
   const [open,setOpen]=useState(false);
   const isSpectPost=stageKey==='spect_postprocess_stage';
   const isSynLesion=stageKey==='synthetic_lesions_stage';
-  const entries=Object.entries(stageData).filter(([k])=>
+  const isOpengate=stageKey==='opengate_stage';
+  let entries=Object.entries(stageData).filter(([k])=>
     !DEVELOPER_FIELDS.has(k)&&
     !(isSpectPost&&(k==='FrameStartTimes'||k==='FrameDurations'))&&
     !(isSynLesion&&k==='specs')
   );
+  if(isOpengate&&entries.some(([k])=>k==='xyz_spacing_mm')){
+    entries=[...entries.filter(([k])=>k==='xyz_spacing_mm'),...entries.filter(([k])=>k!=='xyz_spacing_mm')];
+  }
   return(
     <div className="border border-slate-100 rounded-lg overflow-hidden">
       <button onClick={()=>setOpen(o=>!o)}
@@ -970,7 +1075,7 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
                       <FieldRenderer key={sk} fieldKey={sk} value={sv} path={[...fPath,sk]}
                         patientName={patientName} onChange={onChange} descriptions={descriptions}
                         pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}
-                        systemCpuCount={systemCpuCount} lesionSpecs={lesionSpecs}/>
+                        nativeSpacing={nativeSpacing} systemCpuCount={systemCpuCount} lesionSpecs={lesionSpecs}/>
                     ))}
                   </div>
                 </div>
@@ -979,7 +1084,7 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
             return<FieldRenderer key={k} fieldKey={k} value={v} path={fPath}
               patientName={patientName} onChange={onChange} descriptions={descriptions}
               pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}
-              systemCpuCount={systemCpuCount} lesionSpecs={lesionSpecs}/>;
+              nativeSpacing={nativeSpacing} systemCpuCount={systemCpuCount} lesionSpecs={lesionSpecs}/>;
           })}
           {isSynLesion&&'specs' in stageData&&(
             <SpecsEditor value={stageData.specs}
@@ -998,7 +1103,7 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
 }
 
 // ─── PhaseSection ─────────────────────────────────────────────────────────────
-function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,phase1RoiSubset,patientShape,flags,systemCpuCount,lesionSpecs}){
+function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,phase1RoiSubset,patientShape,nativeSpacing,flags,systemCpuCount,lesionSpecs}){
   const [open,setOpen]=useState(false);
   const stages=Object.entries(phaseData).filter(([k,v])=>{
     if(k==='sub_dir_name'||typeof v!=='object'||v===null) return false;
@@ -1028,7 +1133,7 @@ function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipe
               descriptions={descriptions} pipelineOptions={pipelineOptions}
               // segmentation_stage sees full choices; everything else is constrained
               roiChoices={sk==='segmentation_stage'?roiChoices:constrained}
-              patientShape={patientShape} systemCpuCount={systemCpuCount}
+              patientShape={patientShape} nativeSpacing={nativeSpacing} systemCpuCount={systemCpuCount}
               lesionSpecs={lesionSpecs}/>
           ))}
         </div>
@@ -1040,7 +1145,8 @@ function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipe
 // ─── Page 3 ───────────────────────────────────────────────────────────────────
 function Page3Configure({patients,projectName,setProjectName,projectDirs,setProjectDirs,
                          patientConfigs,setPatientConfigs,flags,setFlags,mode,setMode,
-                         patientShapes,systemCpuCount,onNext,onBack}){
+                         patientShapes,patientSpacings,systemCpuCount,
+                         profileIntervalS,setProfileIntervalS,onNext,onBack}){
   const [dirsCreated,setDirsCreated]=useState(Object.keys(projectDirs).length>0);
   const [creating,setCreating]=useState(false);
   const [createError,setCreateError]=useState('');
@@ -1228,6 +1334,18 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
             </label>
           ))}
         </div>
+        {flags.profile&&(
+          <div className="mb-5 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 flex items-center justify-between gap-4 flex-wrap">
+            <div>
+              <p className="text-sm font-semibold text-slate-800">Profiler Sampling Interval</p>
+              <p className="text-xs text-slate-500 mt-0.5">Choose how often CPU and RAM are sampled. Shorter intervals capture brief spikes better but add a little more overhead. Allowed range: 0.1 s to 3.0 s.</p>
+            </div>
+            <select value={String(profileIntervalS)} onChange={e=>setProfileIntervalS(parseFloat(e.target.value))}
+              className="px-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white">
+              {PROFILE_INTERVAL_OPTIONS.map(opt=><option key={opt} value={opt}>{opt} s</option>)}
+            </select>
+          </div>
+        )}
         <div className="border-t border-slate-100 pt-4 flex items-center gap-4 flex-wrap">
           <span className="text-sm font-semibold text-slate-700 flex-shrink-0">Run Mode</span>
           <div className="flex gap-2">
@@ -1265,6 +1383,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
               const cfg=patientConfigs[p.name]||configMeta.template;
               const cardOpen=!!openCards[p.name];
               const shape=patientShapes[p.name]||null;
+              const nativeSpacing=patientSpacings[p.name]||null;
               // Phase 1 segmentation roi_subset is the source of truth for all ROI constraints
               const p1RoiSubset=cfg?.phase_1?.segmentation_stage?.roi_subset??null;
               const hasPrior=!!existedDirs[p.name];
@@ -1308,6 +1427,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
                           roiChoices={roiChoices}
                           phase1RoiSubset={p1RoiSubset}
                           patientShape={shape}
+                          nativeSpacing={nativeSpacing}
                           flags={flags}
                           systemCpuCount={systemCpuCount}
                           lesionSpecs={cfg?.phase_1?.synthetic_lesions_stage?.specs||null}/>
@@ -1416,7 +1536,7 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir}){
 }
 
 // ─── Page 4 ───────────────────────────────────────────────────────────────────
-function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,onBack}){
+function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,patientSpacings,profileIntervalS,onBack}){
   const [status,setStatus]=useState('idle'); // idle | starting | launched | error
   const [errorMsg,setErrorMsg]=useState('');
   const [validation,setValidation]=useState(null);
@@ -1427,9 +1547,12 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
     const issues=[];
     if(!projectName.trim()) issues.push('Project name is empty');
     if(!patients.length)    issues.push('No patients selected');
+    if(flags.profile&&!validateProfileInterval(profileIntervalS))
+      issues.push('Profiler sampling interval must be between 0.1 s and 3.0 s');
     patients.forEach(p=>{
       if(!projectDirs[p.name]) issues.push(`Missing output directory for "${p.name}"`);
       const cfg=patientConfigs?.[p.name];
+      const nativeSpacing=patientSpacings?.[p.name]||null;
       if(!cfg) return;
       // FrameStartTimes / FrameDurations
       const fst=cfg?.phase_3?.spect_postprocess_stage?.FrameStartTimes;
@@ -1439,11 +1562,24 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
         fst.forEach((v,i)=>{if(typeof v!=='number'||isNaN(v)) issues.push(`[${p.name}] FrameStartTimes[${i}] must be a number`);});
         fd.forEach((v,i)=>{ if(typeof v!=='number'||isNaN(v)) issues.push(`[${p.name}] FrameDurations[${i}] must be a number`);});
       }
+      // Collect ROIs that have synthetic lesions
+      const specs=cfg?.phase_1?.synthetic_lesions_stage?.specs;
+      const lesionRois=specs&&typeof specs==='object'?Object.keys(specs):[];
+      const checkLesionSubset=(roi,stageName)=>{
+        if(!Array.isArray(roi)||lesionRois.length===0) return;
+        const picked=lesionRois.filter(r=>roi.includes(r));
+        const missing=lesionRois.filter(r=>!roi.includes(r));
+        if(picked.length>0&&missing.length>0)
+          issues.push(`[${p.name}] ${stageName} includes some synthetic-lesion ROIs (${picked.join(', ')}) but not all — missing: ${missing.join(', ')}. Include all or none to avoid corrupting remaining_body.`);
+      };
       // SPECT: simind must have at least one ROI selected
       if(flags.spect){
         const roi=cfg?.phase_2?.simind_stage?.roi_subset;
         if(!Array.isArray(roi)||roi.length===0)
           issues.push(`[${p.name}] SPECT is ON but no ROIs are selected in the SIMIND stage`);
+        else checkLesionSubset(roi,'SIMIND');
+        validateXyzSpacingRule(cfg?.phase_2?.simind_stage?.xyz_spacing_mm,nativeSpacing)
+          .forEach(msg=>issues.push(`[${p.name}] SIMIND xyz_spacing_mm ${msg}`));
       }
       // Post-processing + SPECT: at least one option enabled
       if(flags.postprocess&&flags.spect){
@@ -1456,10 +1592,13 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
         const roi=cfg?.phase_2?.opengate_stage?.roi_subset;
         if(!Array.isArray(roi)||roi.length===0)
           issues.push(`[${p.name}] Dosimetry is ON but no ROIs are selected in the OpenGATE stage`);
+        else checkLesionSubset(roi,'OpenGATE');
+        validateXyzSpacingRule(cfg?.phase_2?.opengate_stage?.xyz_spacing_mm,nativeSpacing)
+          .forEach(msg=>issues.push(`[${p.name}] OpenGATE xyz_spacing_mm ${msg}`));
       }
     });
     setValidation({ok:!issues.length,issues});
-  },[patientConfigs,flags,patients,projectName,projectDirs]);
+  },[patientConfigs,flags,patients,patientSpacings,profileIntervalS,projectName,projectDirs]);
 
   useEffect(()=>{
     let cancelled=false;
@@ -1502,7 +1641,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
   const startRun=async()=>{
     setStatus('starting');setErrorMsg('');
     try{
-      const res=await apiFetch('/api/run',{method:'POST',body:JSON.stringify({project_name:projectName,patients,project_dirs:projectDirs,flags,patient_configs:patientConfigs,mode})});
+      const res=await apiFetch('/api/run',{method:'POST',body:JSON.stringify({project_name:projectName,patients,project_dirs:projectDirs,flags,patient_configs:patientConfigs,mode,profile_interval_s:profileIntervalS})});
       if(!res.ok){const err=await res.json();setErrorMsg(err.detail||'Unknown server error');setStatus('error');return;}
       setStatus('launched');
     }catch(e){setErrorMsg(e.message);setStatus('error');}
@@ -1574,6 +1713,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,on
               <p>· {patients.length} patient{patients.length!==1?'s':''} queued</p>
               <p>· Mode: <span className="font-semibold">{mode}</span></p>
               <p>· Logging: <span className="font-semibold">{flags.logging_on?'On':'Off'}</span></p>
+              <p>· Profiling: <span className="font-semibold">{flags.profile?`On (${profileIntervalS} s)`:'Off'}</span></p>
             </div>
           ):(
             <ul className="space-y-1">{combinedIssues.map((iss,i)=><li key={i} className="text-sm text-red-700 whitespace-pre-line">· {iss}</li>)}</ul>
@@ -1614,11 +1754,13 @@ function App(){
   const [step,setStep]=useState(1);
   const [patients,setPatients]=useState([]);
   const [patientShapes,setPatientShapes]=useState({});
+  const [patientSpacings,setPatientSpacings]=useState({});
   const [projectName,setProjectName]=useState('');
   const [projectDirs,setProjectDirs]=useState({});
   const [patientConfigs,setPatientConfigs]=useState({});
   const [mode,setMode]=useState('PRODUCTION');
   const [flags,setFlags]=useState({spect:true,dosimetry:true,postprocess:true,logging_on:true,profile:false});
+  const [profileIntervalS,setProfileIntervalS]=useState(2.0);
   const [systemCpuCount,setSystemCpuCount]=useState(null);
 
   useEffect(()=>{
@@ -1632,17 +1774,19 @@ function App(){
         {step===1&&<Page1Welcome onNext={()=>setStep(2)}/>}
         {step===2&&<Page2CTInput patients={patients} setPatients={setPatients}
           patientShapes={patientShapes} setPatientShapes={setPatientShapes}
+          patientSpacings={patientSpacings} setPatientSpacings={setPatientSpacings}
           onNext={()=>setStep(3)} onBack={()=>setStep(1)}/>}
         {step===3&&<Page3Configure patients={patients}
           projectName={projectName} setProjectName={setProjectName}
           projectDirs={projectDirs} setProjectDirs={setProjectDirs}
           patientConfigs={patientConfigs} setPatientConfigs={setPatientConfigs}
           flags={flags} setFlags={setFlags} mode={mode} setMode={setMode}
-          patientShapes={patientShapes} systemCpuCount={systemCpuCount}
+          profileIntervalS={profileIntervalS} setProfileIntervalS={setProfileIntervalS}
+          patientShapes={patientShapes} patientSpacings={patientSpacings} systemCpuCount={systemCpuCount}
           onNext={()=>setStep(4)} onBack={()=>setStep(2)}/>}
         {step===4&&<Page4Run patients={patients} projectName={projectName}
           projectDirs={projectDirs} flags={flags} mode={mode}
-          patientConfigs={patientConfigs}
+          patientConfigs={patientConfigs} patientSpacings={patientSpacings} profileIntervalS={profileIntervalS}
           onBack={()=>setStep(3)}/>}
       </div>
     </div>

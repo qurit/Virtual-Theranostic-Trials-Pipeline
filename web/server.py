@@ -19,10 +19,7 @@ POST /api/create-output-dirs        Create per-patient output dirs and write bas
 POST /api/save-patient-config       Inject developer fields and save config to an output dir
 GET  /api/load-patient-config       Load existing config.json for rerun auto-fill
 GET  /api/check-completion          Check which pipeline stages have already produced output
-POST /api/run                       Start a pipeline run → run_id
-POST /api/runs/{run_id}/stop        Kill a running pipeline run
-GET  /api/runs/{run_id}             Poll run status / timing
-WS   /ws/{run_id}                   Stream live logs for a run
+POST /api/run                       Save configs, write pending-jobs file, shut down server
 """
 from __future__ import annotations
 
@@ -35,20 +32,20 @@ import shutil
 import sys
 import tempfile
 import time
-import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from starlette.requests import ClientDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.io.config_paths import inject_pipeline_paths, load_pipeline_paths, strip_developer_fields
+from src.io.profiler import validate_profile_interval_s
 from src.io.rerun_guard import (
     STAGE_LABELS,
     build_ct_identity,
@@ -78,42 +75,10 @@ MAIN_PY           = REPO_ROOT / "main.py"
 VTT_MAP           = REPO_ROOT / "src" / "data" / "vtt_map.json"
 PIPELINE_OPTIONS  = REPO_ROOT / "src" / "data" / "pipeline_options.json"
 
-RUN_TTL_SECONDS = 6 * 60 * 60
-RUN_PRUNE_INTERVAL_SECONDS = 10 * 60
-MAX_FINISHED_RUNS = 200
-UPLOAD_TTL_SECONDS = 7 * 24 * 60 * 60   # delete upload dirs older than 7 days
+UPLOAD_TTL_SECONDS = 7 * 24 * 60 * 60
 
-# In-memory registry: run_id → run dict
-_runs: Dict[str, Dict[str, Any]] = {}
-
-
-def _prune_finished_runs(now: float | None = None) -> None:
-    """Drop expired finished runs and cap retained history."""
-    now = time.time() if now is None else now
-    removable_ids: List[str] = []
-    finished_runs: List[tuple[float, str]] = []
-
-    for run_id, run in _runs.items():
-        if run.get("status") not in {"done", "error"}:
-            continue
-
-        end_time = float(run.get("end_time") or run.get("start_time") or now)
-        if now - end_time > RUN_TTL_SECONDS:
-            removable_ids.append(run_id)
-            continue
-
-        finished_runs.append((end_time, run_id))
-
-    for run_id in removable_ids:
-        _runs.pop(run_id, None)
-
-    if len(finished_runs) <= MAX_FINISHED_RUNS:
-        return
-
-    finished_runs.sort(key=lambda item: item[0])
-    overflow = len(finished_runs) - MAX_FINISHED_RUNS
-    for _, run_id in finished_runs[:overflow]:
-        _runs.pop(run_id, None)
+# Written by /api/run; read by run_server.py after uvicorn exits to exec main.py.
+_PENDING_FILE = REPO_ROOT / ".vtt_pending_run.json"
 
 
 def _prune_old_uploads(now: float | None = None) -> None:
@@ -133,29 +98,18 @@ def _prune_old_uploads(now: float | None = None) -> None:
             pass
 
 
-async def _run_registry_janitor() -> None:
-    """Periodically prune expired finished runs and stale upload dirs."""
-    while True:
-        await asyncio.sleep(RUN_PRUNE_INTERVAL_SECONDS)
-        _prune_finished_runs()
-        _prune_old_uploads()
-
 # ── App ────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
-    janitor_task = asyncio.create_task(_run_registry_janitor())
-    try:
-        yield
-    finally:
-        janitor_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await janitor_task
+    _prune_old_uploads()
+    yield
 
 app = FastAPI(title="Virtual Theranostic Trials", lifespan=lifespan)
 
 
 # ── Static / SPA ──────────────────────────────────────────────────────────────
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -199,7 +153,7 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "isotope": "Radionuclide for PBPK and simulation. Currently only 'lu177' (Lutetium-177) is supported",
     "VOIs": "PBPK volumes of interest to model. These are PyCNO observable names. Must cover all segmented ROIs",
     "Randomization_Kidney_SG_Para": "Randomize kidney and salivary-gland PBPK parameters via lognormal sampling — simulates patient-to-patient variability",
-    "xyz_spacing_mm": "Target voxel spacing in mm as [sx, sy, sz]. Each value must be >= the native CT spacing on that axis (only coarser grids allowed). The pipeline logs the native CT spacing at runtime. Null = native CT resolution (no downsampling).",
+    "xyz_spacing_mm": "Target voxel spacing in mm as [sxy, sxy, sz]. X and Y must match. XY must be >= both native in-plane spacings; Z must be >= the native CT z-spacing (only coarser grids allowed). The pipeline logs the native CT spacing at runtime. Null = native CT resolution (no downsampling).",
     "Collimator": "SIMIND collimator code (e.g. 'si-me' = Siemens medium-energy parallel-hole). Must match your SIMIND install",
     "Isotope": "Isotope code for SIMIND collimator lookup (e.g. 'lu177')",
     "NumProjections": "Number of SPECT angular projection views. Minimum: 64 — fewer causes angular undersampling and streak artifacts in OSEM reconstruction. Rule: Subsets × Iterations must not exceed NumProjections.",
@@ -266,13 +220,13 @@ async def get_config_template() -> Dict:
     # SIMINDDirectory, etc.) — these come from pipeline_paths.json, not from the user.
     data = strip_developer_fields(data)
 
-    # Load ROI choices from the shared label map (TDT_Pipeline section, excluding reserved labels)
+    # Load ROI choices from the shared label map (VTT_Pipeline section, excluding reserved labels)
     _RESERVED = {"background", "remaining_body", "synthetic_lesion"}
     try:
         tdt_raw = VTT_MAP.read_text(encoding="utf-8")
         tdt_map = json.loads(json_minify(tdt_raw))
         roi_choices = [
-            name for name in tdt_map.get("TDT_Pipeline", {}).values()
+            name for name in tdt_map.get("VTT_Pipeline", tdt_map.get("TDT_Pipeline", {})).values()
             if name not in _RESERVED
         ]
     except Exception:
@@ -685,7 +639,7 @@ def _validate_patient_rerun(
     seg_cfg = config_full["phase_1"]["segmentation_stage"]
     seg_prefix = seg_cfg["file_prefix"]
     seg_stage_dir = phase1_dir / "segmentation_stage"
-    expected_tdt_handoff = (
+    expected_vtt_handoff = (
         phase1_dir / "digital_twin.nii.gz"
         if synthetic_enabled
         else seg_stage_dir / f"{seg_cfg['unification_prefix']}.nii.gz"
@@ -780,7 +734,7 @@ def _validate_patient_rerun(
             )
         simind_deps = {
             "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
-            "tdt_roi_seg": fingerprint_optional_file(expected_tdt_handoff),
+            "vtt_roi_seg": fingerprint_optional_file(expected_vtt_handoff),
             "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(output_dir, "segmentation_stage")
@@ -816,7 +770,7 @@ def _validate_patient_rerun(
             og_markers.append(og_work / f"{og_prefix}_unc_{roi_name}.nii.gz")
         og_deps = {
             "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
-            "tdt_roi_seg": fingerprint_optional_file(expected_tdt_handoff),
+            "vtt_roi_seg": fingerprint_optional_file(expected_vtt_handoff),
             "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(output_dir, "segmentation_stage")
@@ -1166,7 +1120,7 @@ def _load_preview_slices(path: str, ct_type: str) -> Dict:
         sagittal = _resize_to_physical(sagittal, ny * dy, nz * dz)
 
         return {"axial": axial, "coronal": coronal, "sagittal": sagittal,
-                "shape": [nx, ny, nz]}
+                "shape": [nx, ny, nz], "spacing": [dx, dy, dz]}
 
     # ── DICOM ──────────────────────────────────────────────────────────────
     # Try SimpleITK — it uses a streaming reader and is much faster than
@@ -1216,8 +1170,9 @@ def _load_preview_slices(path: str, ct_type: str) -> Dict:
         coronal  = _resize_to_physical(coronal,  nx_px * sx, nz_s * sz_eff)
         sagittal = _resize_to_physical(sagittal, ny_px * sy, nz_s * sz_eff)
 
+        sz_actual = sz_eff / max(1, N)
         return {"axial": axial, "coronal": coronal, "sagittal": sagittal,
-                "shape": [nx_px, ny_px, nz]}
+                "shape": [nx_px, ny_px, nz], "spacing": [sx, sy, sz_actual]}
     except Exception:
         pass
 
@@ -1230,12 +1185,18 @@ def _load_preview_slices(path: str, ct_type: str) -> Dict:
     if not ffiles:
         raise RuntimeError(f"No DICOM files found in {path}")
 
-    nz = len(ffiles)
+    header_pairs = [(f, pydicom.dcmread(f, stop_before_pixels=True)) for f in ffiles]
 
-    def _z(f):
-        ds = pydicom.dcmread(f, stop_before_pixels=True)
-        return float(getattr(ds, "ImagePositionPatient", [0, 0, 0])[2])
-    ffiles.sort(key=_z)
+    def _header_z(ds):
+        try:
+            return float(getattr(ds, "ImagePositionPatient", [0.0, 0.0, 0.0])[2])
+        except Exception:
+            return 0.0
+
+    header_pairs.sort(key=lambda pair: _header_z(pair[1]))
+    ffiles = [f for f, _ in header_pairs]
+    headers = [ds for _, ds in header_pairs]
+    nz = len(ffiles)
 
     # Axial: only the middle file
     mid_ds = pydicom.dcmread(ffiles[nz // 2])
@@ -1249,9 +1210,24 @@ def _load_preview_slices(path: str, ct_type: str) -> Dict:
         sx, sy = float(ps[1]), float(ps[0])   # [row_spacing, col_spacing] → (x, y)
     except Exception:
         sx = sy = 1.0
+
+    sz_orig = None
     try:
-        sz_orig = float(mid_ds.SliceThickness)
+        z_positions = [_header_z(ds) for ds in headers]
+        z_diffs = [abs(b - a) for a, b in zip(z_positions, z_positions[1:]) if abs(b - a) > 1e-6]
+        if z_diffs:
+            sz_orig = float(np.median(z_diffs))
     except Exception:
+        sz_orig = None
+    if not sz_orig or sz_orig <= 0:
+        for attr in ("SpacingBetweenSlices", "SliceThickness"):
+            try:
+                sz_orig = float(getattr(mid_ds, attr))
+            except Exception:
+                continue
+            if sz_orig > 0:
+                break
+    if not sz_orig or sz_orig <= 0:
         sz_orig = 1.0
 
     # Coronal + sagittal: subsample (max 64 slices)
@@ -1268,7 +1244,7 @@ def _load_preview_slices(path: str, ct_type: str) -> Dict:
     sagittal = _resize_to_physical(sagittal, ny_px * sy, nz_s * sz_eff)
 
     return {"axial": axial, "coronal": coronal, "sagittal": sagittal,
-            "shape": [nx_px, ny_px, nz]}
+            "shape": [nx_px, ny_px, nz], "spacing": [sx, sy, sz_orig]}
 
 
 @app.post("/api/preview-ct")
@@ -1284,6 +1260,7 @@ async def preview_ct(req: PreviewRequest) -> Dict:
             "coronal":   _arr_to_png_b64(slices["coronal"]),
             "sagittal":  _arr_to_png_b64(slices["sagittal"]),
             "shape":     slices["shape"],
+            "spacing":   slices.get("spacing"),
             "height_m":  hw["height_m"],
             "weight_kg": hw["weight_kg"],
             "missing":   hw["missing"],
@@ -1302,32 +1279,34 @@ class RunRequest(BaseModel):
     flags: Dict[str, bool]
     patient_configs: Optional[Dict[str, Dict[str, Any]]] = None
     mode: str = "PRODUCTION"
+    profile_interval_s: float = 2.0
 
 
-def _fmt_duration(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    parts: List[str] = []
-    if h:
-        parts.append(f"{h} hr{'s' if h != 1 else ''}")
-    if m:
-        parts.append(f"{m} min")
-    parts.append(f"{s} sec")
-    return " ".join(parts)
+async def _shutdown_after_delay() -> None:
+    await asyncio.sleep(0.5)
+    os.kill(os.getpid(), signal.SIGINT)
+
 
 @app.post("/api/run")
 async def start_run(req: RunRequest) -> Dict:
     """
-    Launch the pipeline for each patient using pre-created output directories.
-
-    Each patient gets its own main.py call with:
-    - A single-patient temp symlink dir as --input_ct_dir
-    - The patient's config.json from its output dir as --config_file
-    - --ct_index_start {i}  so output folder naming matches what the web UI created
+    Save configs, write a pending-jobs file, then shut down the server.
+    run_server.py picks up the pending file after uvicorn exits and runs
+    each patient's main.py command directly in the terminal with inherited
+    stdio — identical to the CLI experience.
     """
     if not req.patients:
         raise HTTPException(400, "No patients provided.")
+
+    # Save patient configs sent by the UI (in case /api/save-patient-config wasn't called).
+    if req.patient_configs:
+        for patient in req.patients:
+            nm = patient["name"]
+            cfg = req.patient_configs.get(nm)
+            out_dir = Path(req.project_dirs.get(nm, ""))
+            if cfg and out_dir.is_dir():
+                full_cfg = inject_pipeline_paths(cfg, repo_root=REPO_ROOT, include_input_paths=False)
+                (out_dir / "config.json").write_text(json.dumps(full_cfg, indent=2))
 
     conflicts_by_patient = _validate_reruns_for_request(
         patients=req.patients,
@@ -1346,10 +1325,31 @@ async def start_run(req: RunRequest) -> Dict:
             + "\n".join(summary_lines),
         )
 
-    _prune_finished_runs()
-    run_id = str(uuid.uuid4())[:8]
+    if req.flags.get("profile", False):
+        try:
+            validate_profile_interval_s(float(req.profile_interval_s))
+        except ValueError:
+            raise HTTPException(
+                400,
+                "profile_interval_s must be between 0.1 and 3.0 seconds when profiling is enabled.",
+            )
 
-    # Build one job per patient — pass the CT path directly, no temp dirs or symlinks.
+    flag_map = {
+        "spect": "--spect",
+        "dosimetry": "--dosimetry",
+        "postprocess": "--postprocess",
+        "logging_on": "--logging_on",
+        "save_config": "--save_config",
+        "profile": "--profile",
+    }
+    flag_args: List[str] = []
+    for key, cli_flag in flag_map.items():
+        val = req.flags.get(key, False)
+        if val:
+            flag_args.append(cli_flag)
+        elif key == "logging_on":
+            flag_args.append("--no-logging_on")
+
     jobs = []
     for i, patient in enumerate(req.patients, start=1):
         nm = patient["name"]
@@ -1359,7 +1359,6 @@ async def start_run(req: RunRequest) -> Dict:
 
         ct_path = Path(patient["path"])
         if not ct_path.exists():
-            # Fall back to the CT copy saved in the output folder on a previous run.
             candidate = out_dir / ct_path.name
             if candidate.exists():
                 ct_path = candidate
@@ -1371,210 +1370,18 @@ async def start_run(req: RunRequest) -> Dict:
                     "Please re-upload or re-scan the CT directory.",
                 )
 
-        jobs.append({
-            "ct_path": str(ct_path),
-            "config": str(out_dir / "config.json"),
-            "ct_index_start": i,
-            "patient_name": nm,
-        })
+        cmd = [
+            sys.executable, "-u", str(MAIN_PY),
+            "--config_file", str(out_dir / "config.json"),
+            "--input_ct", str(ct_path),
+            "--mode", req.mode,
+            "--ct_index_start", str(i),
+            "--launched_via", "web_ui",
+        ] + flag_args
+        if req.flags.get("profile", False):
+            cmd.extend(["--profile_interval_s", str(float(req.profile_interval_s))])
+        jobs.append({"cmd": cmd, "patient_name": nm})
 
-    _runs[run_id] = {
-        "status": "pending",
-        "jobs": jobs,
-        "flags": req.flags,
-        "mode": req.mode,
-        "logs": [],
-        "start_time": time.time(),
-        "end_time": None,
-        "total_patients": len(req.patients),
-        "patient_times": {},
-        "output_title": req.project_name,
-        "output_root": str(REPO_ROOT),
-    }
-
-    asyncio.create_task(_execute_run(run_id))
-    return {"run_id": run_id}
-
-
-async def _execute_run(run_id: str) -> None:
-    run = _runs[run_id]
-    run["status"] = "running"
-
-    def _emit(msg: str) -> None:
-        run["logs"].append(msg)
-        sys.stdout.write(msg)
-        sys.stdout.flush()
-
-    # Build flag args from the flags dict
-    flag_map = {
-        "spect": "--spect",
-        "dosimetry": "--dosimetry",
-        "postprocess": "--postprocess",
-        "logging_on": "--logging_on",
-        "save_config": "--save_config",
-        "profile": "--profile",
-    }
-    flag_args: List[str] = []
-    for key, cli_flag in flag_map.items():
-        val = run["flags"].get(key, False)
-        if val:
-            flag_args.append(cli_flag)
-        elif key in ("logging_on",):
-            flag_args.append(f"--no-{cli_flag.lstrip('-')}")
-
-    total = run["total_patients"]
-    processed = 0
-    any_failed = False
-
-    try:
-        for job in run["jobs"]:
-            nm = job["patient_name"]
-            ct_idx = job["ct_index_start"]
-            processed += 1
-            t0 = time.time()
-            run["patient_times"][nm] = {"start": t0}
-            _emit(f"[VTT] ── Processing CT_{ct_idx} ({nm}) — {processed}/{total} ──\n")
-
-            cmd = [
-                sys.executable,
-                "-u",
-                str(MAIN_PY),
-                "--config_file", job["config"],
-                "--input_ct", job["ct_path"],
-                "--mode", run["mode"],
-                "--ct_index_start", str(ct_idx),
-                "--launched_via", "web_ui",
-            ] + flag_args
-
-            _emit(f"[VTT] Command: {' '.join(cmd)}\n\n")
-
-            env = os.environ.copy()
-            env["PYTHONPATH"] = f"{REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=str(REPO_ROOT),
-                env=env,
-                start_new_session=True,
-            )
-            run["proc"] = proc
-
-            async for line in proc.stdout:
-                _emit(line.decode(errors="replace"))
-
-            await proc.wait()
-            rc = proc.returncode
-
-            if rc != 0:
-                any_failed = True
-
-            t_end = time.time()
-            pt = run["patient_times"].get(nm, {})
-            pt["end"] = t_end
-            run["patient_times"][nm] = pt
-            dt = t_end - pt.get("start", t_end)
-            status_str = "OK" if rc == 0 else f"FAILED (exit code {rc})"
-            _emit(f"\n[VTT] ── Finished CT_{ct_idx} ({nm}) — {status_str} in {_fmt_duration(dt)} ──\n\n")
-
-        run["status"] = "error" if any_failed else "done"
-    except Exception as exc:
-        _emit(f"\n[VTT ERROR] {exc}\n")
-        run["status"] = "error"
-    finally:
-        run["end_time"] = time.time()
-        _prune_finished_runs(run["end_time"])
-
-
-# ── WebSocket log streaming ────────────────────────────────────────────────────
-@app.websocket("/ws/{run_id}")
-async def ws_logs(ws: WebSocket, run_id: str) -> None:
-    await ws.accept()
-    _prune_finished_runs()
-
-    if run_id not in _runs:
-        await ws.send_text(json.dumps({"error": "Run not found"}))
-        await ws.close()
-        return
-
-    run = _runs[run_id]
-    sent = 0   # index into run["logs"] of the next unsent entry
-
-    try:
-        while True:
-            logs = run["logs"]
-
-            if sent < len(logs):
-                chunk = "".join(logs[sent:])
-                await ws.send_text(json.dumps({"type": "log", "data": chunk}))
-                sent = len(logs)
-
-            if run["status"] in ("done", "error"):
-                elapsed = (run["end_time"] or time.time()) - run["start_time"]
-                patient_times_out = {
-                    name: {
-                        **times,
-                        "duration": _fmt_duration(times["end"] - times["start"])
-                        if "end" in times else None,
-                    }
-                    for name, times in run["patient_times"].items()
-                }
-                await ws.send_text(json.dumps({
-                    "type": "done",
-                    "status": run["status"],
-                    "elapsed": elapsed,
-                    "elapsed_str": _fmt_duration(elapsed),
-                    "patient_times": patient_times_out,
-                    "output_title": run.get("output_title", ""),
-                    "output_root": run.get("output_root", ""),
-                }))
-                break
-
-            await asyncio.sleep(0.25)
-
-    except WebSocketDisconnect:
-        pass
-
-
-# ── Stop a running run ────────────────────────────────────────────────────────
-@app.post("/api/runs/{run_id}/stop")
-async def stop_run(run_id: str) -> Dict:
-    _prune_finished_runs()
-    if run_id not in _runs:
-        raise HTTPException(404, "Run not found")
-    run = _runs[run_id]
-    if run["status"] != "running":
-        return {"status": run["status"]}
-    proc = run.get("proc")
-    if proc and proc.returncode is None:
-        try:
-            # Kill the entire process group so SIMIND/OpenGATE grandchildren
-            # are also terminated (start_new_session=True gives them their own pgid).
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            with suppress(Exception):
-                proc.kill()
-    run["logs"].append("\n[VTT] Run stopped by user.\n")
-    run["status"] = "error"
-    run["end_time"] = time.time()
-    _prune_finished_runs(run["end_time"])
-    return {"status": "stopped"}
-
-
-# ── Run status (for polling fallback) ─────────────────────────────────────────
-@app.get("/api/runs/{run_id}")
-async def get_run_status(run_id: str) -> Dict:
-    _prune_finished_runs()
-    if run_id not in _runs:
-        raise HTTPException(404, "Run not found")
-    run = _runs[run_id]
-    elapsed = time.time() - run["start_time"]
-    return {
-        "run_id": run_id,
-        "status": run["status"],
-        "elapsed": elapsed,
-        "elapsed_str": _fmt_duration(elapsed),
-        "total_patients": run["total_patients"],
-        "patient_times": run["patient_times"],
-    }
+    _PENDING_FILE.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+    asyncio.create_task(_shutdown_after_delay())
+    return {"ok": True}

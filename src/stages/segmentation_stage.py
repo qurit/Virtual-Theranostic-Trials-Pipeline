@@ -21,7 +21,7 @@ On success, this stage sets:
 - context.total_ml_path : Optional[str]  (None if not required by requested ROIs)
 - context.head_glands_cavities_ml_path : Optional[str]  (None if not required)
 - context.totseg_plan : dict  (which tasks ran, which roi_subsets were passed to TotalSegmentator)
-- context.tdt_roi_seg_path : str  (path to unified multilabel NIfTI handoff)
+- context.vtt_roi_seg_path : str  (path to unified multilabel NIfTI handoff)
 """
 
 from __future__ import annotations
@@ -55,36 +55,19 @@ from src.utils.nifti_utils import load_int_seg
 torch.GradScaler = _GradScaler
 
 
-# User-facing ROI names supported by this pipeline stage.
-# "remaining_body" is NOT listed here — it is auto-added by the pipeline and
-# is never shown or selected by the user.
-TDT_ALLOWED_ROIS = {
-    "kidney",
-    "liver",
-    "prostate",
-    "spleen",
-    "heart",
-    "salivary_glands",
-}
-
-# Maps each TDT ROI name to the TotalSegmentator (task, roi_subset) it requires.
-# "remaining_body" maps to the TotalSegmentator "body" task (patient outline).
-TDT_TO_TOTSEG = {
-    "kidney":          ("total", ["kidney_left", "kidney_right"]),
-    "liver":           ("total", ["liver"]),
-    "prostate":        ("total", ["prostate"]),
-    "spleen":          ("total", ["spleen"]),
-    "heart":           ("total", ["heart"]),
-    "salivary_glands": ("head_glands_cavities", [
-        "parotid_gland_left",
-        "parotid_gland_right",
-        "submandibular_gland_left",
-        "submandibular_gland_right",
-    ]),
-    "remaining_body":  ("body", []),
-}
-
 CTInputType = Literal["nii", "dicom"]
+
+
+def _nifti_gz_intact(path: str) -> bool:
+    """Return True if a .nii.gz file can be fully decompressed without error."""
+    import gzip
+    try:
+        with gzip.open(path, "rb") as f:
+            while f.read(1 << 20):
+                pass
+        return True
+    except (EOFError, OSError):
+        return False
 
 
 class TotSegPlan(TypedDict):
@@ -94,16 +77,16 @@ class TotSegPlan(TypedDict):
     run_head_glands_cavities: bool
     total_roi_subset: List[str]   # TotalSegmentator ROI names for the total task
     head_roi_subset: List[str]    # TotalSegmentator ROI names for head_glands_cavities task
-    tdt_roi_subset: List[str]     # User-facing TDT ROI names (passed in from config)
+    vtt_roi_subset: List[str]     # User-facing VTT ROI names (passed in from config)
 
 
-class SegmentationStage:                                                               
+class SegmentationStage:
     """
-    TDT Stage: TotalSegmentator segmentation + ROI unification.
+    VTT segmentation stage: TotalSegmentator + ROI unification.
 
     Always runs the `body` task (used downstream as a patient mask for all ROI operations).
     The `total` and `head_glands_cavities` tasks run only if needed by the requested ROIs.
-    After segmentation, combines outputs into a single multilabel volume in TDT label space.
+    After segmentation, combines outputs into a single multilabel volume in VTT label space.
 
     Parameters
     ----------
@@ -149,16 +132,20 @@ class SegmentationStage:
         with open(self.ts_map_path, encoding="utf-8") as f: 
             ts_map_json: Dict[str, Dict[str, str]] = json.loads(json_minify(f.read())) 
 
-        # Convert all JSON maps from {str(id): name} to {name: int(id)} for lookup. 
-        self.total_name2id: Dict[str, int] = { 
-            name: int(lab) for lab, name in ts_map_json["total"].items() 
-        } 
-        self.head_name2id: Dict[str, int] = { 
-            name: int(lab) for lab, name in ts_map_json["head_glands_cavities"].items() 
-        } 
-        self.tdt_name2id: Dict[str, int] = { 
-            name: int(lab) for lab, name in ts_map_json["TDT_Pipeline"].items() 
-        } 
+        # Convert all JSON maps from {str(id): name} to {name: int(id)} for lookup.
+        self.total_name2id: Dict[str, int] = {
+            name: int(lab) for lab, name in ts_map_json["total"].items()
+        }
+        self.head_name2id: Dict[str, int] = {
+            name: int(lab) for lab, name in ts_map_json["head_glands_cavities"].items()
+        }
+        self.vtt_name2id: Dict[str, int] = {
+            name: int(lab) for lab, name in ts_map_json["VTT_Pipeline"].items()
+        }
+        # VTT_allowed_rois and VTT_to_totseg live in vtt_map.json — loaded here so
+        # the stage has no hardcoded ROI or TotalSegmentator coupling.
+        self.vtt_allowed_rois: set = set(ts_map_json["VTT_allowed_rois"])
+        self.vtt_to_totseg: Dict[str, Any] = ts_map_json["VTT_to_totseg"]
 
     def _rerun_config_snapshot(self, plan: TotSegPlan) -> Dict[str, Any]:
         """Return the config subset that must match for cached outputs to remain valid."""
@@ -186,7 +173,9 @@ class SegmentationStage:
         """
         self.ct_nii_path = os.path.join(self.phase_output_dir, "ct.nii.gz")
         if os.path.exists(self.ct_nii_path):
-            return
+            if _nifti_gz_intact(self.ct_nii_path):
+                return
+            os.remove(self.ct_nii_path)
 
         if os.path.isdir(self.ct_input_path):
             dicom2nifti.dicom_series_to_nifti(
@@ -224,13 +213,13 @@ class SegmentationStage:
 
         if not rois:
             raise ValueError(
-                f"roi_subset must contain at least one ROI from: {sorted(TDT_ALLOWED_ROIS)}"
+                f"roi_subset must contain at least one ROI from: {sorted(self.vtt_allowed_rois)}"
             )
 
-        invalid = [r for r in rois if r not in TDT_ALLOWED_ROIS]
+        invalid = [r for r in rois if r not in self.vtt_allowed_rois]
         if invalid:
             raise ValueError(
-                f"Invalid ROI(s): {invalid}. Allowed: {sorted(TDT_ALLOWED_ROIS)}"
+                f"Invalid ROI(s): {invalid}. Allowed: {sorted(self.vtt_allowed_rois)}"
             )
 
         total_rois: List[str] = []
@@ -239,7 +228,8 @@ class SegmentationStage:
         seen_head: set = set()
 
         for r in rois:
-            task, expanded = TDT_TO_TOTSEG[r]
+            entry = self.vtt_to_totseg[r]
+            task, expanded = entry["task"], entry["totseg_rois"]
             if task == "total":
                 for x in expanded:
                     if x not in seen_total:
@@ -257,7 +247,7 @@ class SegmentationStage:
             run_head_glands_cavities=bool(head_rois),
             total_roi_subset=total_rois,
             head_roi_subset=head_rois,
-            tdt_roi_subset=rois,
+            vtt_roi_subset=rois,
         )
 
     def _files_exist(self) -> Tuple[bool, bool, bool]:
@@ -315,7 +305,7 @@ class SegmentationStage:
         plan: TotSegPlan,                                                              
     ) -> np.ndarray:
         """
-        Build the unified TDT multilabel volume by painting ROIs in priority order.
+        Build the unified VTT multilabel volume by painting ROIs in priority order.
 
         Parameters
         ----------
@@ -326,12 +316,12 @@ class SegmentationStage:
 
         Returns
         -------
-        np.ndarray  (uint8, TDT label IDs)
+        np.ndarray  (uint8, VTT label IDs)
         """
         roi_unified = np.zeros(body_seg.shape, dtype=np.uint8)
-        roi_unified[body_seg > 0] = self.tdt_name2id["remaining_body"]
+        roi_unified[body_seg > 0] = self.vtt_name2id["remaining_body"]
 
-        requested = set(plan["tdt_roi_subset"])                                        
+        requested = set(plan["vtt_roi_subset"])                                        
 
         if total_seg is not None:
             if total_seg.shape != body_seg.shape:
@@ -341,15 +331,15 @@ class SegmentationStage:
             if "kidney" in requested:
                 kL = self.total_name2id["kidney_left"]
                 kR = self.total_name2id["kidney_right"]
-                roi_unified[(total_seg == kL) | (total_seg == kR)] = self.tdt_name2id["kidney"]
+                roi_unified[(total_seg == kL) | (total_seg == kR)] = self.vtt_name2id["kidney"]
             if "liver" in requested:
-                roi_unified[total_seg == self.total_name2id["liver"]] = self.tdt_name2id["liver"]
+                roi_unified[total_seg == self.total_name2id["liver"]] = self.vtt_name2id["liver"]
             if "prostate" in requested:
-                roi_unified[total_seg == self.total_name2id["prostate"]] = self.tdt_name2id["prostate"]
+                roi_unified[total_seg == self.total_name2id["prostate"]] = self.vtt_name2id["prostate"]
             if "spleen" in requested:
-                roi_unified[total_seg == self.total_name2id["spleen"]] = self.tdt_name2id["spleen"]
+                roi_unified[total_seg == self.total_name2id["spleen"]] = self.vtt_name2id["spleen"]
             if "heart" in requested:
-                roi_unified[total_seg == self.total_name2id["heart"]] = self.tdt_name2id["heart"]
+                roi_unified[total_seg == self.total_name2id["heart"]] = self.vtt_name2id["heart"]
 
         if head_seg is not None and "salivary_glands" in requested:
             if head_seg.shape != body_seg.shape:
@@ -360,7 +350,7 @@ class SegmentationStage:
             pR = self.head_name2id["parotid_gland_right"]
             sL = self.head_name2id["submandibular_gland_left"]
             sR = self.head_name2id["submandibular_gland_right"]
-            roi_unified[np.isin(head_seg, [pL, pR, sL, sR])] = self.tdt_name2id["salivary_glands"]
+            roi_unified[np.isin(head_seg, [pL, pR, sL, sR])] = self.vtt_name2id["salivary_glands"]
 
         return roi_unified
 
@@ -368,7 +358,7 @@ class SegmentationStage:
         """
         Run ROI unification and write the unified segmentation NIfTI.
 
-        Combines TotalSegmentator outputs into a single multilabel TDT volume.
+        Combines TotalSegmentator outputs into a single multilabel VTT volume.
         Skips if the final output already exists.
         """
         # Skip if unified output already exists 
@@ -480,7 +470,18 @@ class SegmentationStage:
             current_config_snapshot=self._rerun_config_snapshot(plan),
             current_ct_identity=self.ct_input_identity,
             current_upstream_fingerprints=self._current_upstream_fingerprints(),
+            context=self.context,
         )
+        if self.context.stage_skipped:
+            self.context.ct_nii_path = self.ct_nii_path
+            self.context.body_ml_path = self.body_ml_path
+            self.context.total_ml_path = self.total_ml_path if plan["run_total"] else None
+            self.context.head_glands_cavities_ml_path = (
+                self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None
+            )
+            self.context.totseg_plan = plan
+            self.context.vtt_roi_seg_path = self.final_output_path
+            return self.context
 
         if plan["run_body"] and not body_ml_done:
             print("Running TotalSegmentator for task: BODY...")
@@ -525,7 +526,7 @@ class SegmentationStage:
             self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None
         )
         self.context.totseg_plan = plan
-        self.context.tdt_roi_seg_path = self.final_output_path                         
+        self.context.vtt_roi_seg_path = self.final_output_path                         
         self.context.extras["segmentation_stage"] = {
             "output_dir": self.output_dir,
             "work_dir": self.work_dir,
