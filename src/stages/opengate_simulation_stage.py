@@ -4,7 +4,7 @@ OpenGATE dosimetry for the VTT pipeline.
 This stage runs voxel-source Monte Carlo dose calculations on the phase-1 CT grid
 (using the native CT grid or an optional downsampled simulation grid) with OpenGATE.
 Each requested ROI is simulated independently as a binary voxel source, then the
-resulting dose maps are optionally resampled back to the native CT space and summed.
+resulting dose maps are saved and summed on that same simulation grid.
 
 Core responsibilities
 ---------------------
@@ -16,7 +16,8 @@ Core responsibilities
 - Run one OpenGATE simulation per ROI using Lu-177 decay physics.
 - Skip simulation for any ROI whose final dose NIfTI output already exists on disk
   (allows resuming a crashed run without re-simulating completed ROIs).
-- Save per-ROI dose maps, optional uncertainty maps, and an optional summed dose map.
+- Save per-ROI dose maps, optional uncertainty maps, and an optional summed dose map
+  on the selected simulation grid.
 - Save stage metadata and optional OpenGATE material-label / MHD outputs.
 
 Dose units
@@ -85,7 +86,6 @@ from src.utils.opengate_utils import (
     find_hu_tables,
     resample_image,
     to_centered_identity,
-    upsample_array_to_native,
 )
 from src.utils.resize_utils import resolve_simulation_grid
 
@@ -98,7 +98,7 @@ class OpenGateSimulationStage:
     -----
     - Simulation may run on the native CT grid or on an optional downsampled grid.
     - Source masks are binary voxel maps derived from the unified VTT segmentation.
-    - ROI dose outputs are accumulated into a summed dose map in native CT space.
+    - ROI dose outputs are accumulated into a summed dose map in simulation space.
     - If a per-ROI dose NIfTI already exists on disk the simulation for that ROI is
       skipped, allowing a crashed run to be resumed from where it left off.
     """
@@ -282,6 +282,16 @@ class OpenGateSimulationStage:
         """Return the expected final NIfTI output path for a given ROI dose map."""
         return Path(self.stage_output_dir) / f"{self.prefix}_dose_{roi_name}.nii.gz"
 
+    @staticmethod
+    def _same_image_grid(a: sitk.Image, b: sitk.Image, *, atol: float = 1e-5) -> bool:
+        """Return True when two images share the same voxel grid geometry."""
+        return (
+            tuple(a.GetSize()) == tuple(b.GetSize())
+            and np.allclose(a.GetSpacing(), b.GetSpacing(), atol=atol)
+            and np.allclose(a.GetOrigin(), b.GetOrigin(), atol=atol)
+            and np.allclose(a.GetDirection(), b.GetDirection(), atol=atol)
+        )
+
     def _prepare_simulation_images(
         self,
         ct: sitk.Image,
@@ -293,7 +303,7 @@ class OpenGateSimulationStage:
         Steps
         -----
         1) Optionally downsample.
-        2) Store the pre-centered simulation CT geometry for later dose resampling.
+        2) Store the pre-centered simulation CT geometry used for dose outputs.
         3) Convert both images to centered identity-direction form.
         4) Write the prepared images to disk and re-read them.
         """
@@ -317,8 +327,8 @@ class OpenGateSimulationStage:
                 seg = resample_image(seg, new_size, new_spacing, is_label=True)
                 was_resampled = True
 
-        # Preserve the simulation-space geometry before centering so dose can later be
-        # resampled or written back into a CT-aligned grid.
+        # Preserve the simulation-space geometry before centering so saved dose maps
+        # stay on the selected OpenGATE grid.
         self._original_sim_ct_img = sitk.GetImageFromArray(sitk.GetArrayFromImage(ct))
         self._original_sim_ct_img.CopyInformation(ct)
 
@@ -592,6 +602,11 @@ class OpenGateSimulationStage:
                 "sim_ct_path": sim_ct_path,
                 "sim_seg_path": sim_seg_path,
             },
+            "dose_output_grid": {
+                "size_xyz": list(self._original_sim_ct_img.GetSize()),
+                "spacing_xyz_mm": [float(v) for v in self._original_sim_ct_img.GetSpacing()],
+                "origin_xyz_mm": [float(v) for v in self._original_sim_ct_img.GetOrigin()],
+            },
             "centering": {
                 "flipped_axes": self._centering_flipped_axes,
                 "original_origin": [round(o, 2) for o in self._original_sim_ct_img.GetOrigin()],
@@ -692,6 +707,9 @@ class OpenGateSimulationStage:
             native_ct,
             native_seg,
         )
+        dose_ref_img = self._original_sim_ct_img
+        if dose_ref_img is None:
+            raise RuntimeError("OpenGATE simulation reference grid was not initialized.")
 
         mask_paths, roi_counts, roi_names = self._build_source_masks(sim_ct, sim_seg)
 
@@ -701,11 +719,6 @@ class OpenGateSimulationStage:
         sum_arr: Optional[np.ndarray] = None
         mat_label_path: Optional[str] = None
 
-        needs_upsample = (
-            was_resampled
-            or self._original_sim_ct_img.GetSize() != native_ct.GetSize()
-        )
-
         for idx, roi_name in enumerate(roi_names):
             expected_nii = self._roi_dose_nii_path(roi_name)
 
@@ -714,13 +727,20 @@ class OpenGateSimulationStage:
             # ----------------------------------------------------------
             if expected_nii.exists():
                 print(f"[OpenGateSimulationStage] '{roi_name}': output exists, skipping simulation.")
-                dose_native = sitk.GetArrayFromImage(sitk.ReadImage(str(expected_nii))).astype(np.float64)
+                dose_img = sitk.ReadImage(str(expected_nii))
+                if not self._same_image_grid(dose_img, dose_ref_img):
+                    raise ValueError(
+                        f"Existing dose map for '{roi_name}' does not match the current "
+                        "OpenGATE simulation grid. Delete the old OpenGATE outputs or choose "
+                        "a fresh output folder before rerunning."
+                    )
+                dose_grid = sitk.GetArrayFromImage(dose_img).astype(np.float64)
                 dose_paths[roi_name] = str(expected_nii)
                 unc_nii = Path(self.work_dir) / f"{self.prefix}_unc_{roi_name}.nii.gz"
                 if unc_nii.exists():
                     unc_paths[roi_name] = str(unc_nii)
                 roi_meta[roi_name] = {"skipped": True, "loaded_from": str(expected_nii)}
-                sum_arr = dose_native.copy() if sum_arr is None else sum_arr + dose_native
+                sum_arr = dose_grid.copy() if sum_arr is None else sum_arr + dose_grid
                 continue
 
             # ----------------------------------------------------------
@@ -736,34 +756,23 @@ class OpenGateSimulationStage:
             # Convert Gy/primary -> Gy/decay using the actual simulated history count.
             dose_sim = np.asarray(res["dose_arr"], dtype=np.float64) / self.actual_total_histories
 
-            dose_native = (
-                upsample_array_to_native(
-                    dose_sim.astype(np.float32),
-                    self._original_sim_ct_img,
-                    native_ct,
-                ).astype(np.float64)
-                if needs_upsample
-                else dose_sim
-            )
-
-            sum_arr = dose_native.copy() if sum_arr is None else sum_arr + dose_native
+            # Preserve the selected simulation grid. If xyz_spacing_mm requested a
+            # coarser grid, saving directly here avoids an extra interpolation back
+            # to native CT resolution.
+            dose_grid = dose_sim
+            sum_arr = dose_grid.copy() if sum_arr is None else sum_arr + dose_grid
 
             if self.save_per_roi_dose_maps:
                 dose_paths[roi_name] = save_nii_sitk(
-                    native_ct,
-                    dose_native.astype(np.float32),
+                    dose_ref_img,
+                    dose_grid.astype(np.float32),
                     expected_nii,
                 )
 
             if self.save_uncertainty_map and res["unc_arr"] is not None:
-                unc_out = (
-                    upsample_array_to_native(res["unc_arr"], self._original_sim_ct_img, native_ct)
-                    if needs_upsample
-                    else res["unc_arr"]
-                )
                 unc_paths[roi_name] = save_nii_sitk(
-                    native_ct,
-                    unc_out,
+                    dose_ref_img,
+                    res["unc_arr"],
                     Path(self.work_dir) / f"{self.prefix}_unc_{roi_name}.nii.gz",
                 )
 
@@ -797,7 +806,7 @@ class OpenGateSimulationStage:
         sum_path: Optional[str] = None
         if self.save_summed_dose_map and sum_arr is not None:
             sum_path = save_nii_sitk(
-                native_ct,
+                dose_ref_img,
                 sum_arr.astype(np.float32),
                 Path(self.phase_output_dir) / f"{self.prefix}_dose_sum.nii.gz",
             )

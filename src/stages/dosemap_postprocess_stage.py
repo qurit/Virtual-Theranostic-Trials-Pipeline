@@ -148,12 +148,24 @@ class DosemapPostprocessStage:
     # helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _same_image_grid(a: sitk.Image, b: sitk.Image, *, atol: float = 1e-5) -> bool:
+        """Return True when two images share the same voxel grid geometry."""
+        return (
+            tuple(a.GetSize()) == tuple(b.GetSize())
+            and np.allclose(a.GetSpacing(), b.GetSpacing(), atol=atol)
+            and np.allclose(a.GetOrigin(), b.GetOrigin(), atol=atol)
+            and np.allclose(a.GetDirection(), b.GetDirection(), atol=atol)
+        )
+
     def _save_stage_metadata(
         self,
         dose_path: str,
         cumulated_activities: Dict[str, float],
         roi_names_used: List[str],
         integration_end_min: float,
+        dose_ref_img: sitk.Image,
+        folded_remaining_body_decays: Optional[Dict[str, float]] = None,
     ) -> None:
         """Save post-processing metadata."""
         roi_contribution_paths = {
@@ -178,7 +190,15 @@ class DosemapPostprocessStage:
             "cumulated_activities_per_roi_decays": cumulated_activities,
             "dose_input_units": "Gy/decay (per ROI source)",
             "dose_output_units": "Gy (total absorbed dose, summed across ROI sources)",
+            "dose_output_grid": {
+                "size_xyz": list(dose_ref_img.GetSize()),
+                "spacing_xyz_mm": [float(v) for v in dose_ref_img.GetSpacing()],
+                "origin_xyz_mm": [float(v) for v in dose_ref_img.GetOrigin()],
+            },
         }
+        if folded_remaining_body_decays:
+            extra["remaining_body_folded_from_decays"] = folded_remaining_body_decays
+            extra["remaining_body_folded_total_decays"] = float(sum(folded_remaining_body_decays.values()))
         metadata = build_stage_metadata(
             stage_name="dosemap_postprocess_stage",
             config_snapshot=self._rerun_config_snapshot(),
@@ -210,12 +230,11 @@ class DosemapPostprocessStage:
         if not raw_dose_paths:
             raise ValueError("No per-ROI dose map paths found in context.dosimetry_raw_dose_paths")
 
-        ref_ct = sitk.ReadImage(str(self.context.ct_nii_path))
-
         tac_time = self.context.pbpk_tac_time
         # Work on a local copy so we can safely patch remaining_body.
         tac_values: Dict[str, np.ndarray] = dict(self.context.pbpk_tac_values)
         integration_end_min = float(tac_time[-1])
+        folded_remaining_body_decays: Dict[str, float] = {}
 
         # Aggregate excluded-organ TACs into remaining_body.
         # OpenGATE's roi_subset may be smaller than Phase 1's roi_subset.  Any organ
@@ -228,6 +247,7 @@ class DosemapPostprocessStage:
             for _rn, _rt in self.context.pbpk_tac_values.items():
                 if _rn != "remaining_body" and _rn not in simulation_rois:
                     effective_rb += np.asarray(_rt, dtype=np.float64)
+                    folded_remaining_body_decays[_rn] = compute_roi_cumulated_activity(tac_time, _rt)
                     if self.debug:
                         print(
                             f"[DosemapPostprocessStage] Folding excluded ROI '{_rn}' TAC "
@@ -265,6 +285,7 @@ class DosemapPostprocessStage:
         # Load per-ROI dose maps and match with TACs
         roi_dose_maps: Dict[str, np.ndarray] = {}
         roi_names_used: List[str] = []
+        dose_ref_img: Optional[sitk.Image] = None
 
         for roi_name, dose_path in raw_dose_paths.items():
             if not os.path.exists(dose_path):
@@ -278,9 +299,16 @@ class DosemapPostprocessStage:
                     )
                 continue
 
-            dose_arr = sitk.GetArrayFromImage(
-                sitk.ReadImage(str(dose_path))
-            ).astype(np.float64)
+            dose_img = sitk.ReadImage(str(dose_path))
+            if dose_ref_img is None:
+                dose_ref_img = dose_img
+            elif not self._same_image_grid(dose_img, dose_ref_img):
+                raise ValueError(
+                    f"Per-ROI dose map grid mismatch for '{roi_name}'. Dose maps must "
+                    "all be on the same OpenGATE simulation grid before dose post-processing."
+                )
+
+            dose_arr = sitk.GetArrayFromImage(dose_img).astype(np.float64)
             roi_dose_maps[roi_name] = dose_arr
             roi_names_used.append(roi_name)
 
@@ -295,6 +323,8 @@ class DosemapPostprocessStage:
                 "No ROI dose maps could be matched with TACs. "
                 f"Dose ROIs: {list(raw_dose_paths.keys())}, TAC ROIs: {list(tac_values.keys())}"
             )
+        if dose_ref_img is None:
+            raise RuntimeError("Dose post-processing reference grid was not initialized.")
 
         # Accumulate total dose: SUM[ dose_roi * CA_roi ]
         total_dose = None
@@ -315,7 +345,7 @@ class DosemapPostprocessStage:
             roi_contrib_path = os.path.join(
                 self.work_dir, f"{self.prefix}_{roi_name}_dose_contribution.nii.gz"
             )
-            save_nii_sitk(ref_ct, roi_contribution.astype(np.float32), roi_contrib_path)
+            save_nii_sitk(dose_ref_img, roi_contribution.astype(np.float32), roi_contrib_path)
 
             if self.debug:
                 print(
@@ -332,9 +362,16 @@ class DosemapPostprocessStage:
                 f"({integration_end_min / 60.0 / 24.0:.1f} days)"
             )
 
-        save_nii_sitk(ref_ct, total_dose.astype(np.float32), output_path)
+        save_nii_sitk(dose_ref_img, total_dose.astype(np.float32), output_path)
 
-        self._save_stage_metadata(output_path, cumulated_activities, roi_names_used, integration_end_min)
+        self._save_stage_metadata(
+            output_path,
+            cumulated_activities,
+            roi_names_used,
+            integration_end_min,
+            dose_ref_img,
+            folded_remaining_body_decays,
+        )
 
         self.context.dosemap_postprocess_output_dir = self.stage_output_dir
         self.context.dosemap_postprocess_dose_path = output_path
