@@ -12,7 +12,7 @@
   // 5. Run: python main.py --config_file inputs/my_config.json --input_ct_dir /path/to/cts [--spect] [--dosimetry] [--postprocess]
   // ---------------------------------------------------------------------------
 
-  // Top-level output folder name. Each patient CT gets its own subfolder: <title>_CT_<index>/
+  // Project folder name created under the repo root. Each patient CT gets its own subfolder: <title>/CT_<index>/
   "output_folder_title": "test_run",
 
   // ==========================================================================

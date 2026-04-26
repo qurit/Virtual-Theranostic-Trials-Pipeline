@@ -1302,7 +1302,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
       {/* Project name */}
       <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-5 shadow-sm">
         <h3 className="font-semibold text-slate-800 mb-1">Project Name</h3>
-        <p className="text-xs text-slate-500 mb-4">Creates <code className="bg-slate-100 px-1 rounded">{'{name}'}_CT_1</code>, … directories in the repo root.</p>
+        <p className="text-xs text-slate-500 mb-4">Creates <code className="bg-slate-100 px-1 rounded">{'{name}'}/CT_1</code>, … inside a project folder in the repo root.</p>
         <div className="flex gap-3 items-start">
           <input type="text" value={projectName} onChange={e=>setProjectName(e.target.value)}
             onKeyDown={e=>{if(e.key==='Enter'&&!dirsCreated)createDirs();}} placeholder="e.g. my_study" disabled={dirsCreated}
@@ -1316,7 +1316,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
           }
         </div>
         {createError&&<p className="mt-2 text-sm text-red-600">{createError}</p>}
-        {dirsCreated&&<div className="mt-3 space-y-0.5">{patients.map((p,i)=><p key={p.name} className="text-xs terminal-font text-slate-400">✓ {projectDirs[p.name]||`${projectName}_CT_${i+1}`}</p>)}</div>}
+        {dirsCreated&&<div className="mt-3 space-y-0.5">{patients.map((p,i)=><p key={p.name} className="text-xs terminal-font text-slate-400">✓ {projectDirs[p.name]||`${projectName}/CT_${i+1}`}</p>)}</div>}
       </div>
 
       {/* Pipeline Options */}

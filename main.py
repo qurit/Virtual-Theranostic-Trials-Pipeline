@@ -197,8 +197,9 @@ class TdtPipeline:
             include_input_paths=True,
         )
 
-        output_folder_title = f"{self.config['output_folder_title']}_CT_{self.ct_index}"
-        self.output_folder_path = os.path.join(self.current_dir_path, output_folder_title)
+        project_dir = os.path.join(self.current_dir_path, self.config['output_folder_title'])
+        os.makedirs(project_dir, exist_ok=True)
+        self.output_folder_path = os.path.join(project_dir, f"CT_{self.ct_index}")
         os.makedirs(self.output_folder_path, exist_ok=True)
         self.metadata_dir_path = str(ensure_metadata_dir(self.output_folder_path))
 

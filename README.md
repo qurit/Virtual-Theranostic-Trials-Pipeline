@@ -176,7 +176,7 @@ CLI preflight now validates CT inputs before launching any patient run:
 | `--input_ct PATH` | required* | Single CT input — a NIfTI file or a DICOM directory |
 | `--mode {DEBUG,PRODUCTION}` | `PRODUCTION` | Verbosity and intermediate file cleanup |
 | `--logging_on / --no-logging_on` | on | Write per-CT log file |
-| `--ct_index_start N` | `1` | Starting index for output folder naming (e.g. `2` → `_CT_2`, `_CT_3`, …) |
+| `--ct_index_start N` | `1` | Starting index for CT subfolder naming (e.g. `2` → `CT_2`, `CT_3`, …) |
 | `--spect` | off | Run SIMIND SPECT projection simulation |
 | `--dosimetry` | off | Run OpenGATE dosimetry simulation |
 | `--postprocess` | off | Run post-processing for whichever simulations ran |
@@ -226,12 +226,13 @@ python -u main.py \
 
 ## Outputs
 
-Each CT input generates an output folder under `<output_folder_title>_CT_<index>/` with subfolders per phase.
+Each CT input generates a subfolder `CT_<index>/` inside the project folder `<output_folder_title>/`, with subfolders per phase.
 
 ### Example Structure
 
 ```
-test_run_CT_1/
+test_run/
+  CT_1/
   pipeline_metadata/                         <- persistent rerun guard metadata (created on first run)
     ct_input.json                           <- saved CT identity / provenance
     segmentation_stage.json                 <- stage-level rerun guard snapshot

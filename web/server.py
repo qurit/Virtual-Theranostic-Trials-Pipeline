@@ -143,7 +143,7 @@ async def get_input_paths() -> Dict:
 
 # ── Field descriptions (used by the frontend to render tooltips) ───────────────
 FIELD_DESCRIPTIONS: Dict[str, str] = {
-    "output_folder_title": "Name for the output folder created under the repo root. Each CT gets its own subfolder: <title>_CT_<index>/",
+    "output_folder_title": "Name for the project folder created under the repo root. Each CT gets its own subfolder: <title>/CT_<index>/",
     "roi_subset": "Which organs to segment and include in downstream simulation stages",
     "default_seed": "Global random seed for reproducible lesion placement; 0 = non-reproducible",
     "auto_shrink_factor": "If a lesion can't be placed, reduce its radius by this factor (e.g. 0.85 = shrink 15%) and retry",
@@ -350,9 +350,9 @@ class CreateDirsRequest(BaseModel):
 @app.post("/api/create-output-dirs")
 async def create_output_dirs(req: CreateDirsRequest) -> Dict:
     """
-    Create one output directory per patient under REPO_ROOT:
-      {project_name}_CT_1 / {project_name}_CT_2 / …
-    Write a base config.json (user-facing fields only) into each dir.
+    Create a project directory under REPO_ROOT and one CT subfolder per patient:
+      {project_name}/CT_1 / {project_name}/CT_2 / …
+    Write a base config.json (user-facing fields only) into each CT dir.
 
     Returns `existed`: a per-patient flag indicating whether the directory
     already contained pipeline outputs (subdirectories) before this call.
@@ -376,12 +376,15 @@ async def create_output_dirs(req: CreateDirsRequest) -> Dict:
     # by the user through the UI only when the synthetic lesions flag is enabled.
     base_cfg.get("phase_1", {}).get("synthetic_lesions_stage", {}).pop("specs", None)
 
+    project_dir = REPO_ROOT / name
+    project_dir.mkdir(parents=True, exist_ok=True)
+
     created: Dict[str, str] = {}
     existed: Dict[str, bool] = {}
     existing_configs: Dict[str, Any] = {}   # patient_name → stripped user config (when prior run exists)
 
     for i, patient in enumerate(req.patients, start=1):
-        out_dir = REPO_ROOT / f"{name}_CT_{i}"
+        out_dir = project_dir / f"CT_{i}"
         # Check for prior pipeline outputs (any subdirectory) before touching the dir.
         has_prior = out_dir.exists() and any(
             e.is_dir() for e in out_dir.iterdir() if not e.name.startswith(".")
