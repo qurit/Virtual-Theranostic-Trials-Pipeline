@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 
+
 def _normalize_roi_list(value: Any) -> List[str]:
     """Normalize an ROI name or ROI sequence into a clean string list."""
     if value is None:
@@ -90,10 +91,12 @@ def build_opengate_rerun_snapshot(config: Dict[str, Any], *, synthetic_enabled: 
 
 def build_spect_rerun_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
     """Build the SPECT post-processing rerun snapshot from a full config."""
+    stage_cfg = dict(config.get("phase_3", {}).get("spect_postprocess_stage", {}))
+    stage_cfg.pop("apply_frame_duration", None)
     return {
-        "spect_postprocess_stage": dict(
-            config.get("phase_3", {}).get("spect_postprocess_stage", {})
-        ),
+        "frame_duration_applied": True,
+        "saved_image_spacing_unit": "mm",
+        "spect_postprocess_stage": stage_cfg,
     }
 
 

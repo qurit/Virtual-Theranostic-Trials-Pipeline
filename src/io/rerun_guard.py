@@ -16,6 +16,7 @@ from src.io.rerun_fingerprints import (
     fingerprint_optional_file,
     fingerprint_path,
     fingerprints_equal,
+    flatten_paths,
     json_digest,
     normalize_jsonable,
 )
@@ -117,6 +118,34 @@ def _format_stage_conflict(stage_name: str, reasons: List[str], metadata_path: s
     return "\n".join(lines)
 
 
+def _missing_required_outputs(required_outputs: Any) -> List[str]:
+    """Return required output paths that do not exist on disk."""
+    return [path for path in flatten_paths(required_outputs) if not Path(path).exists()]
+
+
+def _compare_upstream_fingerprints(
+    stored_upstream: Any,
+    current_upstream: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Return rerun-conflict reasons for changed upstream dependencies."""
+    stored_norm = normalize_jsonable(stored_upstream or {})
+    current_norm = normalize_jsonable(current_upstream or {})
+    if not isinstance(stored_norm, dict) or not isinstance(current_norm, dict):
+        return ["upstream dependency fingerprints changed"]
+
+    reasons: List[str] = []
+    for key in sorted(set(stored_norm) | set(current_norm)):
+        stored_value = stored_norm.get(key)
+        current_value = current_norm.get(key)
+        if stored_value == current_value:
+            continue
+        if isinstance(stored_value, dict) and isinstance(current_value, dict):
+            if fingerprints_equal(stored_value, current_value):
+                continue
+        reasons.append(f"upstream dependency changed: {key}")
+    return reasons
+
+
 def compare_stage_rerun_state(
     *,
     stage_name: str,
@@ -148,6 +177,13 @@ def compare_stage_rerun_state(
     if stored_ct_fp and not fingerprints_equal(stored_ct_fp, current_ct_fp):
         reasons.append("the current CT input does not match the CT used to create these outputs")
 
+    reasons.extend(
+        _compare_upstream_fingerprints(
+            rerun_guard.get("upstream_fingerprints", {}),
+            current_upstream_fingerprints,
+        )
+    )
+
     return reasons
 
 
@@ -172,6 +208,19 @@ def assert_stage_rerun_safe(
         return None
 
     meta_path = Path(metadata_path)
+    missing_outputs = _missing_required_outputs(required_outputs)
+    if missing_outputs:
+        preview = ", ".join(missing_outputs[:5])
+        if len(missing_outputs) > 5:
+            preview += f", ... ({len(missing_outputs)} missing total)"
+        raise RerunConflictError(
+            _format_stage_conflict(
+                stage_name,
+                [f"cached outputs are incomplete; missing required output(s): {preview}"],
+                meta_path,
+            )
+        )
+
     if not meta_path.exists():
         raise RerunConflictError(
             _format_stage_conflict(
@@ -193,4 +242,3 @@ def assert_stage_rerun_safe(
     if context is not None:
         context.stage_skipped = True
     return load_json(meta_path)
-

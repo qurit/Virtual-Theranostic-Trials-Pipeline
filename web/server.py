@@ -46,6 +46,7 @@ from pydantic import BaseModel
 
 from src.io.config_paths import inject_pipeline_paths, load_pipeline_paths, strip_developer_fields
 from src.io.profiler import validate_profile_interval_s
+from src.io.rerun_fingerprints import flatten_paths
 from src.io.rerun_guard import (
     STAGE_LABELS,
     build_ct_identity,
@@ -182,9 +183,8 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "apply_tac": "Weight SIMIND projections by interpolated PBPK time-activity curves",
     "apply_poisson_noise": "Add Poisson counting noise to simulate realistic scanner count statistics",
     "apply_reconstruction": "Run PyTomography OSEM+TEW reconstruction on the weighted projections",
-    "apply_frame_duration": "Scale projection counts by frame acquisition duration",
     "FrameStartTimes": "Acquisition frame start times in minutes post-injection (e.g. [120, 1440, 2880])",
-    "FrameDurations": "Duration of each acquisition frame in seconds — one value per frame (e.g. [10, 10, 10])",
+    "FrameDurations": "Duration of each acquisition frame in seconds. This is always applied when projections are converted to counts.",
     "ReconstructionAlgorithm": "Iterative reconstruction algorithm. Currently only 'OSEM' (with TEW scatter correction) is supported",
     "Iterations": "Number of OSEM reconstruction iterations. Subsets × Iterations must not exceed NumProjections.",
     "Subsets": "Number of OSEM ordered subsets. Higher subsets accelerate convergence but may reduce stability. Subsets × Iterations must not exceed NumProjections.",
@@ -578,16 +578,29 @@ def _validate_stage_rerun_state(
     *,
     stage_name: str,
     output_dir: Path,
-    has_outputs: bool,
+    required_outputs: Any,
     config_snapshot: Dict[str, Any],
     ct_identity: Dict[str, Any],
     dependency_fingerprints: Dict[str, Any],
 ) -> Optional[str]:
     """Return a user-facing conflict message when a stage cache is unsafe to reuse."""
-    if not has_outputs:
+    output_paths = flatten_paths(required_outputs)
+    existing_paths = [path for path in output_paths if Path(path).exists()]
+    if not existing_paths:
         return None
 
     metadata_path = Path(stage_metadata_path(output_dir, stage_name))
+    missing_paths = [path for path in output_paths if not Path(path).exists()]
+    if missing_paths:
+        preview = ", ".join(missing_paths[:5])
+        if len(missing_paths) > 5:
+            preview += f", ... ({len(missing_paths)} missing total)"
+        return _format_rerun_stage_message(
+            stage_name,
+            [f"cached outputs are incomplete; missing required output(s): {preview}"],
+            metadata_path,
+        )
+
     if not metadata_path.exists():
         return _format_rerun_stage_message(
             stage_name,
@@ -639,22 +652,16 @@ def _validate_patient_rerun(
     seg_cfg = config_full["phase_1"]["segmentation_stage"]
     seg_prefix = seg_cfg["file_prefix"]
     seg_stage_dir = phase1_dir / "segmentation_stage"
-    expected_vtt_handoff = (
-        phase1_dir / "digital_twin.nii.gz"
-        if synthetic_enabled
-        else seg_stage_dir / f"{seg_cfg['unification_prefix']}.nii.gz"
-    )
+    expected_vtt_handoff = phase1_dir / "digital_twin.nii.gz"
     seg_markers = [
         seg_stage_dir / f"{seg_prefix}_body_ml.nii.gz",
-        seg_stage_dir / f"{seg_prefix}_total_ml.nii.gz",
-        seg_stage_dir / f"{seg_prefix}_head_glands_cavities_ml.nii.gz",
         seg_stage_dir / f"{seg_cfg['unification_prefix']}.nii.gz",
         phase1_dir / "digital_twin.nii.gz",
     ]
     seg_message = _validate_stage_rerun_state(
         stage_name="segmentation_stage",
         output_dir=output_dir,
-        has_outputs=any(p.exists() for p in seg_markers),
+        required_outputs=seg_markers,
         config_snapshot=build_segmentation_rerun_snapshot(config_full),
         ct_identity=ct_identity,
         dependency_fingerprints={
@@ -667,8 +674,9 @@ def _validate_patient_rerun(
     syn_cfg = config_full["phase_1"]["synthetic_lesions_stage"]
     syn_prefix = syn_cfg["file_prefix"]
     syn_stage_dir = phase1_dir / "synthetic_lesions_stage" / "work_dir"
+    syn_pre_lesion_path = syn_stage_dir / f"{syn_prefix}_pre_lesions.nii.gz"
     syn_markers = [
-        syn_stage_dir / f"{syn_prefix}_pre_lesions.nii.gz",
+        syn_pre_lesion_path,
         syn_stage_dir / f"{syn_prefix}_all_lesions_binary.nii.gz",
         syn_stage_dir / f"{syn_prefix}_all_lesions_labels.nii.gz",
     ]
@@ -676,7 +684,7 @@ def _validate_patient_rerun(
         syn_message = _validate_stage_rerun_state(
             stage_name="synthetic_lesions_stage",
             output_dir=output_dir,
-            has_outputs=any(p.exists() for p in syn_markers),
+            required_outputs=syn_markers,
             config_snapshot=build_synthetic_lesions_rerun_snapshot(config_full),
             ct_identity=ct_identity,
             dependency_fingerprints={
@@ -684,7 +692,9 @@ def _validate_patient_rerun(
                     stage_metadata_path(output_dir, "segmentation_stage")
                 ),
                 "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
-                "lesioned_seg_handoff": fingerprint_optional_file(phase1_dir / "digital_twin.nii.gz"),
+                "pre_lesion_seg_handoff": fingerprint_optional_file(
+                    syn_pre_lesion_path if syn_pre_lesion_path.exists() else phase1_dir / "digital_twin.nii.gz"
+                ),
             },
         )
         if syn_message:
@@ -699,7 +709,7 @@ def _validate_patient_rerun(
     pbpk_message = _validate_stage_rerun_state(
         stage_name="pbpk_tac_stage",
         output_dir=output_dir,
-        has_outputs=any(p.exists() for p in pbpk_markers),
+        required_outputs=pbpk_markers,
         config_snapshot=build_pbpk_rerun_snapshot(config_full, synthetic_enabled=synthetic_enabled),
         ct_identity=ct_identity,
         dependency_fingerprints={},
@@ -747,7 +757,7 @@ def _validate_patient_rerun(
         simind_message = _validate_stage_rerun_state(
             stage_name="simind_simulation_stage",
             output_dir=output_dir,
-            has_outputs=any(p.exists() for p in simind_markers),
+            required_outputs=simind_markers,
             config_snapshot=simind_snapshot,
             ct_identity=ct_identity,
             dependency_fingerprints=simind_deps,
@@ -761,13 +771,11 @@ def _validate_patient_rerun(
         og_stage_dir = phase2_dir / og_cfg.get("sub_dir_name", "opengate_simulation")
         og_work = og_stage_dir / "work_dir"
         og_snapshot = build_opengate_rerun_snapshot(config_full, synthetic_enabled=synthetic_enabled)
-        og_markers: List[Path] = [
-            og_stage_dir / f"{og_prefix}_dose_sum.nii.gz",
-            og_work / f"{og_prefix}_material_labels.nii.gz",
-        ]
-        for roi_name in og_snapshot["resolved_roi_subset"]:
-            og_markers.append(og_work / f"{og_prefix}_dose_{roi_name}.nii.gz")
-            og_markers.append(og_work / f"{og_prefix}_unc_{roi_name}.nii.gz")
+        og_markers: List[Path] = []
+        if og_cfg.get("save_summed_dose_map", True):
+            og_markers.append(og_stage_dir / f"{og_prefix}_dose_sum.nii.gz")
+        if og_cfg.get("save_material_label_image", True):
+            og_markers.append(og_work / f"{og_prefix}_material_labels.nii.gz")
         og_deps = {
             "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
             "vtt_roi_seg": fingerprint_optional_file(expected_vtt_handoff),
@@ -783,7 +791,7 @@ def _validate_patient_rerun(
         og_message = _validate_stage_rerun_state(
             stage_name="opengate_simulation_stage",
             output_dir=output_dir,
-            has_outputs=any(p.exists() for p in og_markers),
+            required_outputs=og_markers,
             config_snapshot=og_snapshot,
             ct_identity=ct_identity,
             dependency_fingerprints=og_deps,
@@ -803,14 +811,16 @@ def _validate_patient_rerun(
                     spect_stage_dir / f"{spect_prefix}_{frame_label}_tot_w1.nii.gz",
                     spect_stage_dir / f"{spect_prefix}_{frame_label}_tot_w2.nii.gz",
                     spect_stage_dir / f"{spect_prefix}_{frame_label}_tot_w3.nii.gz",
-                    phase3_dir / f"reconstructed_SPECT_{frame_label}.nii.gz",
                 ]
             )
-        spect_markers.append(spect_stage_dir / "recon_atn_img.nii.gz")
+            if spect_cfg.get("apply_reconstruction", True):
+                spect_markers.append(phase3_dir / f"reconstructed_SPECT_{frame_label}.nii.gz")
+        if spect_cfg.get("apply_reconstruction", True):
+            spect_markers.append(spect_stage_dir / "recon_atn_img.nii.gz")
         spect_message = _validate_stage_rerun_state(
             stage_name="spect_postprocess_stage",
             output_dir=output_dir,
-            has_outputs=any(p.exists() for p in spect_markers),
+            required_outputs=spect_markers,
             config_snapshot=build_spect_rerun_snapshot(config_full),
             ct_identity=ct_identity,
             dependency_fingerprints={
@@ -832,7 +842,7 @@ def _validate_patient_rerun(
         dose_message = _validate_stage_rerun_state(
             stage_name="dosemap_postprocess_stage",
             output_dir=output_dir,
-            has_outputs=any(p.exists() for p in dose_markers),
+            required_outputs=dose_markers,
             config_snapshot=build_dosemap_rerun_snapshot(config_full),
             ct_identity=ct_identity,
             dependency_fingerprints={

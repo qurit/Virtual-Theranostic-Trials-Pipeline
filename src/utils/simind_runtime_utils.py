@@ -126,7 +126,22 @@ def run_jaszczak_calibration(
         "/fa:15"
         "/fa:14"
     )
-    subprocess.run(cmd, shell=True, cwd=output_dir, stdout=subprocess.DEVNULL)
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        cwd=output_dir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        if len(stderr) > 1000:
+            stderr = stderr[-1000:]
+        detail = f"\nSIMIND stderr:\n{stderr}" if stderr else ""
+        raise RuntimeError(
+            f"SIMIND Jaszczak calibration failed with exit code {result.returncode}: {cmd}{detail}"
+        )
 
 
 def derive_input_geometry(

@@ -19,7 +19,6 @@ Controlled by config flags:
 - apply_tac: whether to weight projections by PBPK TACs
 - apply_poisson_noise: whether to add Poisson noise
 - apply_reconstruction: whether to run PyTomography OSEM+TEW
-- apply_frame_duration: whether to scale projections by frame duration
 
 Expected Context interface
 --------------------------
@@ -111,11 +110,10 @@ class SpectPostprocessStage:
         self.apply_tac: bool = bool(self.stage_cfg.get("apply_tac", True))
         self.apply_poisson_noise: bool = bool(self.stage_cfg.get("apply_poisson_noise", True))
         self.apply_reconstruction: bool = bool(self.stage_cfg.get("apply_reconstruction", True))
-        # NOTE: apply_frame_duration MUST be True for correct units.
         # SIMIND projections are in counts/MBq/s; organ_sum is in MBq.
-        # Without the frame duration (seconds), the weighted projections are count
-        # rates (counts/s) rather than counts — reconstruction would receive wrong inputs.
-        self.apply_frame_duration: bool = bool(self.stage_cfg.get("apply_frame_duration", True))
+        # Frame duration is always applied so weighted projections are counts,
+        # not count rates.
+        self.frame_duration_applied: bool = True
 
         # Frame timing from post-process config 
         self.frame_start: Sequence[float] = self.stage_cfg["FrameStartTimes"]          
@@ -148,15 +146,15 @@ class SpectPostprocessStage:
         self.subsets: int = int(self.stage_cfg.get("Subsets", 8))                       
         self.recon_algorithm: str = self.stage_cfg.get("ReconstructionAlgorithm", "OSEM") 
 
-        # (x, y, z) spacing tuple for SimpleITK images
-        self.output_tuple: Tuple[float, float, float] = (
-            self.simind_output_pixel_width_cm,
-            self.simind_output_pixel_width_cm,
-            self.simind_output_slice_width_cm,
+        # SIMIND uses cm in its config, while NIfTI spacing is conventionally mm.
+        self.recon_spacing_mm: Tuple[float, float, float] = (
+            self.simind_output_pixel_width_cm * 10.0,
+            self.simind_output_pixel_width_cm * 10.0,
+            self.simind_output_slice_width_cm * 10.0,
         )
 
     def _frame_label(self, i: int) -> str:
-        """Return a compact minute-valued string label for frame index i."""
+        """Return a compact hour-valued string label for frame index i."""
         return f"{float(self.frame_start[i]) / 60.0:.6f}".rstrip("0").rstrip(".")
 
     def _rerun_config_snapshot(self) -> Dict[str, Any]:
@@ -201,6 +199,17 @@ class SpectPostprocessStage:
             / self.simind_output_slice_width_cm
         )
 
+    def _image_has_expected_spacing(self, image_path: str) -> bool:
+        """Return True when an existing NIfTI already has the current recon spacing."""
+        try:
+            spacing = sitk.ReadImage(image_path).GetSpacing()
+        except Exception:
+            return False
+        return all(
+            abs(float(actual) - float(expected)) < 1e-6
+            for actual, expected in zip(spacing, self.recon_spacing_mm)
+        )
+
     def _get_recon_img(
         self,
         likelihood: PoissonLogLikelihood,
@@ -217,17 +226,17 @@ class SpectPostprocessStage:
         recon_arr = self._convert_counts_to_mbq_per_ml(reconstructed_image, sensitivity, frame_duration)
 
         recon_img = sitk.GetImageFromArray(recon_arr)
-        recon_img.SetSpacing(self.output_tuple)
+        recon_img.SetSpacing(self.recon_spacing_mm)
         return recon_img
 
     def _write_recon_atn_img(self, amap: torch.Tensor) -> Tuple[sitk.Image, str]:
         """Write the attenuation map (from SIMIND .hct header) as a NIfTI in recon grid."""
         recon_atn_path = os.path.join(self.output_dir, "recon_atn_img.nii.gz")         
-        if os.path.exists(recon_atn_path):
+        if os.path.exists(recon_atn_path) and self._image_has_expected_spacing(recon_atn_path):
             return sitk.ReadImage(recon_atn_path), recon_atn_path
 
         recon_atn_img = sitk.GetImageFromArray(amap.cpu().T)
-        recon_atn_img.SetSpacing(self.output_tuple)
+        recon_atn_img.SetSpacing(self.recon_spacing_mm)
         sitk.WriteImage(recon_atn_img, recon_atn_path, imageIO="NiftiImageIO")
         return recon_atn_img, recon_atn_path
 
@@ -250,9 +259,10 @@ class SpectPostprocessStage:
             "apply_tac": self.apply_tac,                                               
             "apply_poisson_noise": self.apply_poisson_noise,                           
             "apply_reconstruction": self.apply_reconstruction,                         
-            "apply_frame_duration": self.apply_frame_duration,                         
+            "frame_duration_applied": self.frame_duration_applied,
             "frame_start_times_min": np.asarray(self.frame_start, dtype=float).tolist(),
             "frame_durations_s": np.asarray(self.frame_durations_s, dtype=float).tolist(),
+            "reconstruction_spacing_xyz_mm": list(self.recon_spacing_mm),
             "iterations": self.iterations,                                             
             "subsets": self.subsets,                                                    
             "reconstruction_algorithm": self.recon_algorithm,                          
@@ -293,6 +303,11 @@ class SpectPostprocessStage:
         )
         if self.context.stage_skipped:
             self.context.reconstruction_output_dir = self.phase_output_dir
+            self.context.pbpk_projection_paths = build_frame_projection_paths(
+                self.output_dir, self.prefix, self.frame_start
+            )
+            self.context.pbpk_frame_start_times_min = np.asarray(self.frame_start, dtype=float)
+            self.context.pbpk_frame_durations_s = np.asarray(self.frame_durations_s, dtype=float)
             return self.context
 
         self.context.require(
@@ -395,8 +410,7 @@ class SpectPostprocessStage:
                 frame_label = self._frame_label(i)
                 # frame_scale: counts = (counts/MBq/s) * MBq * s
                 frame_scale = float(organ_sum[i])                                      
-                if self.apply_frame_duration:                                          
-                    frame_scale *= float(self.frame_durations_s[i])                    
+                frame_scale *= float(self.frame_durations_s[i])
                 for window_key in ("w1", "w2", "w3"):
                     proj_path = roi_projection_paths[window_key]
                     if not os.path.exists(proj_path):
@@ -479,7 +493,7 @@ class SpectPostprocessStage:
                     self.phase_output_dir, f"reconstructed_SPECT_{frame_label}.nii.gz"
                 )
 
-                if os.path.exists(recon_output_path):
+                if os.path.exists(recon_output_path) and self._image_has_expected_spacing(recon_output_path):
                     recon_paths[frame_label] = recon_output_path
                     continue
 

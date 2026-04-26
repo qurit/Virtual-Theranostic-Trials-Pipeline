@@ -146,7 +146,7 @@ cp config_template.json inputs/my_config.json
 - `phase_2.simind_stage.num_cpu` — CPU cores for parallel SIMIND (`0` = use all available).
 - `phase_3.spect_postprocess_stage.Iterations`, `Subsets` — OSEM reconstruction settings. `Subsets × Iterations` must not exceed `NumProjections`.
 - `phase_2.simind_stage.xyz_spacing_mm` — target voxel spacing in mm as `[sxy, sxy, sz]`. X and Y must match. The shared XY value must be ≥ both native in-plane spacings; Z must be ≥ the native CT Z spacing (only coarser grids allowed). Voxel counts are derived automatically from the physical CT extent. The native CT spacing is logged at runtime. `null` = native CT resolution.
-- `phase_2.opengate_stage.xyz_spacing_mm` — same rule as above for dosimetry. Dose maps are always resampled back to native CT resolution after simulation.
+- `phase_2.opengate_stage.xyz_spacing_mm` — same rule as above for dosimetry. Dose maps are saved on the selected simulation grid; use `null` to keep native CT resolution.
 - `phase_2.opengate_stage.gate.total_histories` — Monte Carlo histories for dosimetry.
 - `phase_2.opengate_stage.gate.num_cpu` — OpenGATE threads (`0` = use all available).
 

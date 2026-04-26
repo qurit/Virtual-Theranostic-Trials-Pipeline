@@ -175,12 +175,13 @@ class SyntheticLesionsStage:
     def _current_dependency_fingerprints(self) -> Dict[str, Any]:
         """Return fingerprints for dependencies that must remain unchanged on rerun."""
         label_map_path = self.context.config["phase_1"]["segmentation_stage"]["label_map_path"]
+        pre_lesion_seg_path = self.backup_path if os.path.exists(self.backup_path) else self.vtt_roi_seg_path
         return {
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
             ),
             "label_map_json": fingerprint_optional_file(label_map_path),
-            "lesioned_seg_handoff": fingerprint_optional_file(self.vtt_roi_seg_path),
+            "pre_lesion_seg_handoff": fingerprint_optional_file(pre_lesion_seg_path),
         }
 
     def _cleanup_failed_run(self) -> None:

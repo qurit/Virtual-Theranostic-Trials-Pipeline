@@ -1047,7 +1047,7 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
   const isOpengate=stageKey==='opengate_stage';
   let entries=Object.entries(stageData).filter(([k])=>
     !DEVELOPER_FIELDS.has(k)&&
-    !(isSpectPost&&(k==='FrameStartTimes'||k==='FrameDurations'))&&
+    !(isSpectPost&&(k==='FrameStartTimes'||k==='FrameDurations'||k==='apply_frame_duration'))&&
     !(isSynLesion&&k==='specs')
   );
   if(isOpengate&&entries.some(([k])=>k==='xyz_spacing_mm')){

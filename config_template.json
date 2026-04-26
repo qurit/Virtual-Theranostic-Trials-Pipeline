@@ -179,7 +179,7 @@
       // X and Y must match (square in-plane voxels).
       // XY must be >= both native in-plane spacings; Z must be >= native Z (only coarser grids allowed).
       // The pipeline logs the native CT spacing at runtime so you know the baseline.
-      // Dose maps are always resampled back to native CT resolution after simulation.
+      // Dose maps are saved on the selected simulation grid; null keeps the native CT grid.
       "xyz_spacing_mm": null,
 
       // Enable forced-detection variance reduction (valid for Lu-177 when voxel size << photon mean-free path).
@@ -237,14 +237,12 @@
       // Run PyTomography OSEM+TEW reconstruction.
       "apply_reconstruction": true,
 
-      // Scale projections by frame duration before reconstruction.
-      "apply_frame_duration": true,
-
       // Frame start times in minutes post-injection. One value per frame.
       // Example: [120, 1440, 2880] = scans at 2 h, 24 h, 48 h p.i.
       "FrameStartTimes": [120, 1440, 2880],
 
       // Frame acquisition durations in seconds. Must match FrameStartTimes length.
+      // These durations are always applied so weighted projections are true counts.
       "FrameDurations": [10, 10, 10],
 
       // Reconstruction algorithm. Currently only "OSEM" (with TEW scatter correction).

@@ -551,7 +551,7 @@ class SimindSimulationStage:
         Each process uses a unique /rr:<core_id> random seed so contributions are
         statistically independent. Core 0 outputs to stdout; others are silenced.
         """
-        processes: List[subprocess.Popen] = []
+        processes: List[Tuple[int, str, subprocess.Popen]] = []
         for j in range(self.num_cpu):
             cmd = (
                 f"{self.simind_exe} {self.prefix} {self.prefix}_{organ_name}_{j} "
@@ -559,10 +559,20 @@ class SimindSimulationStage:
                 + f"/rr:{j}"
             )
             stdout = None if j == 0 else subprocess.DEVNULL
-            processes.append(subprocess.Popen(cmd, shell=True, cwd=self.work_dir, stdout=stdout))
+            process = subprocess.Popen(cmd, shell=True, cwd=self.work_dir, stdout=stdout)
+            processes.append((j, cmd, process))
 
-        for p in processes:
-            p.wait()
+        failures: List[str] = []
+        for core_id, cmd, process in processes:
+            return_code = process.wait()
+            if return_code != 0:
+                failures.append(f"core {core_id} exited {return_code}: {cmd}")
+
+        if failures:
+            joined = "\n".join(failures)
+            raise RuntimeError(
+                f"SIMIND failed while simulating organ '{organ_name}'.\n{joined}"
+            )
 
     def _save_stage_metadata(
         self,
@@ -769,11 +779,11 @@ class SimindSimulationStage:
             act_path = organ_act_paths[organ_name]
             act_work_name = f"{self.prefix}_{organ_name}_act_av.bin"
             act_work_path = os.path.join(self.work_dir, act_work_name)
-            if not os.path.exists(act_work_path):
-                shutil.copyfile(act_path, act_work_path)
-
             if not os.path.exists(act_path):
                 raise FileNotFoundError(f"Binary ROI source map not found: {act_path}")
+
+            if not os.path.exists(act_work_path):
+                shutil.copyfile(act_path, act_work_path)
 
             simind_switches = build_simind_switches(
                 atn_name=atn_work_name,
