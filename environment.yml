@@ -1,0 +1,14 @@
+name: tdt_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11.14
+  - pip
+  - git
+  - pip:
+      - json-minify==0.3.0
+      - pytomography==3.4.0
+      - totalsegmentator==2.12.0
+      - pycno @ git+https://github.com/qurit/PyCNO.git@main
+      - opengate

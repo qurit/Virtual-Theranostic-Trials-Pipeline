@@ -1,0 +1,293 @@
+"""
+Dosimetry Post-Processing Stage for the TDT pipeline.
+
+This stage applies PBPK time-activity curves to OpenGATE per-ROI dose maps to produce
+a single total absorbed dose map in absolute units (Gy).
+
+Core responsibilities
+---------------------
+- Load per-ROI dose maps from OpenGATE (Gy/decay).
+- Load PBPK TACs from Phase 1.
+- Integrate each ROI's TAC from t=0 to the end of the TAC (which covers 10x the
+  isotope half-life, capturing >99.9% of all decays) to get total cumulated activity.
+- Multiply each ROI's dose_per_decay by its own cumulated activity, then sum
+  across ROIs to get the total absorbed dose map in Gy.
+- Save one dose map NIfTI to the phase output directory.
+
+Dose unit conversion
+--------------------
+OpenGATE outputs dose in Gy/decay per ROI source. The final dose map is:
+
+    dose_Gy = SUM over ROIs [ dose_per_decay_roi [Gy/decay] * N_decays_roi ]
+
+where N_decays_roi is the total number of decays for that ROI over the full
+treatment period:
+
+    N_decays_roi = integral(A_roi(t), 0, T_end)  [decays]
+
+A_roi(t) is in MBq = 10^6 decays/second, so:
+
+    N_decays_roi = integral(A_roi(t), 0, T_end) * 1e6 * 60  [decays]
+    (converting MBq*min to decays)
+
+Why per-ROI weighting matters
+-----------------------------
+Each ROI dose map represents the dose field produced when decays occur ONLY in
+that organ. The kidney dose map and the liver dose map must be scaled by their
+respective cumulated activities, not by a combined total. Multiplying the summed
+dose map by the summed cumulated activity creates unphysical cross-terms (e.g.,
+kidney dose scaled by liver activity).
+
+Expected Context interface
+--------------------------
+Incoming `context` is expected to provide:
+- context.subdir_paths["phase_3"] : str
+- context.config["phase_3"]["dosemap_postprocess_stage"] : dict
+- context.dosimetry_raw_dose_paths : dict[str, str]  {roi_name: path to per-ROI dose NIfTI}
+- context.pbpk_tac_time : np.ndarray  (time in minutes)
+- context.pbpk_tac_values : dict[str, np.ndarray]  {roi_name: TAC array in MBq}
+- context.ct_nii_path : str
+
+On success, this stage sets:
+- context.dosemap_postprocess_output_dir : str
+- context.dosemap_postprocess_dose_path : str  (path to single total dose map)
+
+Maintainer / contact: pyazdi@bccrc.ca
+"""
+
+from __future__ import annotations
+
+import os
+import json
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import SimpleITK as sitk
+
+# NumPy 2.0 renamed np.trapz -> np.trapezoid
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
+
+class DosemapPostprocessStage:
+    """
+    Apply PBPK time-activity curves to OpenGATE per-ROI dose maps.
+
+    Produces a single total absorbed dose map in Gy by integrating each ROI's
+    TAC over the full treatment period, multiplying by dose_per_decay, and
+    summing across all ROIs.
+    """
+
+    def __init__(self, context: Any) -> None:
+        context.require(
+            "subdir_paths",
+            "config",
+            "dosimetry_raw_dose_paths",
+            "pbpk_tac_time",
+            "pbpk_tac_values",
+            "ct_nii_path",
+        )
+        self.context = context
+        self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"
+
+        self.phase_output_dir: str = context.subdir_paths["phase_3"]
+        self.stage_cfg: Dict[str, Any] = context.config["phase_3"]["dosemap_postprocess_stage"]
+
+        self.stage_output_dir: str = os.path.join(
+            self.phase_output_dir,
+            self.stage_cfg.get("sub_dir_name", "dosemap_postprocess"),
+        )
+        os.makedirs(self.stage_output_dir, exist_ok=True)
+        self.work_dir: str = os.path.join(self.stage_output_dir, "work_dir")
+        os.makedirs(self.work_dir, exist_ok=True)
+        self.metadata_path: str = os.path.join(self.work_dir, "dosemap_postprocess_metadata.json")
+
+        self.prefix: str = self.stage_cfg.get("file_prefix", "dosemap_postprocess")
+
+    # -----------------------------
+    # helpers
+    # -----------------------------
+
+    @staticmethod
+    def _save_nii(ref: sitk.Image, arr: np.ndarray, path: str) -> str:
+        """Save a numpy array as NIfTI using `ref` geometry."""
+        img = sitk.GetImageFromArray(np.asarray(arr, dtype=np.float32))
+        img.CopyInformation(ref)
+        sitk.WriteImage(img, path, imageIO="NiftiImageIO")
+        return path
+
+    @staticmethod
+    def _compute_roi_cumulated_activity(
+        tac_time: np.ndarray,
+        tac_roi: np.ndarray,
+    ) -> float:
+        """
+        Compute total cumulated activity (total decays) for a single ROI over the
+        full extent of the TAC from t=0 to the last timepoint.
+
+        Uses trapezoidal integration of the ROI's TAC.
+
+        Parameters
+        ----------
+        tac_time : np.ndarray  (minutes)
+        tac_roi : np.ndarray  (TAC in MBq for this specific ROI)
+
+        Returns
+        -------
+        float  total number of decays over the full TAC period
+        """
+        tac_float = tac_roi.astype(np.float64)
+        integral_mbq_min = _trapezoid(tac_float, tac_time.astype(np.float64))
+
+        # Convert MBq*min -> decays: 1 MBq = 1e6 decays/s, 1 min = 60 s
+        n_decays = integral_mbq_min * 1e6 * 60.0
+        return float(n_decays)
+
+    def _save_stage_metadata(
+        self,
+        dose_path: str,
+        cumulated_activities: Dict[str, float],
+        roi_names_used: List[str],
+        integration_end_min: float,
+    ) -> None:
+        """Save post-processing metadata."""
+        metadata: Dict[str, Any] = {
+            "stage": "dosemap_postprocess_stage",
+            "stage_output_dir": self.stage_output_dir,
+            "work_dir": self.work_dir,
+            "dose_input_paths": dict(self.context.dosimetry_raw_dose_paths),
+            "roi_names_used": roi_names_used,
+            "dose_output_path": dose_path,
+            "integration_range_min": [0.0, integration_end_min],
+            "integration_range_hr": [0.0, integration_end_min / 60.0],
+            "integration_range_days": [0.0, integration_end_min / 60.0 / 24.0],
+            "cumulated_activities_per_roi_decays": cumulated_activities,
+            "dose_input_units": "Gy/decay (per ROI source)",
+            "dose_output_units": "Gy (total absorbed dose, summed across ROI sources)",
+        }
+        with open(self.metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=4)
+
+    # -----------------------------
+    # main
+    # -----------------------------
+    def run(self) -> Any:
+        """
+        Apply per-ROI PBPK TAC weighting to per-ROI dose maps and produce
+        a single total absorbed dose map.
+
+        The TAC is integrated from t=0 to the end of the PBPK simulation
+        (10x isotope half-life), capturing >99.9% of all decays:
+
+            dose = SUM_roi [ dose_per_decay_roi * integral(TAC_roi, 0, T_end) ]
+
+        Returns
+        -------
+        context : Context-like
+        """
+        raw_dose_paths = self.context.dosimetry_raw_dose_paths
+        if not raw_dose_paths:
+            raise ValueError("No per-ROI dose map paths found in context.dosimetry_raw_dose_paths")
+
+        ref_ct = sitk.ReadImage(str(self.context.ct_nii_path))
+
+        tac_time = self.context.pbpk_tac_time
+        tac_values = self.context.pbpk_tac_values
+        integration_end_min = float(tac_time[-1])
+
+        # Final output path
+        output_path = os.path.join(
+            self.phase_output_dir,
+            f"{self.prefix}_total_dose.nii.gz",
+        )
+
+        # Skip if output already exists
+        if os.path.exists(output_path):
+            if self.debug:
+                print(f"[DosemapPostprocessStage] Total dose map already exists, skipping.")
+            self.context.dosemap_postprocess_output_dir = self.stage_output_dir
+            self.context.dosemap_postprocess_dose_path = output_path
+            self.context.extras["dosemap_postprocess_stage"] = {
+                "stage_output_dir": self.stage_output_dir,
+                "dose_path": output_path,
+                "metadata_path": self.metadata_path,
+            }
+            return self.context
+
+        # Load per-ROI dose maps and match with TACs
+        roi_dose_maps: Dict[str, np.ndarray] = {}
+        roi_names_used: List[str] = []
+
+        for roi_name, dose_path in raw_dose_paths.items():
+            if not os.path.exists(dose_path):
+                raise FileNotFoundError(f"Per-ROI dose map not found: {dose_path}")
+
+            if roi_name not in tac_values:
+                if self.debug:
+                    print(
+                        f"[DosemapPostprocessStage] WARNING: ROI '{roi_name}' has a dose map "
+                        f"but no TAC — skipping this ROI in dose weighting."
+                    )
+                continue
+
+            dose_arr = sitk.GetArrayFromImage(
+                sitk.ReadImage(str(dose_path))
+            ).astype(np.float64)
+            roi_dose_maps[roi_name] = dose_arr
+            roi_names_used.append(roi_name)
+
+            if self.debug:
+                print(
+                    f"[DosemapPostprocessStage] Loaded dose map for '{roi_name}': "
+                    f"shape={dose_arr.shape}, max={dose_arr.max():.4e} Gy/decay"
+                )
+
+        if not roi_dose_maps:
+            raise ValueError(
+                "No ROI dose maps could be matched with TACs. "
+                f"Dose ROIs: {list(raw_dose_paths.keys())}, TAC ROIs: {list(tac_values.keys())}"
+            )
+
+        # Accumulate total dose: SUM[ dose_roi * CA_roi ]
+        total_dose = None
+        cumulated_activities: Dict[str, float] = {}
+
+        for roi_name, dose_per_decay in roi_dose_maps.items():
+            n_decays = self._compute_roi_cumulated_activity(tac_time, tac_values[roi_name])
+            cumulated_activities[roi_name] = n_decays
+
+            roi_contribution = dose_per_decay * n_decays
+
+            if total_dose is None:
+                total_dose = roi_contribution.copy()
+            else:
+                total_dose += roi_contribution
+
+            if self.debug:
+                print(
+                    f"[DosemapPostprocessStage]   {roi_name}: "
+                    f"CA={n_decays:.2e} decays, "
+                    f"max_dose_contribution={np.max(roi_contribution):.4e} Gy"
+                )
+
+        if self.debug:
+            print(
+                f"[DosemapPostprocessStage] Total absorbed dose: "
+                f"max={np.max(total_dose):.4e} Gy | "
+                f"TAC integrated from 0 to {integration_end_min:.0f} min "
+                f"({integration_end_min / 60.0 / 24.0:.1f} days)"
+            )
+
+        self._save_nii(ref_ct, total_dose.astype(np.float32), output_path)
+
+        self._save_stage_metadata(output_path, cumulated_activities, roi_names_used, integration_end_min)
+
+        self.context.dosemap_postprocess_output_dir = self.stage_output_dir
+        self.context.dosemap_postprocess_dose_path = output_path
+
+        self.context.extras["dosemap_postprocess_stage"] = {
+            "stage_output_dir": self.stage_output_dir,
+            "dose_path": output_path,
+            "metadata_path": self.metadata_path,
+        }
+
+        return self.context

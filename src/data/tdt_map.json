@@ -155,6 +155,7 @@
         "4": "prostate",
         "5": "spleen",
         "6": "heart",
-        "7": "salivary_glands"
+        "7": "salivary_glands",
+        "8": "synthetic_lesion"
     }
 }
