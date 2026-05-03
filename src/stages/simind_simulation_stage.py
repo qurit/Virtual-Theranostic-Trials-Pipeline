@@ -25,7 +25,7 @@ Expected Context interface
 --------------------------
 Incoming `context` is expected to provide:
 - context.config["phase_2"]["simind_stage"] : dict (including roi_subset, xyz_spacing_mm)
-- context.config["phase_1"]["segmentation_stage"]["label_map_path"] : str
+- label map loaded from ``src/data/pipeline_paths.json`` input_paths.label_map_path
 - context.subdir_paths["phase_2"] : str
 - context.mode : str  ("DEBUG" or "PRODUCTION")
 - context.ct_nii_path : str
@@ -58,6 +58,7 @@ import nibabel as nib
 import numpy as np
 from scipy.ndimage import zoom
 
+from src.io.config_paths import get_label_map_path
 from src.io.rerun_guard import (
     assert_stage_rerun_safe,
     build_stage_metadata,
@@ -412,7 +413,7 @@ class SimindSimulationStage:
         self.config: Dict[str, Any] = context.config
         self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
-        # Repository root: one level above this stage file (src/stages/ -> repo root).
+        # src/ directory: one level above this stage file (src/stages/ -> src/).
         self.repo_root: str = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
         self.phase_output_dir: str = context.subdir_paths["phase_2"]
@@ -468,6 +469,7 @@ class SimindSimulationStage:
         self.xyz_spacing_mm = self.stage_cfg.get("xyz_spacing_mm")
 
         # SIMIND ROI subset (independent from phase_1 roi_subset) 
+        using_config_roi_subset = self.stage_cfg.get("roi_subset") is not None
         simind_roi_subset = self.stage_cfg.get("roi_subset")                           
         if simind_roi_subset is None:                                                  
             simind_roi_subset = getattr(context, "downstream_roi_subset", [])          
@@ -475,17 +477,41 @@ class SimindSimulationStage:
             simind_roi_subset = [simind_roi_subset]                                    
         self.simind_roi_subset: List[str] = [str(r).strip() for r in simind_roi_subset if str(r).strip()] 
 
-        # Validate SIMIND ROI subset against phase_1 segmented ROIs 
-        phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])         
-        invalid_rois = [r for r in self.simind_roi_subset if r not in phase1_rois and r != "remaining_body"] 
-        if invalid_rois:                                                               
-            raise ValueError(                                                          
-                f"SIMIND roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. " 
-                f"Available: {sorted(phase1_rois)}"                                    
+        lesion_specs = (
+            self.context.config.get("phase_1", {})
+            .get("synthetic_lesions_stage", {})
+            .get("specs")
+        )
+        lesion_hosts = [str(r).strip() for r in lesion_specs] if isinstance(lesion_specs, dict) else []
+        picked_lesion_hosts = [r for r in lesion_hosts if r in self.simind_roi_subset]
+        missing_lesion_hosts = [r for r in lesion_hosts if r not in self.simind_roi_subset]
+        if using_config_roi_subset and "synthetic_lesion" in self.simind_roi_subset:
+            raise ValueError(
+                "SIMIND roi_subset contains internal ROI 'synthetic_lesion'. "
+                "Select lesion host ROIs instead; "
+                "the synthetic_lesion source is added automatically."
+            )
+        if picked_lesion_hosts and missing_lesion_hosts:
+            raise ValueError(
+                "SIMIND roi_subset selects some synthetic-lesion host ROIs "
+                f"({picked_lesion_hosts}) but not all ({missing_lesion_hosts}). "
+                "Include all lesion host ROIs or none."
+            )
+        if picked_lesion_hosts and "synthetic_lesion" not in self.simind_roi_subset:
+            self.simind_roi_subset.append("synthetic_lesion")
+
+        # Validate SIMIND ROI subset against phase_1 segmented ROIs
+        phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])
+        _internal = {"remaining_body", "synthetic_lesion"}
+        invalid_rois = [r for r in self.simind_roi_subset if r not in phase1_rois and r not in _internal]
+        if invalid_rois:
+            raise ValueError(
+                f"SIMIND roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. "
+                f"Available: {sorted(phase1_rois)}"
             )                                                                          
 
         # Load VTT label map
-        self.ts_map_path: str = context.config["phase_1"]["segmentation_stage"]["label_map_path"]
+        self.ts_map_path: str = get_label_map_path()
         self.vtt_name2id: Dict[str, int] = load_vtt_label_map(self.ts_map_path)
 
         # CPU count: 0 or invalid -> use all available cores
@@ -524,7 +550,7 @@ class SimindSimulationStage:
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
             ),
         }
-        if getattr(self.context, "synthetic_lesions_enabled", False):
+        if "synthetic_lesion" in self.simind_roi_subset:
             deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "synthetic_lesions_stage")
             )

@@ -45,7 +45,7 @@ Incoming `context` is expected to provide:
 - context.ct_nii_path : str
 - context.vtt_roi_seg_path : str
 - context.downstream_roi_subset : list[str] | str
-- context.config["phase_1"]["segmentation_stage"]["label_map_path"] : str
+- label map loaded from ``src/data/pipeline_paths.json`` input_paths.label_map_path
 
 On success, this stage sets:
 - context.dosimetry_output_dir : str
@@ -70,6 +70,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import SimpleITK as sitk
 
+from src.io.config_paths import get_label_map_path
 from src.io.rerun_guard import (
     assert_stage_rerun_safe,
     build_stage_metadata,
@@ -189,7 +190,7 @@ class OpenGateSimulationStage:
         # Input paths
         self.ct_nii_path: Path = Path(context.ct_nii_path)
         self.vtt_roi_seg_path: Path = Path(context.vtt_roi_seg_path)
-        self.label_map_path: Path = Path(context.config["phase_1"]["segmentation_stage"]["label_map_path"]) 
+        self.label_map_path: Path = Path(get_label_map_path())
         self.vtt_name2id: Dict[str, int] = load_vtt_label_map(self.label_map_path)
 
         _nuclear = load_isotope_config()["nuclear"].get(self.isotope)
@@ -199,6 +200,7 @@ class OpenGateSimulationStage:
         self._isotope_A: int = _nuclear["A"]
 
         # Build final ROI list from opengate_stage config (independent from phase_1) 
+        using_config_roi_subset = self.stage_cfg.get("roi_subset") is not None
         opengate_roi_subset = self.stage_cfg.get("roi_subset")                         
         if opengate_roi_subset is None:                                                
             opengate_roi_subset = getattr(context, "downstream_roi_subset", None)      
@@ -206,14 +208,39 @@ class OpenGateSimulationStage:
             opengate_roi_subset = [opengate_roi_subset]                                
         if opengate_roi_subset is None:                                                
             raise ValueError("OpenGATE roi_subset must be provided (in config or context)") 
+        opengate_roi_subset = [str(r).strip() for r in opengate_roi_subset if str(r).strip()]
 
-        # Validate OpenGATE ROI subset against phase_1 segmented ROIs 
-        phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])         
-        invalid_rois = [r for r in opengate_roi_subset if r not in phase1_rois and r != "remaining_body"]
-        if invalid_rois:                                                               
-            raise ValueError(                                                          
-                f"OpenGATE roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. " 
-                f"Available: {sorted(phase1_rois)}"                                    
+        lesion_specs = (
+            self.context.config.get("phase_1", {})
+            .get("synthetic_lesions_stage", {})
+            .get("specs")
+        )
+        lesion_hosts = [str(r).strip() for r in lesion_specs] if isinstance(lesion_specs, dict) else []
+        picked_lesion_hosts = [r for r in lesion_hosts if r in opengate_roi_subset]
+        missing_lesion_hosts = [r for r in lesion_hosts if r not in opengate_roi_subset]
+        if using_config_roi_subset and "synthetic_lesion" in opengate_roi_subset:
+            raise ValueError(
+                "OpenGATE roi_subset contains internal ROI 'synthetic_lesion'. "
+                "Select lesion host ROIs instead; "
+                "the synthetic_lesion source is added automatically."
+            )
+        if picked_lesion_hosts and missing_lesion_hosts:
+            raise ValueError(
+                "OpenGATE roi_subset selects some synthetic-lesion host ROIs "
+                f"({picked_lesion_hosts}) but not all ({missing_lesion_hosts}). "
+                "Include all lesion host ROIs or none."
+            )
+        if picked_lesion_hosts and "synthetic_lesion" not in opengate_roi_subset:
+            opengate_roi_subset.append("synthetic_lesion")
+
+        # Validate OpenGATE ROI subset against phase_1 segmented ROIs
+        phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])
+        _internal = {"remaining_body", "synthetic_lesion"}
+        invalid_rois = [r for r in opengate_roi_subset if r not in phase1_rois and r not in _internal]
+        if invalid_rois:
+            raise ValueError(
+                f"OpenGATE roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. "
+                f"Available: {sorted(phase1_rois)}"
             )                                                                          
 
         roi_list: List[str] = []
@@ -247,7 +274,7 @@ class OpenGateSimulationStage:
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
             ),
         }
-        if getattr(self.context, "synthetic_lesions_enabled", False):
+        if "synthetic_lesion" in self.requested_roi_subset:
             deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "synthetic_lesions_stage")
             )

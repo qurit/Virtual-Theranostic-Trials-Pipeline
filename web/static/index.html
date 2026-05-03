@@ -32,7 +32,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // ─── constants ────────────────────────────────────────────────────────────────
 const DEVELOPER_FIELDS = new Set([
   'output_folder_title','sub_dir_name','file_prefix',
-  'unification_prefix','label_map_path','SIMINDDirectory',
+  'unification_prefix','SIMINDDirectory',
 ]);
 const PHASE_LABELS = {
   phase_1:'Phase 1 — Digital Twin & Ground Truth',
@@ -59,6 +59,7 @@ const CLI_FLAGS = [
 ];
 const PROFILE_INTERVAL_OPTIONS = [0.1,0.2,0.5,1.0,2.0,3.0];
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
+const RESERVED_ROIS = new Set(['background','remaining_body','synthetic_lesion']);
 // Maps each stage key to the flag that gates it (stage hidden + cleared when flag is OFF)
 const STAGE_FLAG_MAP = {
   simind_stage:              'spect',
@@ -744,13 +745,15 @@ function SpecRoiCard({roi,spec,onUpdateSpec,onRemove}){
   );
 }
 
-function SpecsEditor({value,onChange,roiChoices,desc}){
+function SpecsEditor({value,onChange,roiChoices,pbpkCompatibleRois,desc}){
   const [showDesc,setShowDesc]=useState(false);
   const [addRoi,setAddRoi]=useState('');
   const isDisabled=value===null;
   const specs=value||{};
   const usedRois=Object.keys(specs);
-  const available=(roiChoices||[]).filter(r=>r!=='body'&&!usedRois.includes(r));
+  // Only ROIs with dedicated PBPK VOIs can have synthetic lesions
+  const pbpkSet=pbpkCompatibleRois instanceof Set?pbpkCompatibleRois:new Set(pbpkCompatibleRois||[]);
+  const available=(roiChoices||[]).filter(r=>r!=='body'&&!usedRois.includes(r)&&pbpkSet.has(r));
   const handleAdd=()=>{if(!addRoi)return;onChange({...specs,[addRoi]:{n_lesions:1,prob:'uniform',margin_mm:1.0,seed:0}});setAddRoi('');};
   const handleUpdateSpec=(roi,newSpec)=>onChange({...specs,[roi]:newSpec});
   const handleRemove=(roi)=>{const u={...specs};delete u[roi];onChange(Object.keys(u).length?u:null);};
@@ -791,9 +794,9 @@ function SpecsEditor({value,onChange,roiChoices,desc}){
             </div>
           ):(
             <p className="text-xs text-slate-400 italic mt-2">
-              {(roiChoices||[]).filter(r=>r!=='body').length===0
-                ?'Select Phase 1 ROIs first to unlock lesion placement options.'
-                :'All available ROIs are already configured.'}
+              {pbpkSet.size===0||(roiChoices||[]).filter(r=>r!=='body'&&pbpkSet.has(r)).length===0
+                ?'Select Phase 1 ROIs with dedicated PBPK VOIs first to unlock lesion placement.'
+                :'All PBPK-compatible ROIs are already configured.'}
             </p>
           )}
         </>
@@ -937,8 +940,125 @@ function NumProjectionsField({value,onChange,desc,opts}){
   );
 }
 
+// ─── P1SegRoiSelector ─────────────────────────────────────────────────────────
+// Task-based ROI selector for the Phase 1 segmentation stage.
+function P1SegRoiSelector({value,call,roiTaskGroups,pbpkCompatibleRois,lesionSpecs,roiOverlaps}){
+  const TASK_LABELS={total:'Total Segmentation',head_glands_cavities:'Head Glands & Cavities'};
+  const CAT_ORDER=['organs','bones','vessels','muscles','head'];
+  const CAT_LABELS={organs:'Organs',bones:'Bones',vessels:'Vessels',muscles:'Muscles',head:'Glands & Cavities'};
+  const pbpkSet=pbpkCompatibleRois instanceof Set?pbpkCompatibleRois:new Set(pbpkCompatibleRois||[]);
+  const roisWithLesions=lesionSpecs&&typeof lesionSpecs==='object'?new Set(Object.keys(lesionSpecs)):new Set();
+  const selectedSet=new Set(value||[]);
+  const conflictsFor=roi=>(roiOverlaps?.[roi]||[]).filter(r=>selectedSet.has(r));
+
+  const taskRois=taskKey=>Object.values(roiTaskGroups?.[taskKey]||{}).flat();
+
+  const [totalOpen,setTotalOpen]=useState(false);
+  const [headOpen,setHeadOpen]=useState(false);
+  useEffect(()=>{
+    if((value||[]).some(r=>taskRois('total').includes(r))) setTotalOpen(true);
+    if((value||[]).some(r=>taskRois('head_glands_cavities').includes(r))) setHeadOpen(true);
+  },[]); // eslint-disable-line
+
+  const handleTask=(taskKey,checked,setOpen)=>{
+    setOpen(checked);
+    if(!checked){const s=new Set(taskRois(taskKey));call((value||[]).filter(r=>!s.has(r)));}
+  };
+  const toggleRoi=(roi,sel)=>{
+    if(!sel){call((value||[]).filter(r=>r!==roi));return;}
+    const conflicts=new Set(roiOverlaps?.[roi]||[]);
+    call([...new Set([...(value||[]).filter(r=>!conflicts.has(r)),roi])]);
+  };
+  const selectAll=taskKey=>{
+    const next=new Set(value||[]);
+    taskRois(taskKey).forEach(roi=>{
+      const conflicts=roiOverlaps?.[roi]||[];
+      if(!conflicts.some(r=>next.has(r))) next.add(roi);
+    });
+    call([...next]);
+  };
+  const deselectAll=taskKey=>{const s=new Set(taskRois(taskKey));call((value||[]).filter(r=>!s.has(r)));};
+
+  const renderPanel=(taskKey)=>{
+    const cats=roiTaskGroups?.[taskKey]||{};
+    const ordered=CAT_ORDER.filter(c=>cats[c]&&cats[c].length>0);
+    const allTask=taskRois(taskKey);
+    const allSel=allTask.length>0&&allTask.every(r=>(value||[]).includes(r));
+    return(
+      <div className="px-3 pb-3 pt-1 ml-1 border-t border-blue-100 bg-blue-50/30">
+        {ordered.map(cat=>(
+          <div key={cat} className="mt-2">
+            <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">{CAT_LABELS[cat]||cat}</p>
+            <div className="flex flex-wrap gap-1">
+              {cats[cat].map(roi=>{
+                const sel=(value||[]).includes(roi);
+                const hasPbpk=pbpkSet.has(roi);
+                const hasLesion=roisWithLesions.has(roi);
+                const conflicts=conflictsFor(roi);
+                const disabled=!sel&&conflicts.length>0;
+                return(
+                  <label key={roi} className={`px-2 py-0.5 rounded-full text-xs cursor-pointer border select-none flex items-center gap-1 transition-colors
+                    ${sel?'bg-blue-100 border-blue-400 text-blue-700':disabled?'bg-slate-50 border-slate-200 text-slate-300 cursor-not-allowed':'bg-white border-slate-300 text-slate-500 hover:border-slate-400'}`}
+                    title={disabled?`Overlaps selected ROI: ${conflicts.join(', ')}`:undefined}>
+                    <input type="checkbox" checked={sel} disabled={disabled} onChange={e=>toggleRoi(roi,e.target.checked)} className="hidden"/>
+                    {roi}
+                    {hasPbpk&&<span title="Has dedicated PBPK VOI — simulation eligible" className="text-[9px] bg-teal-100 text-teal-700 rounded px-1 font-bold leading-tight">PBPK</span>}
+                    {hasLesion&&<span title="Has synthetic lesion spec" className="text-[9px] bg-purple-200 text-purple-700 rounded px-1 font-bold leading-tight">lesion</span>}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+        <button onClick={()=>allSel?deselectAll(taskKey):selectAll(taskKey)}
+          className="mt-2 text-[10px] text-blue-600 hover:text-blue-800 border border-blue-200 hover:border-blue-400 px-2 py-0.5 rounded-lg font-medium">
+          {allSel?'Deselect all':'Select all'}
+        </button>
+      </div>
+    );
+  };
+
+  const tasks=[
+    {key:'total',open:totalOpen,setOpen:setTotalOpen},
+    {key:'head_glands_cavities',open:headOpen,setOpen:setHeadOpen},
+  ];
+  const selectedWithLesions=(value||[]).filter(r=>roisWithLesions.has(r));
+  return(
+    <div className="py-2 border-b border-slate-100 last:border-0">
+      <div className="flex items-center gap-1.5 mb-2">
+        <span className="text-sm font-medium text-slate-700">roi_subset</span>
+        <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded font-mono">{(value||[]).length} selected</span>
+      </div>
+      <div className="space-y-1.5">
+        {tasks.map(({key,open,setOpen})=>{
+          const n=taskRois(key).length;
+          if(!n) return null;
+          const selCount=(value||[]).filter(r=>taskRois(key).includes(r)).length;
+          return(
+            <div key={key} className="border border-slate-200 rounded-lg overflow-hidden">
+              <label className={`flex items-center gap-2.5 px-3 py-2 cursor-pointer select-none transition-colors ${open?'bg-blue-50':'hover:bg-slate-50'}`}>
+                <input type="checkbox" checked={open} onChange={e=>handleTask(key,e.target.checked,setOpen)} className="w-3.5 h-3.5 accent-blue-600 flex-shrink-0"/>
+                <div className="flex-1 min-w-0">
+                  <span className="text-sm font-medium text-slate-700">{TASK_LABELS[key]||key}</span>
+                  {selCount>0&&<span className="ml-2 text-[10px] text-blue-600 font-semibold">{selCount}/{n}</span>}
+                </div>
+              </label>
+              {open&&renderPanel(key)}
+            </div>
+          );
+        })}
+      </div>
+      {selectedWithLesions.length>0&&(
+        <p className="text-[11px] text-purple-700 bg-purple-50 rounded px-2 py-1 mt-2">
+          ⚠ Synthetic lesions configured for: {selectedWithLesions.join(', ')}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // ─── FieldRenderer ────────────────────────────────────────────────────────────
-function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape,nativeSpacing,systemCpuCount,lesionSpecs}){
+function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pipelineOptions,roiChoices,roiTaskGroups,pbpkCompatibleRois,roiOverlaps,patientShape,nativeSpacing,systemCpuCount,lesionSpecs}){
   const desc=descriptions[fieldKey]||'';
   const opts=pipelineOptions&&pipelineOptions[fieldKey];
   const [showDesc,setShowDesc]=useState(false);
@@ -992,12 +1112,22 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
     return<><LabelRow><input type="text" defaultValue={value} onBlur={e=>call(e.target.value)} className="w-44 px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"/></LabelRow><DescLine/></>;
   }
   if(Array.isArray(value)){
-    if(fieldKey==='roi_subset'&&roiChoices&&roiChoices.length>0){
-      const choices=roiChoices.filter(r=>r!=='remaining_body');
-      // ROIs with synthetic lesion specs (from phase 1 config)
-      const roisWithLesions=lesionSpecs&&typeof lesionSpecs==='object'?new Set(Object.keys(lesionSpecs)):new Set();
-      // Selected ROIs that also have lesions (for the info banner)
-      const selectedWithLesions=value.filter(r=>roisWithLesions.has(r));
+    if(fieldKey==='roi_subset'){
+      // Phase 1 segmentation: task-based selector
+      const isP1Seg=path&&path[0]==='phase_1'&&path[1]==='segmentation_stage';
+      if(isP1Seg){
+        return<P1SegRoiSelector value={value} call={call}
+          roiTaskGroups={roiTaskGroups} pbpkCompatibleRois={pbpkCompatibleRois}
+          lesionSpecs={lesionSpecs} roiOverlaps={roiOverlaps}/>;
+      }
+      // Simulation stages: pill selector filtered to PBPK-compatible ROIs from Phase 1 selection
+      const pbpkSet=pbpkCompatibleRois instanceof Set?pbpkCompatibleRois:new Set(pbpkCompatibleRois||[]);
+      const p1RoiSet=new Set((cfg?.phase_1?.segmentation_stage?.roi_subset)||[]);
+      const choices=(roiChoices||[]).filter(r=>r!=='remaining_body'&&pbpkSet.has(r)&&p1RoiSet.has(r));
+      const lesionHosts=lesionSpecs&&typeof lesionSpecs==='object'?Object.keys(lesionSpecs):[];
+      const pickedLesionHosts=lesionHosts.filter(r=>value.includes(r));
+      const missingLesionHosts=lesionHosts.filter(r=>!value.includes(r));
+      const partialLesionPick=pickedLesionHosts.length>0&&missingLesionHosts.length>0;
       return(
         <div className="py-2 border-b border-slate-100 last:border-0">
           <div className="flex items-center gap-1.5 mb-2">
@@ -1005,24 +1135,27 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
             {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
           </div>
           <DescLine/>
-          {choices.length===0&&<p className="text-xs text-slate-400 italic">No ROIs available — constrained by Phase 1 selection</p>}
+          {choices.length===0&&<p className="text-xs text-slate-400 italic">No simulation-eligible ROIs — select organs with dedicated PBPK VOIs in Phase 1</p>}
           <div className="flex flex-wrap gap-1.5">
-            {choices.map(roi=>{
-              const hasLesion=roisWithLesions.has(roi);
-              return(
-                <label key={roi} className={`px-2 py-0.5 rounded-full text-xs cursor-pointer border select-none transition-colors flex items-center gap-1
-                  ${value.includes(roi)?'bg-blue-100 border-blue-400 text-blue-700':'bg-slate-100 border-slate-300 text-slate-500 hover:border-slate-400'}`}>
-                  <input type="checkbox" checked={value.includes(roi)}
-                    onChange={e=>call(e.target.checked?[...value,roi]:value.filter(r=>r!==roi))} className="hidden"/>
-                  {roi}
-                  {hasLesion&&<span title="This ROI has synthetic lesions" className="text-[9px] bg-purple-200 text-purple-700 rounded px-1 font-bold leading-tight">lesion</span>}
-                </label>
-              );
-            })}
+            {choices.map(roi=>(
+              <label key={roi} className={`px-2 py-0.5 rounded-full text-xs cursor-pointer border select-none transition-colors
+                flex items-center gap-1 ${value.includes(roi)?'bg-blue-100 border-blue-400 text-blue-700':'bg-slate-100 border-slate-300 text-slate-500 hover:border-slate-400'}`}>
+                <input type="checkbox" checked={value.includes(roi)}
+                  onChange={e=>call(e.target.checked?[...value,roi]:value.filter(r=>r!==roi))} className="hidden"/>
+                {roi}
+                <span title="Has dedicated PBPK VOI — simulation eligible" className="text-[9px] bg-teal-100 text-teal-700 rounded px-1 font-bold leading-tight">PBPK</span>
+                {lesionHosts.includes(roi)&&<span title="Synthetic lesions configured in this ROI" className="text-[9px] bg-purple-200 text-purple-700 rounded px-1 font-bold leading-tight">lesion</span>}
+              </label>
+            ))}
           </div>
-          {selectedWithLesions.length>0&&(
-            <p className="text-[11px] text-purple-700 bg-purple-50 rounded px-2 py-1 mt-1.5">
-              ⚠ Synthetic lesions auto-included for: {selectedWithLesions.join(', ')}
+          {pickedLesionHosts.length>0&&missingLesionHosts.length===0&&(
+            <p className="text-[11px] text-purple-700 bg-purple-50 rounded px-2 py-1 mt-2">
+              synthetic_lesion / Tumor1 source will be added automatically.
+            </p>
+          )}
+          {partialLesionPick&&(
+            <p className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1 mt-2">
+              Synthetic lesion ROIs are all-or-none here. Missing: {missingLesionHosts.join(', ')}.
             </p>
           )}
         </div>
@@ -1040,7 +1173,7 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
 }
 
 // ─── StageSection ─────────────────────────────────────────────────────────────
-function StageSection({stageKey,stageData,basePath,patientName,onChange,descriptions,pipelineOptions,roiChoices,patientShape,nativeSpacing,systemCpuCount,lesionSpecs}){
+function StageSection({stageKey,stageData,basePath,patientName,onChange,descriptions,pipelineOptions,roiChoices,roiTaskGroups,pbpkCompatibleRois,roiOverlaps,patientShape,nativeSpacing,systemCpuCount,lesionSpecs}){
   const [open,setOpen]=useState(false);
   const isSpectPost=stageKey==='spect_postprocess_stage';
   const isSynLesion=stageKey==='synthetic_lesions_stage';
@@ -1074,7 +1207,8 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
                     {sub.map(([sk,sv])=>(
                       <FieldRenderer key={sk} fieldKey={sk} value={sv} path={[...fPath,sk]}
                         patientName={patientName} onChange={onChange} descriptions={descriptions}
-                        pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}
+                        pipelineOptions={pipelineOptions} roiChoices={roiChoices} roiTaskGroups={roiTaskGroups}
+                        pbpkCompatibleRois={pbpkCompatibleRois} roiOverlaps={roiOverlaps} patientShape={patientShape}
                         nativeSpacing={nativeSpacing} systemCpuCount={systemCpuCount} lesionSpecs={lesionSpecs}/>
                     ))}
                   </div>
@@ -1083,13 +1217,14 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
             }
             return<FieldRenderer key={k} fieldKey={k} value={v} path={fPath}
               patientName={patientName} onChange={onChange} descriptions={descriptions}
-              pipelineOptions={pipelineOptions} roiChoices={roiChoices} patientShape={patientShape}
+              pipelineOptions={pipelineOptions} roiChoices={roiChoices} roiTaskGroups={roiTaskGroups}
+              pbpkCompatibleRois={pbpkCompatibleRois} roiOverlaps={roiOverlaps} patientShape={patientShape}
               nativeSpacing={nativeSpacing} systemCpuCount={systemCpuCount} lesionSpecs={lesionSpecs}/>;
           })}
           {isSynLesion&&'specs' in stageData&&(
             <SpecsEditor value={stageData.specs}
               onChange={v=>onChange(patientName,[...basePath,'specs'],v)}
-              roiChoices={roiChoices} desc={descriptions['specs']||''}/>
+              roiChoices={roiChoices} pbpkCompatibleRois={pbpkCompatibleRois} desc={descriptions['specs']||''}/>
           )}
           {isSpectPost&&'FrameStartTimes' in stageData&&'FrameDurations' in stageData&&(
             <FrameTimesSection frameStartTimes={stageData.FrameStartTimes}
@@ -1103,7 +1238,7 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
 }
 
 // ─── PhaseSection ─────────────────────────────────────────────────────────────
-function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,phase1RoiSubset,patientShape,nativeSpacing,flags,systemCpuCount,lesionSpecs}){
+function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,roiTaskGroups,pbpkCompatibleRois,roiOverlaps,phase1RoiSubset,patientShape,nativeSpacing,flags,systemCpuCount,lesionSpecs}){
   const [open,setOpen]=useState(false);
   const stages=Object.entries(phaseData).filter(([k,v])=>{
     if(k==='sub_dir_name'||typeof v!=='object'||v===null) return false;
@@ -1131,8 +1266,9 @@ function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipe
             <StageSection key={sk} stageKey={sk} stageData={sd}
               basePath={[phaseKey,sk]} patientName={patientName} onChange={onChange}
               descriptions={descriptions} pipelineOptions={pipelineOptions}
-              // segmentation_stage sees full choices; everything else is constrained
+              // segmentation_stage sees full choices + task groups; everything else is constrained
               roiChoices={sk==='segmentation_stage'?roiChoices:constrained}
+              roiTaskGroups={roiTaskGroups} pbpkCompatibleRois={pbpkCompatibleRois} roiOverlaps={roiOverlaps}
               patientShape={patientShape} nativeSpacing={nativeSpacing} systemCpuCount={systemCpuCount}
               lesionSpecs={lesionSpecs}/>
           ))}
@@ -1241,13 +1377,20 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
       const isP1Roi=path[0]==='phase_1'&&path[path.length-1]==='roi_subset';
       if(isP1Roi){
         const p1Set=new Set(value);
-        const trimRoi=(cfg,ph,st)=>{const cur=cfg?.[ph]?.[st]?.roi_subset;return Array.isArray(cur)?deepSet(cfg,[ph,st,'roi_subset'],cur.filter(r=>p1Set.has(r))):cfg;};
+        // Simulation ROIs must be in Phase 1 selection AND have a dedicated PBPK VOI
+        const pbpkSet=new Set(configMeta?.pbpk_compatible_rois||[]);
+        const trimRoi=(cfg,ph,st)=>{
+          const cur=cfg?.[ph]?.[st]?.roi_subset;
+          return Array.isArray(cur)
+            ?deepSet(cfg,[ph,st,'roi_subset'],cur.filter(r=>p1Set.has(r)&&pbpkSet.has(r)))
+            :cfg;
+        };
         updated[patientName]=trimRoi(updated[patientName],'phase_2','simind_stage');
         updated[patientName]=trimRoi(updated[patientName],'phase_2','opengate_stage');
-        // Also trim specs keys that are no longer in roi_subset
+        // Lesion specs: only ROIs still in Phase 1 selection AND PBPK-compatible
         const specs=updated[patientName]?.phase_1?.synthetic_lesions_stage?.specs;
         if(specs&&typeof specs==='object'){
-          const newSpecs={};Object.keys(specs).forEach(k=>{if(p1Set.has(k))newSpecs[k]=specs[k];});
+          const newSpecs={};Object.keys(specs).forEach(k=>{if(p1Set.has(k)&&pbpkSet.has(k))newSpecs[k]=specs[k];});
           updated[patientName]=deepSet(updated[patientName],['phase_1','synthetic_lesions_stage','specs'],Object.keys(newSpecs).length?newSpecs:null);
         }
       }
@@ -1256,12 +1399,18 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
         updated[p.name]=deepSet(updated[p.name]||tmpl,path,value);
         if(isP1Roi){
           const p1Set=new Set(value);
-          const trimRoi=(cfg,ph,st)=>{const cur=cfg?.[ph]?.[st]?.roi_subset;return Array.isArray(cur)?deepSet(cfg,[ph,st,'roi_subset'],cur.filter(r=>p1Set.has(r))):cfg;};
+          const pbpkSet=new Set(configMeta?.pbpk_compatible_rois||[]);
+          const trimRoi=(cfg,ph,st)=>{
+            const cur=cfg?.[ph]?.[st]?.roi_subset;
+            return Array.isArray(cur)
+              ?deepSet(cfg,[ph,st,'roi_subset'],cur.filter(r=>p1Set.has(r)&&pbpkSet.has(r)))
+              :cfg;
+          };
           updated[p.name]=trimRoi(updated[p.name],'phase_2','simind_stage');
           updated[p.name]=trimRoi(updated[p.name],'phase_2','opengate_stage');
           const specs=updated[p.name]?.phase_1?.synthetic_lesions_stage?.specs;
           if(specs&&typeof specs==='object'){
-            const ns={};Object.keys(specs).forEach(k=>{if(p1Set.has(k))ns[k]=specs[k];});
+            const ns={};Object.keys(specs).forEach(k=>{if(p1Set.has(k)&&pbpkSet.has(k))ns[k]=specs[k];});
             updated[p.name]=deepSet(updated[p.name],['phase_1','synthetic_lesions_stage','specs'],Object.keys(ns).length?ns:null);
           }
         }
@@ -1291,6 +1440,51 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
   };
 
   const roiChoices=(configMeta?.roi_choices||[]).filter(r=>r!=='remaining_body');
+  const roiTaskGroups=configMeta?.roi_task_groups||{};
+  const pbpkCompatibleRois=new Set(configMeta?.pbpk_compatible_rois||[]);
+  const roiOverlaps=configMeta?.roi_overlaps||{};
+  const page3Issues=[];
+  if(dirsCreated&&configMeta){
+    patients.forEach(p=>{
+      const cfg=patientConfigs[p.name]||configMeta.template||{};
+      const p1=cfg?.phase_1?.segmentation_stage?.roi_subset;
+      const p1List=Array.isArray(p1)?p1:[];
+      const p1Set=new Set(p1List);
+      if(p1List.length===0) page3Issues.push(`[${p.name}] Phase 1 needs at least one ROI selected`);
+      p1List.forEach(roi=>{
+        (roiOverlaps?.[roi]||[]).forEach(other=>{
+          if(p1Set.has(other)&&String(roi)<String(other))
+            page3Issues.push(`[${p.name}] Phase 1 selects overlapping ROIs: ${roi} and ${other}`);
+        });
+      });
+      const specs=cfg?.phase_1?.synthetic_lesions_stage?.specs;
+      const lesionRois=specs&&typeof specs==='object'?Object.keys(specs):[];
+      lesionRois.forEach(roi=>{
+        if(!p1Set.has(roi)) page3Issues.push(`[${p.name}] Synthetic lesion spec for ${roi} is not in Phase 1 roi_subset`);
+        if(!pbpkCompatibleRois.has(roi)) page3Issues.push(`[${p.name}] Synthetic lesion spec for ${roi} needs a dedicated non-Rest PBPK VOI`);
+      });
+      const checkSimStage=(enabled,label,roiSubset)=>{
+        if(!enabled) return;
+        const rois=Array.isArray(roiSubset)?roiSubset:[];
+        if(rois.length===0){page3Issues.push(`[${p.name}] ${label} needs at least one PBPK-compatible ROI`);return;}
+        const reserved=rois.filter(r=>RESERVED_ROIS.has(r));
+        if(reserved.length) page3Issues.push(`[${p.name}] ${label} contains internal ROI(s): ${reserved.join(', ')}`);
+        const missingP1=rois.filter(r=>!p1Set.has(r)&&!RESERVED_ROIS.has(r));
+        if(missingP1.length) page3Issues.push(`[${p.name}] ${label} ROI(s) not selected in Phase 1: ${missingP1.join(', ')}`);
+        const notPbpk=rois.filter(r=>!pbpkCompatibleRois.has(r));
+        if(notPbpk.length) page3Issues.push(`[${p.name}] ${label} ROI(s) without dedicated non-Rest PBPK VOI: ${notPbpk.join(', ')}`);
+        if(lesionRois.length){
+          const picked=lesionRois.filter(r=>rois.includes(r));
+          const missing=lesionRois.filter(r=>!rois.includes(r));
+          if(picked.length>0&&missing.length>0)
+            page3Issues.push(`[${p.name}] ${label} synthetic-lesion ROIs are all-or-none. Missing: ${missing.join(', ')}`);
+        }
+      };
+      checkSimStage(flags.spect,'SIMIND',cfg?.phase_2?.simind_stage?.roi_subset);
+      checkSimStage(flags.dosimetry,'OpenGATE',cfg?.phase_2?.opengate_stage?.roi_subset);
+    });
+  }
+  const canContinue=dirsCreated&&page3Issues.length===0;
 
   return(
     <div className="max-w-4xl mx-auto px-6 py-8">
@@ -1425,6 +1619,9 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
                           descriptions={configMeta.field_descriptions||{}}
                           pipelineOptions={configMeta.pipeline_options||{}}
                           roiChoices={roiChoices}
+                          roiTaskGroups={roiTaskGroups}
+                          pbpkCompatibleRois={pbpkCompatibleRois}
+                          roiOverlaps={roiOverlaps}
                           phase1RoiSubset={p1RoiSubset}
                           patientShape={shape}
                           nativeSpacing={nativeSpacing}
@@ -1441,8 +1638,14 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
         </div>
       )}
 
+      {page3Issues.length>0&&(
+        <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          <p className="font-semibold mb-1">Fix these config issues before continuing</p>
+          <ul className="space-y-0.5">{page3Issues.map((issue,i)=><li key={i}>- {issue}</li>)}</ul>
+        </div>
+      )}
       <div className="mt-6 flex justify-end">
-        <button onClick={onNext} disabled={!dirsCreated}
+        <button onClick={onNext} disabled={!canContinue}
           className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 rounded-xl font-semibold text-base transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm">
           Continue to Run →
         </button>
@@ -1565,8 +1768,17 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
       // Collect ROIs that have synthetic lesions
       const specs=cfg?.phase_1?.synthetic_lesions_stage?.specs;
       const lesionRois=specs&&typeof specs==='object'?Object.keys(specs):[];
-      const checkLesionSubset=(roi,stageName)=>{
-        if(!Array.isArray(roi)||lesionRois.length===0) return;
+      const p1Rois=cfg?.phase_1?.segmentation_stage?.roi_subset;
+      const p1Set=new Set(Array.isArray(p1Rois)?p1Rois:[]);
+      const checkSimulationSubset=(roi,stageName)=>{
+        if(!Array.isArray(roi)) return;
+        const reserved=roi.filter(r=>RESERVED_ROIS.has(r));
+        if(reserved.length)
+          issues.push(`[${p.name}] ${stageName} contains internal ROI(s): ${reserved.join(', ')}. The pipeline adds internal sources automatically.`);
+        const missingP1=roi.filter(r=>!p1Set.has(r)&&!RESERVED_ROIS.has(r));
+        if(missingP1.length)
+          issues.push(`[${p.name}] ${stageName} ROI(s) not selected in Phase 1: ${missingP1.join(', ')}`);
+        if(lesionRois.length===0) return;
         const picked=lesionRois.filter(r=>roi.includes(r));
         const missing=lesionRois.filter(r=>!roi.includes(r));
         if(picked.length>0&&missing.length>0)
@@ -1577,7 +1789,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
         const roi=cfg?.phase_2?.simind_stage?.roi_subset;
         if(!Array.isArray(roi)||roi.length===0)
           issues.push(`[${p.name}] SPECT is ON but no ROIs are selected in the SIMIND stage`);
-        else checkLesionSubset(roi,'SIMIND');
+        else checkSimulationSubset(roi,'SIMIND');
         validateXyzSpacingRule(cfg?.phase_2?.simind_stage?.xyz_spacing_mm,nativeSpacing)
           .forEach(msg=>issues.push(`[${p.name}] SIMIND xyz_spacing_mm ${msg}`));
       }
@@ -1592,7 +1804,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
         const roi=cfg?.phase_2?.opengate_stage?.roi_subset;
         if(!Array.isArray(roi)||roi.length===0)
           issues.push(`[${p.name}] Dosimetry is ON but no ROIs are selected in the OpenGATE stage`);
-        else checkLesionSubset(roi,'OpenGATE');
+        else checkSimulationSubset(roi,'OpenGATE');
         validateXyzSpacingRule(cfg?.phase_2?.opengate_stage?.xyz_spacing_mm,nativeSpacing)
           .forEach(msg=>issues.push(`[${p.name}] OpenGATE xyz_spacing_mm ${msg}`));
       }

@@ -1,0 +1,708 @@
+// Pipeline ROI Naming Map — single source of truth for all ROI definitions.
+//
+// DEVELOPER REFERENCE — VTT ROI ↔ PBPK VOI connections:
+// ┌─────────────────────────┬──────────────────────┬──────────────────────────────────────────┐
+// │ VTT ROI (pipeline name) │ PBPK VOI (PyCNO)     │ TotalSegmentator source labels           │
+// ├─────────────────────────┼──────────────────────┼──────────────────────────────────────────┤
+// │ kidney                  │ Kidney               │ kidney_left + kidney_right               │
+// │ liver                   │ Liver                │ liver                                    │
+// │ prostate                │ Prostate             │ prostate                                 │
+// │ spleen                  │ Spleen               │ spleen                                   │
+// │ heart                   │ Heart                │ heart                                    │
+// │ salivary_glands         │ SG                   │ parotid+submandibular L+R (head task)    │
+// │ lungs                   │ Lungs                │ 5 lung lobes (total task)                │
+// │ brain                   │ Brain                │ brain                                    │
+// │ gi_tract                │ GI                   │ stomach + small_bowel + duodenum + colon │
+// │ bone                    │ Bone                 │ spine + skull + ribs + major limb bones  │
+// │ muscle                  │ Muscle               │ gluteus + autochthon + iliopsoas groups  │
+// ├─────────────────────────┼──────────────────────┼──────────────────────────────────────────┤
+// │ adrenal_glands          │ (no dedicated VOI)   │ adrenal_gland_right + adrenal_gland_left │
+// │ thyroid_gland           │ (no dedicated VOI)   │ thyroid_gland                            │
+// │ gallbladder             │ (no dedicated VOI)   │ gallbladder                              │
+// │ pancreas                │ (no dedicated VOI)   │ pancreas                                 │
+// │ esophagus               │ (no dedicated VOI)   │ esophagus                                │
+// │ trachea                 │ (no dedicated VOI)   │ trachea                                  │
+// │ urinary_bladder         │ (no dedicated VOI)   │ urinary_bladder                          │
+// │ kidney_cyst             │ (no dedicated VOI)   │ kidney_cyst_left + kidney_cyst_right     │
+// │ spinal_cord             │ (no dedicated VOI)   │ spinal_cord                              │
+// │ aorta                   │ (no dedicated VOI)   │ aorta                                    │
+// │ pulmonary_vein          │ (no dedicated VOI)   │ pulmonary_vein                           │
+// │ brachiocephalic_vessels │ (no dedicated VOI)   │ brachiocephalic trunk+subclavian+vein L+R│
+// │ carotid_arteries        │ (no dedicated VOI)   │ common_carotid L+R                       │
+// │ portal_vein             │ (no dedicated VOI)   │ portal_vein_and_splenic_vein             │
+// │ iliac_arteries          │ (no dedicated VOI)   │ iliac_artery L+R                         │
+// │ iliac_veins             │ (no dedicated VOI)   │ iliac_vena L+R                           │
+// │ atrial_appendage        │ (no dedicated VOI)   │ atrial_appendage_left                    │
+// │ superior_vena_cava      │ (no dedicated VOI)   │ superior_vena_cava                       │
+// │ inferior_vena_cava      │ (no dedicated VOI)   │ inferior_vena_cava                       │
+// │ eyes                    │ (no dedicated VOI)   │ eye_left + eye_right (head task)         │
+// │ eye_lenses              │ (no dedicated VOI)   │ eye_lens_left + eye_lens_right           │
+// │ optic_nerves            │ (no dedicated VOI)   │ optic_nerve_left + optic_nerve_right     │
+// │ nasopharynx             │ (no dedicated VOI)   │ nasopharynx                              │
+// │ oropharynx              │ (no dedicated VOI)   │ oropharynx                               │
+// │ hypopharynx             │ (no dedicated VOI)   │ hypopharynx                              │
+// │ nasal_cavity            │ (no dedicated VOI)   │ nasal_cavity_right + nasal_cavity_left   │
+// │ auditory_canal          │ (no dedicated VOI)   │ auditory_canal_right + auditory_canal_left│
+// │ soft_palate             │ (no dedicated VOI)   │ soft_palate                              │
+// │ hard_palate             │ (no dedicated VOI)   │ hard_palate                              │
+// └─────────────────────────┴──────────────────────┴──────────────────────────────────────────┘
+//
+// PBPK_observables: PyCNO PSMA model observables requested by the PBPK stage.
+// pbpk_voi: PyCNO PSMA model observable name. null = no dedicated VOI (falls back to Rest TAC).
+//   User ROIs with a non-null, non-Rest pbpk_voi are "simulation-eligible".
+//   Internal labels:
+//     remaining_body -> Rest
+//     synthetic_lesion -> Tumor1
+// ui_category: grouping used in the web UI panel for each TotalSegmentator task.
+
+{
+    "total": { // TotalSegmentator "total" task label space (117 labels)
+        "1":  "spleen",
+        "2":  "kidney_right",
+        "3":  "kidney_left",
+        "4":  "gallbladder",
+        "5":  "liver",
+        "6":  "stomach",
+        "7":  "pancreas",
+        "8":  "adrenal_gland_right",
+        "9":  "adrenal_gland_left",
+        "10": "lung_upper_lobe_left",
+        "11": "lung_lower_lobe_left",
+        "12": "lung_upper_lobe_right",
+        "13": "lung_middle_lobe_right",
+        "14": "lung_lower_lobe_right",
+        "15": "esophagus",
+        "16": "trachea",
+        "17": "thyroid_gland",
+        "18": "small_bowel",
+        "19": "duodenum",
+        "20": "colon",
+        "21": "urinary_bladder",
+        "22": "prostate",
+        "23": "kidney_cyst_left",
+        "24": "kidney_cyst_right",
+        "25": "sacrum",
+        "26": "vertebrae_S1",
+        "27": "vertebrae_L5",
+        "28": "vertebrae_L4",
+        "29": "vertebrae_L3",
+        "30": "vertebrae_L2",
+        "31": "vertebrae_L1",
+        "32": "vertebrae_T12",
+        "33": "vertebrae_T11",
+        "34": "vertebrae_T10",
+        "35": "vertebrae_T9",
+        "36": "vertebrae_T8",
+        "37": "vertebrae_T7",
+        "38": "vertebrae_T6",
+        "39": "vertebrae_T5",
+        "40": "vertebrae_T4",
+        "41": "vertebrae_T3",
+        "42": "vertebrae_T2",
+        "43": "vertebrae_T1",
+        "44": "vertebrae_C7",
+        "45": "vertebrae_C6",
+        "46": "vertebrae_C5",
+        "47": "vertebrae_C4",
+        "48": "vertebrae_C3",
+        "49": "vertebrae_C2",
+        "50": "vertebrae_C1",
+        "51": "heart",
+        "52": "aorta",
+        "53": "pulmonary_vein",
+        "54": "brachiocephalic_trunk",
+        "55": "subclavian_artery_right",
+        "56": "subclavian_artery_left",
+        "57": "common_carotid_artery_right",
+        "58": "common_carotid_artery_left",
+        "59": "brachiocephalic_vein_left",
+        "60": "brachiocephalic_vein_right",
+        "61": "atrial_appendage_left",
+        "62": "superior_vena_cava",
+        "63": "inferior_vena_cava",
+        "64": "portal_vein_and_splenic_vein",
+        "65": "iliac_artery_left",
+        "66": "iliac_artery_right",
+        "67": "iliac_vena_left",
+        "68": "iliac_vena_right",
+        "69": "humerus_left",
+        "70": "humerus_right",
+        "71": "scapula_left",
+        "72": "scapula_right",
+        "73": "clavicula_left",
+        "74": "clavicula_right",
+        "75": "femur_left",
+        "76": "femur_right",
+        "77": "hip_left",
+        "78": "hip_right",
+        "79": "spinal_cord",
+        "80": "gluteus_maximus_left",
+        "81": "gluteus_maximus_right",
+        "82": "gluteus_medius_left",
+        "83": "gluteus_medius_right",
+        "84": "gluteus_minimus_left",
+        "85": "gluteus_minimus_right",
+        "86": "autochthon_left",
+        "87": "autochthon_right",
+        "88": "iliopsoas_left",
+        "89": "iliopsoas_right",
+        "90": "brain",
+        "91": "skull",
+        "92": "rib_left_1",
+        "93": "rib_left_2",
+        "94": "rib_left_3",
+        "95": "rib_left_4",
+        "96": "rib_left_5",
+        "97": "rib_left_6",
+        "98": "rib_left_7",
+        "99": "rib_left_8",
+        "100": "rib_left_9",
+        "101": "rib_left_10",
+        "102": "rib_left_11",
+        "103": "rib_left_12",
+        "104": "rib_right_1",
+        "105": "rib_right_2",
+        "106": "rib_right_3",
+        "107": "rib_right_4",
+        "108": "rib_right_5",
+        "109": "rib_right_6",
+        "110": "rib_right_7",
+        "111": "rib_right_8",
+        "112": "rib_right_9",
+        "113": "rib_right_10",
+        "114": "rib_right_11",
+        "115": "rib_right_12",
+        "116": "sternum",
+        "117": "costal_cartilages"
+    },
+    "body": { // TotalSegmentator "body" task — always run; used for body outline + remaining_body
+        "1": "body_trunc",
+        "2": "body_extremities"
+    },
+    "head_glands_cavities": { // TotalSegmentator "head_glands_cavities" task label space (19 labels)
+        "1":  "eye_left",
+        "2":  "eye_right",
+        "3":  "eye_lens_left",
+        "4":  "eye_lens_right",
+        "5":  "optic_nerve_left",
+        "6":  "optic_nerve_right",
+        "7":  "parotid_gland_left",
+        "8":  "parotid_gland_right",
+        "9":  "submandibular_gland_right",
+        "10": "submandibular_gland_left",
+        "11": "nasopharynx",
+        "12": "oropharynx",
+        "13": "hypopharynx",
+        "14": "nasal_cavity_right",
+        "15": "nasal_cavity_left",
+        "16": "auditory_canal_right",
+        "17": "auditory_canal_left",
+        "18": "soft_palate",
+        "19": "hard_palate"
+    },
+    "VTT_Pipeline": { // VTT pipeline label space — integer ID → ROI name in the unified segmentation
+        "0":  "background",
+        "1":  "remaining_body",
+        "2":  "kidney",
+        "3":  "liver",
+        "4":  "prostate",
+        "5":  "spleen",
+        "6":  "heart",
+        "7":  "salivary_glands",
+        "8":  "synthetic_lesion",
+        "9":  "lungs",
+        "10": "adrenal_glands",
+        "11": "thyroid_gland",
+        "12": "gallbladder",
+        "13": "stomach",
+        "14": "pancreas",
+        "15": "esophagus",
+        "16": "trachea",
+        "17": "small_bowel",
+        "18": "duodenum",
+        "19": "colon",
+        "20": "urinary_bladder",
+        "21": "brain",
+        "22": "kidney_cyst",
+        "23": "spine",
+        "24": "spinal_cord",
+        "25": "skull",
+        "26": "ribs",
+        "27": "aorta",
+        "28": "pulmonary_vein",
+        "29": "brachiocephalic_vessels",
+        "30": "carotid_arteries",
+        "31": "portal_vein",
+        "32": "iliac_arteries",
+        "33": "iliac_veins",
+        "34": "atrial_appendage",
+        "35": "superior_vena_cava",
+        "36": "inferior_vena_cava",
+        "37": "humerus",
+        "38": "scapula",
+        "39": "clavicula",
+        "40": "femur",
+        "41": "hip",
+        "42": "gluteus_maximus",
+        "43": "gluteus_medius",
+        "44": "gluteus_minimus",
+        "45": "autochthon",
+        "46": "iliopsoas",
+        "47": "eyes",
+        "48": "eye_lenses",
+        "49": "optic_nerves",
+        "50": "nasopharynx",
+        "51": "oropharynx",
+        "52": "hypopharynx",
+        "53": "nasal_cavity",
+        "54": "auditory_canal",
+        "55": "soft_palate",
+        "56": "hard_palate",
+        "57": "gi_tract",
+        "58": "bone",
+        "59": "muscle"
+    },
+    "VTT_allowed_rois": [
+        // -- total task: organs --
+        "kidney", "liver", "prostate", "spleen", "heart", "lungs",
+        "adrenal_glands", "thyroid_gland", "gallbladder", "gi_tract", "stomach",
+        "pancreas", "esophagus", "trachea", "small_bowel", "duodenum",
+        "colon", "urinary_bladder", "brain", "kidney_cyst",
+        // -- total task: bones --
+        "bone", "spine", "spinal_cord", "skull", "ribs",
+        "humerus", "scapula", "clavicula", "femur", "hip",
+        // -- total task: vessels --
+        "aorta", "pulmonary_vein", "brachiocephalic_vessels",
+        "carotid_arteries", "portal_vein", "iliac_arteries", "iliac_veins",
+        "atrial_appendage", "superior_vena_cava", "inferior_vena_cava",
+        // -- total task: muscles --
+        "muscle", "gluteus_maximus", "gluteus_medius", "gluteus_minimus",
+        "autochthon", "iliopsoas",
+        // -- head_glands_cavities task --
+        "salivary_glands", "eyes", "eye_lenses", "optic_nerves",
+        "nasopharynx", "oropharynx", "hypopharynx", "nasal_cavity",
+        "auditory_canal", "soft_palate", "hard_palate"
+    ],
+    "PBPK_observables": [
+        "Tumor1", "Tumor2", "Kidney", "Heart", "SG", "Bone",
+        "TumorRest", "Spleen", "Liver", "Prostate", "GI", "Rest",
+        "Skin", "Muscle", "Brain", "RedMarrow", "Lungs", "Adipose"
+    ],
+    "VTT_to_totseg": {
+        // ── ORGANS ─────────────────────────────────────────────────────────────────
+        "kidney": {
+            "task": "total",
+            "totseg_rois": ["kidney_left", "kidney_right"],
+            "pbpk_voi": "Kidney",
+            "ui_category": "organs"
+        },
+        "liver": {
+            "task": "total",
+            "totseg_rois": ["liver"],
+            "pbpk_voi": "Liver",
+            "ui_category": "organs"
+        },
+        "prostate": {
+            "task": "total",
+            "totseg_rois": ["prostate"],
+            "pbpk_voi": "Prostate",
+            "ui_category": "organs"
+        },
+        "spleen": {
+            "task": "total",
+            "totseg_rois": ["spleen"],
+            "pbpk_voi": "Spleen",
+            "ui_category": "organs"
+        },
+        "heart": {
+            "task": "total",
+            "totseg_rois": ["heart"],
+            "pbpk_voi": "Heart",
+            "ui_category": "organs"
+        },
+        "lungs": {
+            "task": "total",
+            "totseg_rois": [
+                "lung_upper_lobe_left", "lung_lower_lobe_left",
+                "lung_upper_lobe_right", "lung_middle_lobe_right", "lung_lower_lobe_right"
+            ],
+            "pbpk_voi": "Lungs",
+            "ui_category": "organs"
+        },
+        "brain": {
+            "task": "total",
+            "totseg_rois": ["brain"],
+            "pbpk_voi": "Brain",
+            "ui_category": "organs"
+        },
+        "adrenal_glands": {
+            "task": "total",
+            "totseg_rois": ["adrenal_gland_right", "adrenal_gland_left"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "thyroid_gland": {
+            "task": "total",
+            "totseg_rois": ["thyroid_gland"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "gallbladder": {
+            "task": "total",
+            "totseg_rois": ["gallbladder"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "gi_tract": {
+            "task": "total",
+            "totseg_rois": ["stomach", "small_bowel", "duodenum", "colon"],
+            "pbpk_voi": "GI",
+            "ui_category": "organs"
+        },
+        "stomach": {
+            "task": "total",
+            "totseg_rois": ["stomach"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "pancreas": {
+            "task": "total",
+            "totseg_rois": ["pancreas"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "esophagus": {
+            "task": "total",
+            "totseg_rois": ["esophagus"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "trachea": {
+            "task": "total",
+            "totseg_rois": ["trachea"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "small_bowel": {
+            "task": "total",
+            "totseg_rois": ["small_bowel"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "duodenum": {
+            "task": "total",
+            "totseg_rois": ["duodenum"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "colon": {
+            "task": "total",
+            "totseg_rois": ["colon"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "urinary_bladder": {
+            "task": "total",
+            "totseg_rois": ["urinary_bladder"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        "kidney_cyst": {
+            "task": "total",
+            "totseg_rois": ["kidney_cyst_left", "kidney_cyst_right"],
+            "pbpk_voi": null,
+            "ui_category": "organs"
+        },
+        // ── BONES ──────────────────────────────────────────────────────────────────
+        "bone": {
+            "task": "total",
+            "totseg_rois": [
+                "sacrum",
+                "vertebrae_S1",
+                "vertebrae_L5", "vertebrae_L4", "vertebrae_L3", "vertebrae_L2", "vertebrae_L1",
+                "vertebrae_T12", "vertebrae_T11", "vertebrae_T10", "vertebrae_T9", "vertebrae_T8",
+                "vertebrae_T7", "vertebrae_T6", "vertebrae_T5", "vertebrae_T4", "vertebrae_T3",
+                "vertebrae_T2", "vertebrae_T1",
+                "vertebrae_C7", "vertebrae_C6", "vertebrae_C5", "vertebrae_C4",
+                "vertebrae_C3", "vertebrae_C2", "vertebrae_C1",
+                "skull",
+                "rib_left_1",  "rib_left_2",  "rib_left_3",  "rib_left_4",
+                "rib_left_5",  "rib_left_6",  "rib_left_7",  "rib_left_8",
+                "rib_left_9",  "rib_left_10", "rib_left_11", "rib_left_12",
+                "rib_right_1", "rib_right_2", "rib_right_3", "rib_right_4",
+                "rib_right_5", "rib_right_6", "rib_right_7", "rib_right_8",
+                "rib_right_9", "rib_right_10","rib_right_11","rib_right_12",
+                "sternum", "costal_cartilages",
+                "humerus_left", "humerus_right",
+                "scapula_left", "scapula_right",
+                "clavicula_left", "clavicula_right",
+                "femur_left", "femur_right",
+                "hip_left", "hip_right"
+            ],
+            "pbpk_voi": "Bone",
+            "ui_category": "bones"
+        },
+        "spine": {
+            "task": "total",
+            "totseg_rois": [
+                "sacrum",
+                "vertebrae_S1",
+                "vertebrae_L5", "vertebrae_L4", "vertebrae_L3", "vertebrae_L2", "vertebrae_L1",
+                "vertebrae_T12", "vertebrae_T11", "vertebrae_T10", "vertebrae_T9", "vertebrae_T8",
+                "vertebrae_T7", "vertebrae_T6", "vertebrae_T5", "vertebrae_T4", "vertebrae_T3",
+                "vertebrae_T2", "vertebrae_T1",
+                "vertebrae_C7", "vertebrae_C6", "vertebrae_C5", "vertebrae_C4",
+                "vertebrae_C3", "vertebrae_C2", "vertebrae_C1"
+            ],
+            "pbpk_voi": null,
+            "ui_category": "bones"
+        },
+        "skull": {
+            "task": "total",
+            "totseg_rois": ["skull"],
+            "pbpk_voi": null,
+            "ui_category": "bones"
+        },
+        "ribs": {
+            "task": "total",
+            "totseg_rois": [
+                "rib_left_1",  "rib_left_2",  "rib_left_3",  "rib_left_4",
+                "rib_left_5",  "rib_left_6",  "rib_left_7",  "rib_left_8",
+                "rib_left_9",  "rib_left_10", "rib_left_11", "rib_left_12",
+                "rib_right_1", "rib_right_2", "rib_right_3", "rib_right_4",
+                "rib_right_5", "rib_right_6", "rib_right_7", "rib_right_8",
+                "rib_right_9", "rib_right_10","rib_right_11","rib_right_12",
+                "sternum", "costal_cartilages"
+            ],
+            "pbpk_voi": null,
+            "ui_category": "bones"
+        },
+        "spinal_cord": {
+            "task": "total",
+            "totseg_rois": ["spinal_cord"],
+            "pbpk_voi": null,
+            "ui_category": "bones"
+        },
+        "humerus": {
+            "task": "total",
+            "totseg_rois": ["humerus_left", "humerus_right"],
+            "pbpk_voi": null,
+            "ui_category": "bones"
+        },
+        "scapula": {
+            "task": "total",
+            "totseg_rois": ["scapula_left", "scapula_right"],
+            "pbpk_voi": null,
+            "ui_category": "bones"
+        },
+        "clavicula": {
+            "task": "total",
+            "totseg_rois": ["clavicula_left", "clavicula_right"],
+            "pbpk_voi": null,
+            "ui_category": "bones"
+        },
+        "femur": {
+            "task": "total",
+            "totseg_rois": ["femur_left", "femur_right"],
+            "pbpk_voi": null,
+            "ui_category": "bones"
+        },
+        "hip": {
+            "task": "total",
+            "totseg_rois": ["hip_left", "hip_right"],
+            "pbpk_voi": null,
+            "ui_category": "bones"
+        },
+        // ── VESSELS ────────────────────────────────────────────────────────────────
+        "aorta": {
+            "task": "total",
+            "totseg_rois": ["aorta"],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        "pulmonary_vein": {
+            "task": "total",
+            "totseg_rois": ["pulmonary_vein"],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        "brachiocephalic_vessels": {
+            "task": "total",
+            "totseg_rois": [
+                "brachiocephalic_trunk",
+                "subclavian_artery_right", "subclavian_artery_left",
+                "brachiocephalic_vein_left", "brachiocephalic_vein_right"
+            ],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        "carotid_arteries": {
+            "task": "total",
+            "totseg_rois": ["common_carotid_artery_right", "common_carotid_artery_left"],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        "portal_vein": {
+            "task": "total",
+            "totseg_rois": ["portal_vein_and_splenic_vein"],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        "iliac_arteries": {
+            "task": "total",
+            "totseg_rois": ["iliac_artery_left", "iliac_artery_right"],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        "iliac_veins": {
+            "task": "total",
+            "totseg_rois": ["iliac_vena_left", "iliac_vena_right"],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        "atrial_appendage": {
+            "task": "total",
+            "totseg_rois": ["atrial_appendage_left"],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        "superior_vena_cava": {
+            "task": "total",
+            "totseg_rois": ["superior_vena_cava"],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        "inferior_vena_cava": {
+            "task": "total",
+            "totseg_rois": ["inferior_vena_cava"],
+            "pbpk_voi": null,
+            "ui_category": "vessels"
+        },
+        // ── MUSCLES ────────────────────────────────────────────────────────────────
+        "muscle": {
+            "task": "total",
+            "totseg_rois": [
+                "gluteus_maximus_left", "gluteus_maximus_right",
+                "gluteus_medius_left", "gluteus_medius_right",
+                "gluteus_minimus_left", "gluteus_minimus_right",
+                "autochthon_left", "autochthon_right",
+                "iliopsoas_left", "iliopsoas_right"
+            ],
+            "pbpk_voi": "Muscle",
+            "ui_category": "muscles"
+        },
+        "gluteus_maximus": {
+            "task": "total",
+            "totseg_rois": ["gluteus_maximus_left", "gluteus_maximus_right"],
+            "pbpk_voi": null,
+            "ui_category": "muscles"
+        },
+        "gluteus_medius": {
+            "task": "total",
+            "totseg_rois": ["gluteus_medius_left", "gluteus_medius_right"],
+            "pbpk_voi": null,
+            "ui_category": "muscles"
+        },
+        "gluteus_minimus": {
+            "task": "total",
+            "totseg_rois": ["gluteus_minimus_left", "gluteus_minimus_right"],
+            "pbpk_voi": null,
+            "ui_category": "muscles"
+        },
+        "autochthon": {
+            "task": "total",
+            "totseg_rois": ["autochthon_left", "autochthon_right"],
+            "pbpk_voi": null,
+            "ui_category": "muscles"
+        },
+        "iliopsoas": {
+            "task": "total",
+            "totseg_rois": ["iliopsoas_left", "iliopsoas_right"],
+            "pbpk_voi": null,
+            "ui_category": "muscles"
+        },
+        // ── HEAD GLANDS & CAVITIES ─────────────────────────────────────────────────
+        "salivary_glands": {
+            "task": "head_glands_cavities",
+            "totseg_rois": [
+                "parotid_gland_left", "parotid_gland_right",
+                "submandibular_gland_left", "submandibular_gland_right"
+            ],
+            "pbpk_voi": "SG",
+            "ui_category": "head"
+        },
+        "eyes": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["eye_left", "eye_right"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        "eye_lenses": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["eye_lens_left", "eye_lens_right"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        "optic_nerves": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["optic_nerve_left", "optic_nerve_right"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        "nasopharynx": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["nasopharynx"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        "oropharynx": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["oropharynx"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        "hypopharynx": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["hypopharynx"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        "nasal_cavity": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["nasal_cavity_right", "nasal_cavity_left"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        "auditory_canal": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["auditory_canal_right", "auditory_canal_left"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        "soft_palate": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["soft_palate"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        "hard_palate": {
+            "task": "head_glands_cavities",
+            "totseg_rois": ["hard_palate"],
+            "pbpk_voi": null,
+            "ui_category": "head"
+        },
+        // ── RESERVED (not user-selectable) ─────────────────────────────────────────
+        "synthetic_lesion": {
+            "task": "synthetic",
+            "totseg_rois": [],
+            "pbpk_voi": "Tumor1",
+            "ui_category": null
+        },
+        "remaining_body": {
+            "task": "body",
+            "totseg_rois": [],
+            "pbpk_voi": "Rest",
+            "ui_category": null
+        }
+    }
+}

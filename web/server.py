@@ -44,7 +44,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from src.io.config_paths import inject_pipeline_paths, load_pipeline_paths, strip_developer_fields
+from src.io.config_paths import get_pipeline_input_paths, inject_pipeline_paths, load_pipeline_paths, strip_developer_fields
 from src.io.profiler import validate_profile_interval_s
 from src.io.rerun_fingerprints import flatten_paths
 from src.io.rerun_guard import (
@@ -66,6 +66,7 @@ from src.io.rerun_guard import (
     stage_metadata_path,
     synthetic_lesions_enabled,
 )
+from src.tests.validate_config import validate_config
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).parent.parent.resolve()
@@ -73,7 +74,6 @@ WEB_DIR   = Path(__file__).parent
 STATIC_DIR = WEB_DIR / "static"
 CONFIG_TEMPLATE   = REPO_ROOT / "config_template.json"
 MAIN_PY           = REPO_ROOT / "main.py"
-VTT_MAP           = REPO_ROOT / "src" / "data" / "vtt_map.json"
 PIPELINE_OPTIONS  = REPO_ROOT / "src" / "data" / "pipeline_options.json"
 
 UPLOAD_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -152,7 +152,6 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "max_lesion_placement_attempts": "Maximum random placement attempts per lesion before giving up",
     "model_type": "PBPK pharmacokinetic model type. Currently only 'PSMA' (Lu-177 PSMA) is supported",
     "isotope": "Radionuclide for PBPK and simulation. Currently only 'lu177' (Lutetium-177) is supported",
-    "VOIs": "PBPK volumes of interest to model. These are PyCNO observable names. Must cover all segmented ROIs",
     "Randomization_Kidney_SG_Para": "Randomize kidney and salivary-gland PBPK parameters via lognormal sampling — simulates patient-to-patient variability",
     "xyz_spacing_mm": "Target voxel spacing in mm as [sxy, sxy, sz]. X and Y must match. XY must be >= both native in-plane spacings; Z must be >= the native CT z-spacing (only coarser grids allowed). The pipeline logs the native CT spacing at runtime. Null = native CT resolution (no downsampling).",
     "Collimator": "SIMIND collimator code (e.g. 'si-me' = Siemens medium-energy parallel-hole). Must match your SIMIND install",
@@ -198,9 +197,6 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "seed": "Random seed for this organ's lesion placement. 0 = non-reproducible",
 }
 
-ROI_CHOICES = ["kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"]
-
-
 # ── Config template ────────────────────────────────────────────────────────────
 @app.get("/api/config-template")
 async def get_config_template() -> Dict:
@@ -220,17 +216,65 @@ async def get_config_template() -> Dict:
     # SIMINDDirectory, etc.) — these come from pipeline_paths.json, not from the user.
     data = strip_developer_fields(data)
 
-    # Load ROI choices from the shared label map (VTT_Pipeline section, excluding reserved labels)
     _RESERVED = {"background", "remaining_body", "synthetic_lesion"}
+    roi_choices: List[str] = []
+    roi_task_groups: Dict[str, Dict[str, List[str]]] = {}
+    pbpk_compatible_rois: List[str] = []
+    roi_pbpk_voi: Dict[str, Optional[str]] = {}
+    roi_overlaps: Dict[str, List[str]] = {}
+
     try:
-        tdt_raw = VTT_MAP.read_text(encoding="utf-8")
-        tdt_map = json.loads(json_minify(tdt_raw))
+        label_map_path = Path(get_pipeline_input_paths(REPO_ROOT)["label_map_path"])
+        roi_map = json.loads(json_minify(label_map_path.read_text(encoding="utf-8")))
+
+        # Flat list for backward-compat (all user-selectable ROIs)
         roi_choices = [
-            name for name in tdt_map.get("VTT_Pipeline", tdt_map.get("TDT_Pipeline", {})).values()
+            name for name in roi_map.get("VTT_Pipeline", {}).values()
             if name not in _RESERVED
         ]
-    except Exception:
-        roi_choices = ROI_CHOICES  # fallback to hardcoded list
+
+        # Structured by TotalSegmentator task + ui_category for the task-based UI
+        vtt_to_totseg = roi_map.get("VTT_to_totseg", {})
+        for roi_name, entry in vtt_to_totseg.items():
+            if roi_name in _RESERVED or roi_name not in roi_choices:
+                continue
+            task = entry.get("task")
+            category = entry.get("ui_category")
+            if not task or not category:
+                continue
+            roi_task_groups.setdefault(task, {}).setdefault(category, []).append(roi_name)
+            voi = entry.get("pbpk_voi")
+            roi_pbpk_voi[roi_name] = voi if isinstance(voi, str) else None
+
+        # ROIs with a dedicated non-null PBPK VOI (simulation-eligible)
+        pbpk_compatible_rois = [
+            roi for roi, entry in vtt_to_totseg.items()
+            if roi not in _RESERVED and entry.get("pbpk_voi") not in (None, "Rest")
+        ]
+
+        # ROI groups that share TotalSegmentator source labels are mutually exclusive
+        # in Phase 1; selecting both would make label-painting order affect output.
+        roi_sources: Dict[str, set] = {}
+        for roi_name, entry in vtt_to_totseg.items():
+            if roi_name in _RESERVED or roi_name not in roi_choices:
+                continue
+            task = entry.get("task")
+            sources = entry.get("totseg_rois", []) or []
+            roi_sources[roi_name] = {(task, str(source)) for source in sources}
+        for roi_a, sources_a in roi_sources.items():
+            for roi_b, sources_b in roi_sources.items():
+                if roi_a >= roi_b:
+                    continue
+                if sources_a & sources_b:
+                    roi_overlaps.setdefault(roi_a, []).append(roi_b)
+                    roi_overlaps.setdefault(roi_b, []).append(roi_a)
+        roi_overlaps = {roi: sorted(overlaps) for roi, overlaps in roi_overlaps.items()}
+    except Exception as e:
+        raise HTTPException(
+            500,
+            "Could not load ROI metadata from input_paths.label_map_path in "
+            f"src/data/pipeline_paths.json: {e}",
+        )
 
     # Load pipeline options (dropdowns) — supports JSONC comments via json_minify
     pipeline_options: Dict = {}
@@ -256,6 +300,10 @@ async def get_config_template() -> Dict:
     return {
         "template": data,
         "roi_choices": roi_choices,
+        "roi_task_groups": roi_task_groups,
+        "pbpk_compatible_rois": pbpk_compatible_rois,
+        "roi_pbpk_voi": roi_pbpk_voi,
+        "roi_overlaps": roi_overlaps,
         "field_descriptions": FIELD_DESCRIPTIONS,
         "pipeline_options": pipeline_options,
     }
@@ -646,6 +694,22 @@ def _validate_patient_rerun(
             }
         )
 
+    config_invalid = False
+    try:
+        validate_config(
+            config_full,
+            run_spect=bool(flags.get("spect", False)),
+            run_dosimetry=bool(flags.get("dosimetry", False)),
+            run_postprocess=bool(flags.get("postprocess", False)),
+            repo_root=str(REPO_ROOT),
+        )
+    except ValueError as exc:
+        conflicts.append({"stage": "config_validation", "message": str(exc)})
+        config_invalid = True
+
+    if config_invalid:
+        return conflicts
+
     synthetic_enabled = synthetic_lesions_enabled(config_full)
 
     phase1_dir = output_dir / config_full["phase_1"]["sub_dir_name"]
@@ -661,6 +725,7 @@ def _validate_patient_rerun(
         seg_stage_dir / f"{seg_cfg['unification_prefix']}.nii.gz",
         phase1_dir / "digital_twin.nii.gz",
     ]
+    _label_map_path = get_pipeline_input_paths(REPO_ROOT)["label_map_path"]
     seg_message = _validate_stage_rerun_state(
         stage_name="segmentation_stage",
         output_dir=output_dir,
@@ -668,7 +733,7 @@ def _validate_patient_rerun(
         config_snapshot=build_segmentation_rerun_snapshot(config_full),
         ct_identity=ct_identity,
         dependency_fingerprints={
-            "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
+            "label_map_json": fingerprint_optional_file(_label_map_path),
         },
     )
     if seg_message:
@@ -676,8 +741,9 @@ def _validate_patient_rerun(
 
     syn_cfg = config_full["phase_1"]["synthetic_lesions_stage"]
     syn_prefix = syn_cfg["file_prefix"]
-    syn_stage_dir = phase1_dir / "synthetic_lesions_stage" / "work_dir"
-    syn_pre_lesion_path = syn_stage_dir / f"{syn_prefix}_pre_lesions.nii.gz"
+    syn_stage_dir = phase1_dir / syn_cfg.get("sub_dir_name", "synthetic_lesions_stage")
+    syn_work_dir = syn_stage_dir / "work_dir"
+    syn_pre_lesion_path = syn_work_dir / f"{syn_prefix}_pre_lesions.nii.gz"
     syn_markers = [
         syn_pre_lesion_path,
         syn_stage_dir / f"{syn_prefix}_all_lesions_binary.nii.gz",
@@ -694,7 +760,7 @@ def _validate_patient_rerun(
                 "segmentation_stage_metadata": fingerprint_optional_file(
                     stage_metadata_path(output_dir, "segmentation_stage")
                 ),
-                "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
+                "label_map_json": fingerprint_optional_file(_label_map_path),
                 "pre_lesion_seg_handoff": fingerprint_optional_file(
                     syn_pre_lesion_path if syn_pre_lesion_path.exists() else phase1_dir / "digital_twin.nii.gz"
                 ),
@@ -715,7 +781,9 @@ def _validate_patient_rerun(
         required_outputs=pbpk_markers,
         config_snapshot=build_pbpk_rerun_snapshot(config_full, synthetic_enabled=synthetic_enabled),
         ct_identity=ct_identity,
-        dependency_fingerprints={},
+        dependency_fingerprints={
+            "label_map_json": fingerprint_optional_file(_label_map_path),
+        },
     )
     if pbpk_message:
         conflicts.append({"stage": "pbpk_tac_stage", "message": pbpk_message})
@@ -748,12 +816,12 @@ def _validate_patient_rerun(
         simind_deps = {
             "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
             "vtt_roi_seg": fingerprint_optional_file(expected_vtt_handoff),
-            "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
+            "label_map_json": fingerprint_optional_file(_label_map_path),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(output_dir, "segmentation_stage")
             ),
         }
-        if synthetic_enabled:
+        if "synthetic_lesion" in simind_snapshot["resolved_roi_subset"]:
             simind_deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
                 stage_metadata_path(output_dir, "synthetic_lesions_stage")
             )
@@ -782,12 +850,12 @@ def _validate_patient_rerun(
         og_deps = {
             "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
             "vtt_roi_seg": fingerprint_optional_file(expected_vtt_handoff),
-            "label_map_json": fingerprint_optional_file(seg_cfg["label_map_path"]),
+            "label_map_json": fingerprint_optional_file(_label_map_path),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(output_dir, "segmentation_stage")
             ),
         }
-        if synthetic_enabled:
+        if "synthetic_lesion" in og_snapshot["resolved_roi_subset"]:
             og_deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
                 stage_metadata_path(output_dir, "synthetic_lesions_stage")
             )

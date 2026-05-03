@@ -49,7 +49,7 @@ Incoming `context` must provide:
     - "file_prefix": str
     - "specs": dict | None
 - context.config["phase_1"]["segmentation_stage"]["roi_subset"]
-- context.config["phase_1"]["segmentation_stage"]["label_map_path"]
+- label map loaded from ``src/data/pipeline_paths.json`` input_paths.label_map_path
 - context.vtt_roi_seg_path: str (unified multilabel seg produced by TdtRoiUnifyStage)
 """
 
@@ -64,6 +64,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import nibabel as nib
 import numpy as np
 
+from src.io.config_paths import get_label_map_path
 from src.io.rerun_guard import (
     assert_stage_rerun_safe,
     build_stage_metadata,
@@ -118,7 +119,8 @@ class SyntheticLesionsStage:
 
         # Output base directory for this stage (under phase 1)
         self.phase_output_dir: str = context.subdir_paths["phase_1"]
-        self.output_dir: str = os.path.join(self.phase_output_dir, "synthetic_lesions_stage")
+        _syn_subdir = context.config.get("phase_1", {}).get("synthetic_lesions_stage", {}).get("sub_dir_name", "synthetic_lesions_stage")
+        self.output_dir: str = os.path.join(self.phase_output_dir, _syn_subdir)
         self.work_dir: str = os.path.join(self.output_dir, "work_dir")
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.work_dir, exist_ok=True)
@@ -158,8 +160,8 @@ class SyntheticLesionsStage:
         self.global_lbl_path = os.path.join(self.output_dir, f"{self.prefix}_all_lesions_labels.nii.gz")
         self.backup_path = os.path.join(self.work_dir, f"{self.prefix}_pre_lesions.nii.gz")
 
-        # Load label map from configured phase 1 unification stage path
-        _label_map_path = context.config["phase_1"]["segmentation_stage"]["label_map_path"]
+        # Load label map from pipeline_paths.json
+        _label_map_path = get_label_map_path()
         self.vtt_name2id = load_vtt_label_map(_label_map_path)
         if "synthetic_lesion" not in self.vtt_name2id:
             raise ValueError(
@@ -174,13 +176,12 @@ class SyntheticLesionsStage:
 
     def _current_dependency_fingerprints(self) -> Dict[str, Any]:
         """Return fingerprints for dependencies that must remain unchanged on rerun."""
-        label_map_path = self.context.config["phase_1"]["segmentation_stage"]["label_map_path"]
         pre_lesion_seg_path = self.backup_path if os.path.exists(self.backup_path) else self.vtt_roi_seg_path
         return {
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
             ),
-            "label_map_json": fingerprint_optional_file(label_map_path),
+            "label_map_json": fingerprint_optional_file(get_label_map_path()),
             "pre_lesion_seg_handoff": fingerprint_optional_file(pre_lesion_seg_path),
         }
 

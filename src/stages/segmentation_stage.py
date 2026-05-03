@@ -12,7 +12,7 @@ Incoming `context` is expected to provide:
 - context.config["phase_1"]["segmentation_stage"]["roi_subset"] : list[str]
 - context.config["phase_1"]["segmentation_stage"]["file_prefix"] : str
 - context.config["phase_1"]["segmentation_stage"]["unification_prefix"] : str
-- context.config["phase_1"]["segmentation_stage"]["label_map_path"] : str
+- label map loaded from ``src/data/pipeline_paths.json`` input_paths.label_map_path
 - context.subdir_paths["phase_1"] : str
 
 On success, this stage sets:
@@ -39,6 +39,7 @@ from torch.cuda.amp import GradScaler as _GradScaler
 from totalsegmentator.python_api import totalsegmentator
 from json_minify import json_minify
 
+from src.io.config_paths import get_label_map_path
 from src.io.rerun_guard import (
     assert_stage_rerun_safe,
     build_stage_metadata,
@@ -124,9 +125,9 @@ class SegmentationStage:
         self.stage_output_path: str = os.path.join(self.output_dir, f"{self.unification_prefix}.nii.gz") 
         self.unification_metadata_path: str = os.path.join(self.output_dir, f"{self.unification_prefix}_metadata.json") 
 
-        # Load label map for ROI unification 
-        self.ts_map_path: str = context.config["phase_1"]["segmentation_stage"]["label_map_path"] 
-        if not os.path.exists(self.ts_map_path): 
+        # Load label map for ROI unification
+        self.ts_map_path: str = get_label_map_path()
+        if not os.path.exists(self.ts_map_path):
             raise FileNotFoundError(f"Class map json not found: {self.ts_map_path}") 
 
         with open(self.ts_map_path, encoding="utf-8") as f: 
@@ -142,8 +143,8 @@ class SegmentationStage:
         self.vtt_name2id: Dict[str, int] = {
             name: int(lab) for lab, name in ts_map_json["VTT_Pipeline"].items()
         }
-        # VTT_allowed_rois and VTT_to_totseg live in vtt_map.json — loaded here so
-        # the stage has no hardcoded ROI or TotalSegmentator coupling.
+        # VTT_allowed_rois and VTT_to_totseg live in pipeline_roi_naming_map.json — loaded
+        # here so the stage has no hardcoded ROI or TotalSegmentator coupling.
         self.vtt_allowed_rois: set = set(ts_map_json["VTT_allowed_rois"])
         self.vtt_to_totseg: Dict[str, Any] = ts_map_json["VTT_to_totseg"]
 
@@ -297,15 +298,18 @@ class SegmentationStage:
             if self.head_glands_cavities_ml_path is None or not os.path.exists(self.head_glands_cavities_ml_path): 
                 raise FileNotFoundError(f"Head seg not found: {self.head_glands_cavities_ml_path}") 
 
-    def _create_roi_unified(                                                           
+    def _create_roi_unified(
         self,
         body_seg: np.ndarray,
         total_seg: Optional[np.ndarray],
         head_seg: Optional[np.ndarray],
-        plan: TotSegPlan,                                                              
+        plan: TotSegPlan,
     ) -> np.ndarray:
         """
         Build the unified VTT multilabel volume by painting ROIs in priority order.
+
+        Fully data-driven: reads totseg_rois lists from pipeline_roi_naming_map.json
+        via self.vtt_to_totseg — no hardcoded per-organ logic.
 
         Parameters
         ----------
@@ -321,36 +325,44 @@ class SegmentationStage:
         roi_unified = np.zeros(body_seg.shape, dtype=np.uint8)
         roi_unified[body_seg > 0] = self.vtt_name2id["remaining_body"]
 
-        requested = set(plan["vtt_roi_subset"])                                        
+        if total_seg is not None and total_seg.shape != body_seg.shape:
+            raise ValueError(
+                f"Shape mismatch body vs total: {body_seg.shape} vs {total_seg.shape}"
+            )
+        if head_seg is not None and head_seg.shape != body_seg.shape:
+            raise ValueError(
+                f"Shape mismatch body vs head: {body_seg.shape} vs {head_seg.shape}"
+            )
 
-        if total_seg is not None:
-            if total_seg.shape != body_seg.shape:
-                raise ValueError(
-                    f"Shape mismatch body vs total: {body_seg.shape} vs {total_seg.shape}"
-                )
-            if "kidney" in requested:
-                kL = self.total_name2id["kidney_left"]
-                kR = self.total_name2id["kidney_right"]
-                roi_unified[(total_seg == kL) | (total_seg == kR)] = self.vtt_name2id["kidney"]
-            if "liver" in requested:
-                roi_unified[total_seg == self.total_name2id["liver"]] = self.vtt_name2id["liver"]
-            if "prostate" in requested:
-                roi_unified[total_seg == self.total_name2id["prostate"]] = self.vtt_name2id["prostate"]
-            if "spleen" in requested:
-                roi_unified[total_seg == self.total_name2id["spleen"]] = self.vtt_name2id["spleen"]
-            if "heart" in requested:
-                roi_unified[total_seg == self.total_name2id["heart"]] = self.vtt_name2id["heart"]
+        assigned_voxels = roi_unified > self.vtt_name2id["remaining_body"]
+        for vtt_roi in plan["vtt_roi_subset"]:
+            entry = self.vtt_to_totseg.get(vtt_roi)
+            if not entry:
+                continue
+            vtt_label = self.vtt_name2id.get(vtt_roi)
+            if vtt_label is None:
+                continue
+            task = entry["task"]
+            totseg_rois = entry["totseg_rois"]
 
-        if head_seg is not None and "salivary_glands" in requested:
-            if head_seg.shape != body_seg.shape:
-                raise ValueError(
-                    f"Shape mismatch body vs head: {body_seg.shape} vs {head_seg.shape}"
+            new_mask = np.zeros(body_seg.shape, dtype=bool)
+            if task == "total" and total_seg is not None:
+                ids = [self.total_name2id[r] for r in totseg_rois if r in self.total_name2id]
+                if ids:
+                    new_mask = np.isin(total_seg, ids)
+            elif task == "head_glands_cavities" and head_seg is not None:
+                ids = [self.head_name2id[r] for r in totseg_rois if r in self.head_name2id]
+                if ids:
+                    new_mask = np.isin(head_seg, ids)
+
+            overlap = new_mask & assigned_voxels
+            if overlap.any():
+                raise AssertionError(
+                    f"ROI '{vtt_roi}' overlaps with previously assigned voxels in the unified label map. "
+                    "Check VTT_to_totseg for duplicate totseg_rois entries across ROIs."
                 )
-            pL = self.head_name2id["parotid_gland_left"]
-            pR = self.head_name2id["parotid_gland_right"]
-            sL = self.head_name2id["submandibular_gland_left"]
-            sR = self.head_name2id["submandibular_gland_right"]
-            roi_unified[np.isin(head_seg, [pL, pR, sL, sR])] = self.vtt_name2id["salivary_glands"]
+            roi_unified[new_mask] = vtt_label
+            assigned_voxels |= new_mask
 
         return roi_unified
 
@@ -483,9 +495,11 @@ class SegmentationStage:
             self.context.vtt_roi_seg_path = self.final_output_path
             return self.context
 
+        device = "gpu" if torch.cuda.is_available() else "cpu"
+
         if plan["run_body"] and not body_ml_done:
             print("Running TotalSegmentator for task: BODY...")
-            totalsegmentator(self.ct_nii_path, self.body_ml_path, ml=self.ml, task="body")
+            totalsegmentator(self.ct_nii_path, self.body_ml_path, ml=self.ml, task="body", device=device)
 
         if plan["run_total"] and not total_ml_done:
             print("Running TotalSegmentator for task: TOTAL...")
@@ -495,6 +509,7 @@ class SegmentationStage:
                 ml=self.ml,
                 task="total",
                 roi_subset=plan["total_roi_subset"],
+                device=device,
             )
 
         if plan["run_head_glands_cavities"] and not head_glands_cavities_ml_done:
@@ -504,6 +519,7 @@ class SegmentationStage:
                 self.head_glands_cavities_ml_path,
                 ml=self.ml,
                 task="head_glands_cavities",
+                device=device,
             )
 
         # Final existence checks (only for what was requested).

@@ -61,5 +61,6 @@ def load_and_validate_runtime_config(
         run_spect=run_spect,
         run_dosimetry=run_dosimetry,
         run_postprocess=run_postprocess,
+        repo_root=str(repo_root),
     )
     return cfg

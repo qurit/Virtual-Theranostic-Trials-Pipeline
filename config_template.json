@@ -24,13 +24,13 @@
     "segmentation_stage": {
 
       // Organs to segment and carry into all downstream stages.
-      // Valid names: see "TDT_Pipeline" in src/data/vtt_map.json.
+      // Valid names: see "VTT_allowed_rois" in src/data/pipeline_roi_naming_map.json.
       // Reserved labels (background, body, synthetic_lesion) must NOT appear here.
       // Every ROI used in simulation or lesion specs must be listed here.
       "roi_subset": ["kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"]
     },
 
-    // ── 1.2  Synthetic Lesion Generation  (requires --synthetic_lesions) ──────
+    // ── 1.2  Synthetic Lesion Generation  (auto-runs when specs are present) ──
     "synthetic_lesions_stage": {
 
       // Global RNG seed across all organs. 0 = non-reproducible.
@@ -49,7 +49,8 @@
       "max_lesion_placement_attempts": 4000,
 
       // Per-organ lesion specs. Set to null to skip lesion insertion.
-      // Each key must appear in segmentation_stage.roi_subset.
+      // Each key must appear in segmentation_stage.roi_subset and must have a
+      // dedicated non-Rest PBPK VOI in pipeline_roi_naming_map.json.
       //
       // Placement modes (prob):
       //   "uniform"      — random placement anywhere inside the organ
@@ -80,15 +81,6 @@
       // Radionuclide. Must match the isotope used in simulation stages.
       "isotope": "lu177",
 
-      // PyCNO volumes-of-interest. These are PyCNO observable names — NOT the
-      // same as TDT ROI names. Each segmented organ is mapped automatically
-      // (e.g. kidney → Kidney). Unmatched organs fall back to "Rest".
-      "VOIs": [
-        "Tumor1", "Tumor2", "Kidney", "Heart", "SG", "Bone",
-        "TumorRest", "Spleen", "Liver", "Prostate", "GI", "Rest",
-        "Skin", "Muscle", "Brain", "RedMarrow", "Lungs", "Adipose"
-      ],
-
       // Draw kidney and salivary-gland PBPK parameters from lognormal distributions
       // to model inter-patient pharmacokinetic variability. false = deterministic.
       "Randomization_Kidney_SG_Para": true
@@ -103,7 +95,10 @@
     // ── 2.1  SIMIND SPECT Simulation  (requires --spect) ──────────────────────
     "simind_stage": {
 
-      // ROIs to simulate. Must be a subset of segmentation_stage.roi_subset.
+      // ROIs to simulate. Must be a subset of segmentation_stage.roi_subset and
+      // have a dedicated non-Rest PBPK VOI in pipeline_roi_naming_map.json.
+      // If any selected ROI has synthetic lesions, all lesion-host ROIs must be
+      // selected; the internal synthetic_lesion/Tumor1 source is added automatically.
       "roi_subset": ["liver", "kidney", "salivary_glands"],
 
       // Target voxel spacing in mm as [sxy, sxy, sz], or null to use native CT spacing.
@@ -157,7 +152,9 @@
     // ── 2.2  OpenGATE Dosimetry Simulation  (requires --dosimetry) ────────────
     "opengate_stage": {
 
-      // ROIs to compute dose maps for. Must be a subset of segmentation_stage.roi_subset.
+      // ROIs to compute dose maps for. Must be a subset of segmentation_stage.roi_subset
+      // and have a dedicated non-Rest PBPK VOI in pipeline_roi_naming_map.json.
+      // Synthetic lesion source handling follows the same rule as SIMIND.
       "roi_subset": ["liver", "kidney", "salivary_glands"],
 
       // Save a per-ROI dose map NIfTI for each simulated organ (Gy/decay).

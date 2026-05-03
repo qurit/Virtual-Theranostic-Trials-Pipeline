@@ -6,7 +6,7 @@ them for use by downstream simulation and post-processing stages.
 
 Core responsibilities
 ---------------------
-- Validate PBPK configuration inputs (VOIs, CT input path).
+- Validate PBPK configuration inputs and CT identity.
 - Optionally randomize kidney/salivary-gland parameters (lognormal sampling).
 - Optionally extract patient height/weight from a DICOM directory.
 - Run the PyCNO PSMA model to obtain TACs (time, tacs).
@@ -29,7 +29,6 @@ Incoming `context` is expected to provide:
     - "file_prefix" : str
     - "model_type" : str  (e.g. "PSMA")
     - "isotope" : str  (e.g. "lu177")
-    - "VOIs" : list[str]  (PyCNO observables, e.g. ["Kidney","Liver","Rest",...])
     - "Randomization_Kidney_SG_Para" : bool
 - context.downstream_roi_subset : list[str]
 
@@ -56,16 +55,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pycno
 
+from src.io.config_paths import get_label_map_path
 from src.io.rerun_guard import (
     assert_stage_rerun_safe,
     build_stage_metadata,
     build_pbpk_rerun_snapshot,
+    fingerprint_optional_file,
     stage_metadata_path,
     write_json,
 )
-from src.utils.tac_utils import roi_to_voi
 from src.utils.dicom_utils import extract_height_weight
-from src.utils.label_utils import load_isotope_config
+from src.utils.label_utils import load_isotope_config, load_pbpk_observables, roi_to_voi
 
 
 class PbpkTacStage:
@@ -104,7 +104,8 @@ class PbpkTacStage:
 
         self.prefix: str = self.stage_cfg.get("file_prefix", self.stage_cfg.get("name", "pbpk"))
         self.model_type: str = self.stage_cfg.get("model_type", "PSMA")
-        self.vois_pbpk: List[str] = list(self.stage_cfg["VOIs"])
+        self.label_map_path: str = get_label_map_path()
+        self.vois_pbpk: List[str] = load_pbpk_observables(self.label_map_path)
         self.randomize_kidney_sg_para: bool = self.stage_cfg["Randomization_Kidney_SG_Para"]
 
         # Isotope configuration — loaded from src/data/isotope_config.json
@@ -137,6 +138,12 @@ class PbpkTacStage:
             self.context.config,
             synthetic_enabled=bool(getattr(self.context, "synthetic_lesions_enabled", False)),
         )
+
+    def _current_dependency_fingerprints(self) -> Dict[str, Any]:
+        """Return developer metadata fingerprints that affect generated TACs."""
+        return {
+            "label_map_json": fingerprint_optional_file(self.label_map_path),
+        }
 
     # ------------------------------------------------------------------
     # helpers
@@ -176,7 +183,7 @@ class PbpkTacStage:
         if not os.path.exists(self.ct_input_path):
             raise ValueError(f"CT input path does not exist: {self.ct_input_path}")
         if not isinstance(self.vois_pbpk, (list, tuple)) or len(self.vois_pbpk) == 0:
-            raise ValueError("PBPK VOIs must be a non-empty list/tuple")
+            raise ValueError("PBPK observables must be a non-empty list/tuple")
 
         if not isinstance(self.randomize_kidney_sg_para, bool):
             raise ValueError("Randomization_Kidney_SG_Para must be True or False")
@@ -359,7 +366,7 @@ class PbpkTacStage:
             stage_name="pbpk_tac_stage",
             config_snapshot=self._rerun_config_snapshot(),
             ct_identity=self.ct_input_identity,
-            upstream_fingerprints={},
+            upstream_fingerprints=self._current_dependency_fingerprints(),
             outputs=outputs,
             extra=extra,
         )
@@ -382,7 +389,7 @@ class PbpkTacStage:
             required_outputs=[self.tac_json_path, self.tac_npz_path],
             current_config_snapshot=self._rerun_config_snapshot(),
             current_ct_identity=self.ct_input_identity,
-            current_upstream_fingerprints={},
+            current_upstream_fingerprints=self._current_dependency_fingerprints(),
             context=self.context,
         )
 
@@ -425,7 +432,7 @@ class PbpkTacStage:
         tac_values: Dict[str, np.ndarray] = {}
 
         for roi_name in self.downstream_roi_subset:
-            voi_name = roi_to_voi(roi_name)
+            voi_name = roi_to_voi(roi_name, self.label_map_path)
 
             if voi_name is None or voi_name not in self.vois_pbpk:
                 if "Rest" in self.vois_pbpk:

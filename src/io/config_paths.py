@@ -18,7 +18,13 @@ from json_minify import json_minify
 
 
 DEVELOPER_CONFIG_FIELDS = frozenset(
-    {"output_folder_title", "sub_dir_name", "file_prefix", "unification_prefix", "label_map_path", "SIMINDDirectory"}
+    {
+        "output_folder_title",
+        "sub_dir_name",
+        "file_prefix",
+        "unification_prefix",
+        "SIMINDDirectory",
+    }
 )
 
 _PHASE_KEYS = ("phase_1", "phase_2", "phase_3")
@@ -38,22 +44,25 @@ def get_pipeline_input_paths(repo_root: str | Path) -> Dict[str, str]:
     """
     Return resolved developer-controlled input paths.
 
-    ``label_map_path`` falls back to the repository copy of ``vtt_map.json``
-    when the field is blank in ``pipeline_paths.json``.
+    Paths are read from ``pipeline_paths.json`` only; keep that JSON updated
+    when developer-controlled file locations change.
     """
     repo_root = Path(repo_root)
     input_paths = load_pipeline_paths(repo_root).get("input_paths", {})
 
-    label_map_path = str(input_paths.get("label_map_path", "")).strip()
-    if not label_map_path:
-        label_map_path = str(repo_root / "src" / "data" / "vtt_map.json")
-
     simind_directory = str(input_paths.get("SIMINDDirectory", "")).strip()
 
     return {
-        "label_map_path": label_map_path,
+        "label_map_path": str(input_paths.get("label_map_path", "")).strip(),
         "SIMINDDirectory": simind_directory,
     }
+
+
+def get_label_map_path(repo_root: str | Path | None = None) -> str:
+    """Return the label map path from ``pipeline_paths.json``."""
+    if repo_root is None:
+        repo_root = Path(__file__).parent.parent.parent
+    return get_pipeline_input_paths(repo_root)["label_map_path"]
 
 
 def strip_developer_fields(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -91,7 +100,7 @@ def inject_pipeline_paths(
     repo_root : str or Path
         Repository root used to locate ``pipeline_paths.json``.
     include_input_paths : bool
-        When true, also inject ``label_map_path`` and ``SIMINDDirectory``.
+        When true, also inject ``SIMINDDirectory`` from pipeline_paths.json.
         When false, only structural naming fields are injected.
     """
     cfg_copy = copy.deepcopy(cfg)
@@ -100,9 +109,6 @@ def inject_pipeline_paths(
 
     if include_input_paths:
         input_paths = get_pipeline_input_paths(repo_root)
-        seg_stage = cfg_copy.setdefault("phase_1", {}).setdefault("segmentation_stage", {})
-        seg_stage["label_map_path"] = input_paths["label_map_path"]
-
         simind_directory = input_paths["SIMINDDirectory"]
         if simind_directory:
             simind_stage = cfg_copy.setdefault("phase_2", {}).setdefault("simind_stage", {})

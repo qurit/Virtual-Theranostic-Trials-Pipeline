@@ -107,7 +107,7 @@ Pass `--port PORT` to change the port, or `--no-browser` to skip auto-open.
 |------|------------|
 | **1-Intro** | Read the pipeline overview and prerequisite checklist, then click **Get Started**. |
 | **2 — CT Input** | Click **Choose CT Folder** to open a native folder picker, or type an absolute path into the text field and click **Scan** (useful on remote/Azure servers where a local desktop picker is unavailable). Patients are detected automatically — DICOM subdirectories and `.nii` / `.nii.gz` files both work. Axial, coronal, and sagittal previews are generated for each CT. |
-| **3 — Configure** | Enter a project name (determines the output folder). Toggle pipeline stages: **SPECT**, **Dosimetry**, **Post-Processing**. Choose **PRODUCTION** or **DEBUG** mode. Expand each patient card to adjust per-patient parameters — every field has a tooltip and changes auto-save. The voxel-spacing control is split into **XY** and **Z**: XY is applied to both X and Y, must stay square in-plane, and must be greater than or equal to the native CT in-plane spacing; Z must be greater than or equal to the native CT Z spacing. Synthetic lesions are configured per-patient by adding organ specs in Phase 1 — the stage runs automatically for any patient whose config includes specs, and is skipped for patients without specs. The synthetic lesion editor supports automatic radii, manual per-lesion radii, and fully user-defined centres. If profiling is enabled, the UI also exposes a sampling-interval dropdown (0.1-3.0 s, default 2.0 s). If output directories from a previous run are detected, the UI compares the selected CT and effective stage config against saved rerun metadata before allowing a rerun. |
+| **3 — Configure** | Enter a project name (determines the output folder). Toggle pipeline stages: **SPECT**, **Dosimetry**, **Post-Processing**. Choose **PRODUCTION** or **DEBUG** mode. Expand each patient card to adjust per-patient parameters — every field has a tooltip and changes auto-save. The voxel-spacing control is split into **XY** and **Z**: XY is applied to both X and Y, must stay square in-plane, and must be greater than or equal to the native CT in-plane spacing; Z must be greater than or equal to the native CT Z spacing. ROI pickers show PBPK and lesion badges, prevent grouped/child ROI overlap, and block invalid simulation selections before the Run page. Synthetic lesions are configured per-patient by adding organ specs in Phase 1 — the stage runs automatically for any patient whose config includes specs, and is skipped for patients without specs. The synthetic lesion editor supports automatic radii, manual per-lesion radii, and fully user-defined centres. If profiling is enabled, the UI also exposes a sampling-interval dropdown (0.1-3.0 s, default 2.0 s). If output directories from a previous run are detected, the UI compares the selected CT and effective stage config against saved rerun metadata before allowing a rerun. |
 | **4 — Run** | Review the per-patient configuration summary, then click **Run Pipeline**. |
 
 #### Web UI dependencies
@@ -133,13 +133,13 @@ cp config_template.json inputs/my_config.json
 
 **Must update (most users)**
 - `phase_1.segmentation_stage.roi_subset` — list of ROIs to segment. `remaining_body` (the body outline minus all named organs) is always added automatically — do not include it explicitly.
-- `phase_2.simind_stage.roi_subset` — list of ROIs for SIMIND simulation.
-- `phase_2.opengate_stage.roi_subset` — list of ROIs for OpenGATE dosimetry.
+- `phase_2.simind_stage.roi_subset` — list of PBPK-compatible, non-Rest ROIs for SIMIND simulation. Every ROI must also be present in `phase_1.segmentation_stage.roi_subset`.
+- `phase_2.opengate_stage.roi_subset` — list of PBPK-compatible, non-Rest ROIs for OpenGATE dosimetry. Every ROI must also be present in `phase_1.segmentation_stage.roi_subset`.
 - `phase_3.spect_postprocess_stage.FrameStartTimes` and `FrameDurations` — frame timing for SPECT reconstruction.
 - `src/data/pipeline_paths.json` → `input_paths.SIMINDDirectory` — path to your SIMIND install (set once, shared across all runs).
 
 **Synthetic lesions (optional, per-patient)**
-- `phase_1.synthetic_lesions_stage.specs` — add an organ-keyed dict to enable synthetic lesion generation for a patient. The stage runs automatically when specs are present and is skipped when `specs` is absent or `null`. This means different patients in the same batch can have different lesion configurations.
+- `phase_1.synthetic_lesions_stage.specs` — add an organ-keyed dict to enable synthetic lesion generation for a patient. Each lesion host must be a Phase 1 ROI with a dedicated non-Rest PBPK VOI. The stage runs automatically when specs are present and is skipped when `specs` is absent or `null`. If SIMIND or OpenGATE selects any ROI that has synthetic lesions, that same simulation stage must select all lesion-host ROIs; the internal `synthetic_lesion` / `Tumor1` source is added automatically.
 
 **Common tweaks (runtime / quality)**
 - `phase_2.simind_stage.NumPhotons`, `NumProjections`, `EnergyWindowWidth` — simulation fidelity vs. runtime. `NumProjections` must be ≥ 64; fewer projections causes angular undersampling and streak artifacts in OSEM reconstruction. The constraint `Subsets × Iterations ≤ NumProjections` must also hold.
@@ -326,9 +326,9 @@ src/
 
   utils/
     nifti_utils.py                  <- NIfTI I/O helpers; axis transposition; spacing/volume
-    label_utils.py                  <- VTT label map I/O; isotope config loader; class maps; ROI seg filtering
+    label_utils.py                  <- ROI/PBPK metadata I/O; isotope config loader; class maps; ROI seg filtering
     dicom_utils.py                  <- Patient height/weight extraction from DICOM tags
-    tac_utils.py                    <- TAC/PBPK helpers: ROI↔VOI mapping, cumulated activity
+    tac_utils.py                    <- TAC/PBPK helpers: cumulated activity
     resize_utils.py                 <- Simulation grid resolution; voxel spacing validation
     lesion_utils.py                 <- Synthetic lesion geometry: placement, overlap, labelmap
     opengate_utils.py               <- SimpleITK helpers: centering, resampling, HU tables
@@ -341,7 +341,7 @@ src/
 
   data/
     isotope_config.json             <- Isotope data: half-lives, attenuation coefficients, nuclear params
-    vtt_map.json                    <- VTT_Pipeline label space (unified ROI label map + TotalSegmentator mappings)
+    pipeline_roi_naming_map.json    <- Full ROI definition table: VTT label IDs, TotalSegmentator task mappings, PBPK VOI names, PBPK observables, UI categories
     pipeline_paths.json             <- Developer-facing path configuration (SIMIND dir, output root)
     pipeline_options.json           <- Stage defaults and UI option lists
     smc.smc / scattwin.win          <- SIMIND template files
@@ -354,12 +354,7 @@ src/
 
 | Notebook | Description |
 |----------|-------------|
-| `paper_analysis.ipynb` | **Multi-patient analysis** — iterates all CT outputs, visualises every pipeline stage, runs a PBPK vs Recon-SPECT TAC comparison study, and plots CPU/RAM profiling data across patients. Set `CT_DIR`, `OUTPUT_TITLE`, `OUTPUT_ROOT`, `PARAM_LABEL`, and `PROFILE_PHASE` at the top. |
-| `scripts/single_patient_script.ipynb` | Detailed single-patient deep-dive. |
-| `scripts/multi_patient_analysis_script.ipynb` | Legacy multi-patient analysis (older pipeline format). |
-| `scripts/synthetic_lesions.ipynb` | Synthetic lesion visualisation. |
-| `scripts/opengate_script.ipynb` | OpenGATE dosimetry outputs. |
-| `scripts/lesion_analysis.ipynb` | Per-lesion dose and activity analysis. |
+| `scripts/output_analysis.ipynb` | Multi-patient output inspection, stage visualisation, PBPK vs reconstructed-SPECT TAC comparisons, profiling summaries, and synthetic-lesion views. |
 
 ---
 

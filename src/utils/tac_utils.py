@@ -4,41 +4,12 @@ TAC / PBPK utilities shared across pipeline stages.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import numpy as np
+
+from src.utils.label_utils import roi_to_voi
 
 # NumPy 2.0 renamed np.trapz → np.trapezoid
 _trapezoid = getattr(np, "trapezoid", None) or np.trapz
-
-
-# ---------------------------------------------------------------------------
-# ROI ↔ VOI name mapping
-# ---------------------------------------------------------------------------
-
-# Mapping from VTT segmentation ROI names to PyCNO PSMA model VOI observable names.
-# Used by PbpkTacStage (to select VOIs to simulate) and by any downstream stage
-# that needs to look up a TAC by VOI name.
-# ROIs not in this map should fall back to "Rest" in the caller.
-_ROI_TO_VOI: dict[str, str] = {
-    "kidney":           "Kidney",
-    "remaining_body":   "Rest",
-    "liver":            "Liver",
-    "prostate":         "Prostate",
-    "heart":            "Heart",
-    "spleen":           "Spleen",
-    "salivary_glands":  "SG",
-    "synthetic_lesion": "Tumor1",
-}
-
-
-def roi_to_voi(roi_name: str) -> Optional[str]:
-    """
-    Map a VTT ROI name to its PyCNO PSMA VOI observable name.
-
-    Returns None if there is no explicit mapping (callers should fall back to "Rest").
-    """
-    return _ROI_TO_VOI.get(roi_name, None)
 
 
 # ---------------------------------------------------------------------------

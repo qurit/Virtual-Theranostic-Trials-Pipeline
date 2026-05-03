@@ -8,24 +8,43 @@ discovering issues one run at a time.
 
 Checks performed
 ----------------
-- ``output_folder_title``   — non-empty string
-- ``label_map_path``        — validated only when explicitly present in the config
-- ``roi_subset`` (seg.)     — non-empty list of strings
-- ``pbpk_tac_stage.isotope``— string; must be in pipeline_options.json allowed list
-- ``pbpk_tac_stage.VOIs``   — non-empty list
-- Synthetic-lesion specs   — validated when ``phase_1.synthetic_lesions_stage.specs`` is set
-- ``SIMINDDirectory``       — read from ``pipeline_paths.json`` input_paths; path must exist (``--spect`` only)
-- SIMIND ``roi_subset``     — subset of segmentation ``roi_subset``
-- SIMIND ``Collimator``     — string; must be in allowed list
-- SIMIND ``Isotope``        — string
-- SIMIND numeric fields     — ``NumPhotons``, ``NumProjections``, etc. must be numbers
-- ``xyz_spacing_mm``        — null or a list of 3 positive floats ``[sxy, sxy, sz]`` (mm)
-- OpenGATE ``roi_subset``   — subset of segmentation ``roi_subset``
-- OpenGATE gate numerics    — ``total_histories``, ``num_cpu`` must be numbers
+- ``output_folder_title``      — non-empty string
+- ``label_map_path``           — loaded from ``pipeline_paths.json`` and must exist
+- ``roi_subset`` (seg.)        — non-empty list of recognised VTT ROI names
+                                 (validated against ``VTT_allowed_rois`` in
+                                 ``pipeline_roi_naming_map.json``)
+- ``pbpk_tac_stage.isotope``   — string; must be in pipeline_options.json allowed list
+- PBPK VOIs                   — loaded from the configured ROI metadata map
+- Synthetic-lesion specs       — validated when ``phase_1.synthetic_lesions_stage.specs``
+                                 is set; each ROI must be PBPK-compatible (non-null
+                                 ``pbpk_voi`` in ``pipeline_roi_naming_map.json``)
+- ``SIMINDDirectory``          — read from ``pipeline_paths.json`` input_paths; path must
+                                 exist (``--spect`` only)
+- SIMIND ``roi_subset``        — subset of segmentation ``roi_subset``; each ROI must be
+                                 PBPK-compatible; synthetic-lesion hosts are all-or-none
+                                 (``--spect`` only)
+- SIMIND ``Collimator``        — string; must be in allowed list
+- SIMIND ``isotope``           — string
+- SIMIND ``NumProjections``    — must be ≥ 64 (fewer causes angular undersampling)
+- SIMIND ``NumPhotons``        — must be positive
+- SIMIND numeric fields        — ``EnergyWindowWidth``, ``DetectorDistance``, etc.
+                                 must be numbers
+- ``xyz_spacing_mm``           — null or a 3-element list ``[sxy, sxy, sz]`` of positive
+                                 floats in mm; X and Y must be equal (square in-plane)
+- OpenGATE ``roi_subset``      — subset of segmentation ``roi_subset``; each ROI must be
+                                 PBPK-compatible; synthetic-lesion hosts are all-or-none
+                                 (``--dosimetry`` only)
+- OpenGATE gate numerics       — ``total_histories`` (positive), ``num_cpu`` must be numbers
+- ``dosemap_postprocess_stage.apply_tac`` — must be true when ``--postprocess
+                                 --dosimetry`` are both set (required for absolute dose)
 - ``FrameStartTimes`` /
-  ``FrameDurations``        — same length; all elements must be numbers
-- SPECT reconstruction
-  numerics                  — ``Iterations``, ``Subsets`` must be numbers
+  ``FrameDurations``           — same length; all elements must be numbers
+- SPECT reconstruction         — ``Iterations``, ``Subsets`` must be numbers;
+                                 ``Subsets × Iterations`` must not exceed
+                                 ``NumProjections``
+- Cross-stage isotope          — ``pbpk_tac_stage.isotope`` must match
+                                 ``simind_stage.isotope`` and
+                                 ``opengate_stage.source.isotope``
 
 Usage
 -----
@@ -41,11 +60,21 @@ import json
 import math
 import os
 import warnings
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
 
 from json_minify import json_minify
 
 from src.io.config_paths import get_pipeline_input_paths
+from src.utils.label_utils import RESERVED_ROIS, load_pbpk_compatible_rois, load_pipeline_roi_map
+
+
+def _load_roi_map(repo_root: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Load the pipeline ROI metadata map from pipeline_paths.json; returns None on failure."""
+    path = get_pipeline_input_paths(repo_root).get("label_map_path")
+    try:
+        return load_pipeline_roi_map(path)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +165,25 @@ def validate_config(
     errors: List[str] = []
     _allowed = _load_allowed_options(repo_root)
 
+    # Load ROI map for validation (allowed ROI names + PBPK-compatible subset)
+    _roi_map = _load_roi_map(repo_root, config)
+    _vtt_allowed_rois: Set[str] = set(_roi_map.get("VTT_allowed_rois", [])) if _roi_map else set()
+    _label_map_path = get_pipeline_input_paths(repo_root).get("label_map_path")
+    try:
+        _pbpk_compatible: Set[str] = load_pbpk_compatible_rois(_label_map_path)
+    except Exception:
+        _pbpk_compatible = set()
+
     # ── Internal helpers ───────────────────────────────────────────────────────
 
     def _err(msg: str) -> None:
         errors.append(msg)
+
+    if _roi_map is None:
+        _err(
+            "Could not read pipeline ROI metadata map. Check "
+            "'input_paths.label_map_path' in src/data/pipeline_paths.json."
+        )
 
     def _check_number(val: Any, field: str) -> None:
         """Append an error if *val* is not a genuine number (bools excluded)."""
@@ -318,6 +362,81 @@ def validate_config(
                     f"'{prefix}.user_centers_zyx' is only used when prob='user_defined'"
                 )
 
+    def _check_no_overlapping_totseg_sources(rois: List[str], field: str) -> None:
+        """Reject ROI selections that would paint the same TotalSegmentator label twice."""
+        if not _roi_map:
+            return
+        vtt_to_totseg = _roi_map.get("VTT_to_totseg", {})
+        seen: Dict[tuple[str, str], str] = {}
+        overlaps: List[str] = []
+        for roi_name in rois:
+            entry = vtt_to_totseg.get(roi_name)
+            if not isinstance(entry, dict):
+                continue
+            task = str(entry.get("task", ""))
+            if task in {"body", "synthetic"}:
+                continue
+            for source_name in entry.get("totseg_rois", []) or []:
+                key = (task, str(source_name))
+                if key in seen:
+                    overlaps.append(
+                        f"{roi_name!r} overlaps {seen[key]!r} on {task}:{source_name}"
+                    )
+                else:
+                    seen[key] = roi_name
+        if overlaps:
+            _err(
+                f"'{field}' contains overlapping ROI groups: {overlaps}. "
+                "Choose either the grouped PBPK ROI (for simulation/lesions) or its "
+                "individual anatomical child ROIs, not both."
+            )
+
+    def _check_simulation_roi_subset(stage_field: str, stage_rois: Any, lesion_rois: List[str]) -> None:
+        """Validate SIMIND/OpenGATE user ROI subset contract."""
+        if not isinstance(stage_rois, list):
+            _err(f"'{stage_field}' must be a list")
+            return
+        if len(stage_rois) == 0:
+            _err(f"'{stage_field}' must contain at least one PBPK-compatible ROI")
+            return
+
+        manual_internal = [r for r in stage_rois if r in RESERVED_ROIS]
+        if manual_internal:
+            _err(
+                f"'{stage_field}' contains internal/reserved ROI(s) {manual_internal}. "
+                "'remaining_body' and 'synthetic_lesion' are added internally when needed; "
+                "do not list them in config."
+            )
+
+        bad = [r for r in stage_rois if r not in roi_subset]
+        if bad:
+            _err(
+                f"'{stage_field}' contains ROIs not in "
+                f"'phase_1.segmentation_stage.roi_subset': {bad}. "
+                "Add them to segmentation roi_subset or remove them here."
+            )
+        if _pbpk_compatible:
+            not_pbpk = [r for r in stage_rois if r not in _pbpk_compatible]
+            if not_pbpk:
+                _err(
+                    f"'{stage_field}' contains ROIs without a dedicated non-Rest "
+                    f"PBPK VOI: {not_pbpk}. Simulation requires a distinct "
+                    f"time-activity curve per ROI. Use a grouped PBPK ROI such as "
+                    "'bone', 'gi_tract', or 'muscle' where applicable, or remove "
+                    "the ROI from simulation."
+                )
+        if lesion_rois:
+            picked_lesion = [r for r in stage_rois if r in lesion_rois]
+            missing_lesion = [r for r in lesion_rois if r not in stage_rois]
+            if picked_lesion and missing_lesion:
+                _err(
+                    f"'{stage_field}' includes ROIs with synthetic lesions "
+                    f"({picked_lesion}) but is missing other ROIs that also "
+                    f"have synthetic lesions ({missing_lesion}). Either include all "
+                    "synthetic-lesion host ROIs or none. The synthetic_lesion source "
+                    "is then added internally."
+                )
+
     # ── Top-level ──────────────────────────────────────────────────────────────
 
     title = config.get("output_folder_title")
@@ -338,12 +457,16 @@ def validate_config(
     # Segmentation stage
     seg = p1.get("segmentation_stage", {})
 
-    # label_map_path is injected automatically at runtime from the repo root;
-    # only validate it when it is explicitly present in the config.
-    lmp = seg.get("label_map_path", "")
-    if lmp and not os.path.exists(lmp):
+    # label_map_path is developer-controlled; read from pipeline_paths.json.
+    lmp = str(_label_map_path or "").strip()
+    if not lmp:
         _err(
-            "'phase_1.segmentation_stage.label_map_path' does not exist: "
+            "'input_paths.label_map_path' in src/data/pipeline_paths.json must "
+            "point to the pipeline ROI metadata map"
+        )
+    elif not os.path.exists(lmp):
+        _err(
+            "'input_paths.label_map_path' in src/data/pipeline_paths.json does not exist: "
             f"{lmp!r}"
         )
 
@@ -360,6 +483,13 @@ def validate_config(
                     f"'phase_1.segmentation_stage.roi_subset[{i}]' must be "
                     f"a string, got {type(r).__name__}: {r!r}"
                 )
+            elif _vtt_allowed_rois and r not in _vtt_allowed_rois:
+                _err(
+                    f"'phase_1.segmentation_stage.roi_subset[{i}]' value {r!r} is not "
+                    f"a recognised VTT ROI name. See src/data/pipeline_roi_naming_map.json "
+                    f"VTT_allowed_rois for the full list."
+                )
+        _check_no_overlapping_totseg_sources(roi_subset, "phase_1.segmentation_stage.roi_subset")
     # Guard downstream cross-checks if roi_subset is malformed
     if not isinstance(roi_subset, list):
         roi_subset = []
@@ -379,12 +509,8 @@ def validate_config(
             f"in the allowed list: {_allowed['isotope']}"
         )
 
-    vois = pbpk.get("VOIs", [])
-    if not isinstance(vois, list) or len(vois) == 0:
-        _err(
-            "'phase_1.pbpk_tac_stage.VOIs' must be a non-empty list of "
-            "PyCNO VOI name strings"
-        )
+    # PBPK VOIs are developer-controlled in the configured ROI metadata map.
+    # A legacy config may still contain pbpk_tac_stage.VOIs, but it is ignored.
 
     # Synthetic lesions stage — validated whenever specs are present in config
     sl = p1.get("synthetic_lesions_stage", {})
@@ -402,6 +528,15 @@ def validate_config(
                 _check_number(v, f"phase_1.synthetic_lesions_stage.{num_field}")
         _check_synthetic_lesion_specs(sl.get("specs"), roi_subset)
         lesion_rois = [r for r in sl["specs"] if isinstance(r, str)]
+        if _pbpk_compatible:
+            not_pbpk = [r for r in lesion_rois if r not in _pbpk_compatible]
+            if not_pbpk:
+                _err(
+                    f"'phase_1.synthetic_lesions_stage.specs' defines lesions for ROIs "
+                    f"without a dedicated PBPK VOI: {not_pbpk}. Synthetic lesions require "
+                    f"a distinct TAC so their signal can be separated in simulation. "
+                    f"Remove these ROIs from specs or add a PBPK VOI mapping."
+                )
 
     # ── Phase 2 ────────────────────────────────────────────────────────────────
 
@@ -428,29 +563,10 @@ def validate_config(
                 "(set in src/data/pipeline_paths.json → input_paths.SIMINDDirectory)"
             )
 
-        # roi_subset must be a subset of the segmentation roi_subset
+        # roi_subset must be a subset of the segmentation roi_subset AND PBPK-compatible.
+        # Synthetic lesion source labels are resolved internally from lesion host ROIs.
         simind_rois = simind.get("roi_subset", [])
-        if not isinstance(simind_rois, list):
-            _err("'phase_2.simind_stage.roi_subset' must be a list")
-        else:
-            bad = [r for r in simind_rois if r not in roi_subset]
-            if bad:
-                _err(
-                    "'phase_2.simind_stage.roi_subset' contains ROIs not in "
-                    f"'phase_1.segmentation_stage.roi_subset': {bad}. "
-                    "Add them to segmentation roi_subset or remove them here."
-                )
-            if lesion_rois:
-                picked_lesion = [r for r in simind_rois if r in lesion_rois]
-                missing_lesion = [r for r in lesion_rois if r not in simind_rois]
-                if picked_lesion and missing_lesion:
-                    _err(
-                        f"'phase_2.simind_stage.roi_subset' includes ROIs with synthetic "
-                        f"lesions ({picked_lesion}) but is missing other ROIs that also "
-                        f"have synthetic lesions ({missing_lesion}). Either include all "
-                        f"synthetic-lesion ROIs or none — partial selection leaves those "
-                        "lesions absorbed into remaining_body, corrupting the simulation."
-                    )
+        _check_simulation_roi_subset("phase_2.simind_stage.roi_subset", simind_rois, lesion_rois)
 
         collimator = simind.get("Collimator")
         if not isinstance(collimator, str):
@@ -524,27 +640,7 @@ def validate_config(
         og = p2.get("opengate_stage", {})
 
         og_rois = og.get("roi_subset", [])
-        if not isinstance(og_rois, list):
-            _err("'phase_2.opengate_stage.roi_subset' must be a list")
-        else:
-            bad = [r for r in og_rois if r not in roi_subset]
-            if bad:
-                _err(
-                    "'phase_2.opengate_stage.roi_subset' contains ROIs not in "
-                    f"'phase_1.segmentation_stage.roi_subset': {bad}. "
-                    "Add them to segmentation roi_subset or remove them here."
-                )
-            if lesion_rois:
-                picked_lesion = [r for r in og_rois if r in lesion_rois]
-                missing_lesion = [r for r in lesion_rois if r not in og_rois]
-                if picked_lesion and missing_lesion:
-                    _err(
-                        f"'phase_2.opengate_stage.roi_subset' includes ROIs with synthetic "
-                        f"lesions ({picked_lesion}) but is missing other ROIs that also "
-                        f"have synthetic lesions ({missing_lesion}). Either include all "
-                        f"synthetic-lesion ROIs or none — partial selection leaves those "
-                        "lesions absorbed into remaining_body, corrupting the simulation."
-                    )
+        _check_simulation_roi_subset("phase_2.opengate_stage.roi_subset", og_rois, lesion_rois)
 
         gate = og.get("gate", {})
         for nf in ("total_histories", "num_cpu"):

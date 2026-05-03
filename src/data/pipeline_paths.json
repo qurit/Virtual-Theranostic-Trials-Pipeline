@@ -1,6 +1,6 @@
 {
   "input_paths": {
-    "label_map_path": "/home/jhubadmin/Theranostic-Virtual-Patient-Pipeline/src/data/vtt_map.json",
+    "label_map_path": "/home/jhubadmin/Theranostic-Virtual-Patient-Pipeline/src/data/pipeline_roi_naming_map.json",
     "SIMINDDirectory": "/home/jhubadmin/simind/simind"
   },
   "phase_1": {
@@ -10,7 +10,8 @@
       "unification_prefix": "unified_labels"
     },
     "synthetic_lesions_stage": {
-      "file_prefix": "synthetic_lesions"
+      "file_prefix": "synthetic_lesions",
+      "sub_dir_name": "synthetic_lesions_stage"
     },
     "pbpk_tac_stage": {
       "file_prefix": "pbpk"
