@@ -34,7 +34,8 @@ Checks performed
 - OpenGATE ``roi_subset``      — subset of segmentation ``roi_subset``; each ROI must be
                                  PBPK-compatible; synthetic-lesion hosts are all-or-none
                                  (``--dosimetry`` only)
-- OpenGATE gate numerics       — ``total_histories`` (positive), ``num_cpu`` must be numbers
+- OpenGATE adaptive gate       — ``total_histories_per_batch`` positive, ``num_threads``
+                                 non-negative, ``target_uncertainty_percent`` in [0, 100]
 - ``dosemap_postprocess_stage.apply_tac`` — must be true when ``--postprocess
                                  --dosimetry`` are both set (required for absolute dose)
 - ``FrameStartTimes`` /
@@ -643,31 +644,60 @@ def validate_config(
         _check_simulation_roi_subset("phase_2.opengate_stage.roi_subset", og_rois, lesion_rois)
 
         gate = og.get("gate", {})
-        for nf in ("total_histories", "num_cpu"):
+        deprecated_gate_fields = {
+            "total_histories": "total_histories_per_batch",
+            "num_cpu": "num_threads",
+            "random_seed": None,
+        }
+        for old_field, new_field in deprecated_gate_fields.items():
+            if old_field in gate:
+                if new_field is None:
+                    _err(
+                        f"'phase_2.opengate_stage.gate.{old_field}' is no longer user-configurable; "
+                        "OpenGATE adaptive batches derive deterministic independent seeds internally."
+                    )
+                else:
+                    _err(
+                        f"'phase_2.opengate_stage.gate.{old_field}' has been replaced by "
+                        f"'phase_2.opengate_stage.gate.{new_field}'"
+                    )
+
+        for nf in ("total_histories_per_batch", "num_threads", "target_uncertainty_percent"):
             v = gate.get(nf)
             if v is not None:
                 _check_number(v, f"phase_2.opengate_stage.gate.{nf}")
 
-        total_hist = gate.get("total_histories")
+        total_hist_batch = gate.get("total_histories_per_batch")
         if (
-            isinstance(total_hist, (int, float))
-            and not isinstance(total_hist, bool)
-            and total_hist <= 0
+            isinstance(total_hist_batch, (int, float))
+            and not isinstance(total_hist_batch, bool)
         ):
-            _err(
-                "'phase_2.opengate_stage.gate.total_histories' must be "
-                f"positive, got {total_hist}"
-            )
+            if not float(total_hist_batch).is_integer() or total_hist_batch <= 0:
+                _err(
+                    "'phase_2.opengate_stage.gate.total_histories_per_batch' must be "
+                    f"a positive whole number, got {total_hist_batch}"
+                )
 
-        og_num_cpu = gate.get("num_cpu")
+        og_num_threads = gate.get("num_threads")
         if (
-            isinstance(og_num_cpu, (int, float))
-            and not isinstance(og_num_cpu, bool)
-            and og_num_cpu < 0
+            isinstance(og_num_threads, (int, float))
+            and not isinstance(og_num_threads, bool)
+        ):
+            if not float(og_num_threads).is_integer() or og_num_threads < 0:
+                _err(
+                    "'phase_2.opengate_stage.gate.num_threads' must be a whole number >= 0 "
+                    f"(0 = use all available), got {og_num_threads}"
+                )
+
+        target_unc = gate.get("target_uncertainty_percent")
+        if (
+            isinstance(target_unc, (int, float))
+            and not isinstance(target_unc, bool)
+            and not 0 <= float(target_unc) <= 100
         ):
             _err(
-                "'phase_2.opengate_stage.gate.num_cpu' must be >= 0 (0 = use all available), "
-                f"got {og_num_cpu}"
+                "'phase_2.opengate_stage.gate.target_uncertainty_percent' must be between "
+                f"0 and 100, got {target_unc}"
             )
 
         _check_xyz_spacing_mm(og.get("xyz_spacing_mm"), "phase_2.opengate_stage.xyz_spacing_mm")

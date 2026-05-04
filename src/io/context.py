@@ -113,6 +113,7 @@ class Context:
         self.dosimetry_raw_dose_paths: Optional[Dict[str, str]] = None    # {roi: per-ROI dose NIfTI}
         self.dosimetry_raw_uncertainty_paths: Optional[Dict[str, str]] = None
         self.dosimetry_sum_dose_path: Optional[str] = None                # Summed dose NIfTI across all ROIs
+        self.dosimetry_sum_uncertainty_path: Optional[str] = None
         self.dosimetry_material_label_path: Optional[str] = None          # Material label image NIfTI
 
         # Phase 3: Post-processing

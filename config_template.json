@@ -161,9 +161,11 @@
       "save_per_roi_dose_maps": true,
 
       // Save dose summed across all ROIs into a single NIfTI (Gy/decay).
+      // OpenGATE always writes this final total dose map.
       "save_summed_dose_map": true,
 
-      // Save relative statistical uncertainty maps alongside dose maps.
+      // Save final relative statistical uncertainty maps alongside dose maps.
+      // OpenGATE adaptive stopping always computes these maps.
       "save_uncertainty_map": true,
 
       // Save the Schneider HU→material label image used internally.
@@ -183,14 +185,15 @@
       "variance_reduction": true,
 
       "gate": {
-        // Total particle histories. Higher = more accurate, slower. (e.g. 1e7)
-        "total_histories": 1e7,
+        // Particle histories per adaptive batch. Larger batches reduce OpenGATE startup overhead;
+        // smaller batches stop closer to the requested uncertainty. (e.g. 1e6)
+        "total_histories_per_batch": 1e6,
 
-        // Parallel threads. 0 = use all available CPUs.
-        "num_cpu": 0,
+        // Parallel OpenGATE threads. 0 = use all available CPUs.
+        "num_threads": 0,
 
-        // RNG seed. "auto" = unique per run; integer = reproducible.
-        "random_seed": "auto",
+        // Stop each ROI when the 95th percentile of ROI voxel uncertainty is under this percent.
+        "target_uncertainty_percent": 5,
 
         // Run OpenGATE in a fresh subprocess (recommended for memory isolation).
         "start_new_process": true

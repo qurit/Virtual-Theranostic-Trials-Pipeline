@@ -126,7 +126,7 @@ class PipelineReporter:
             add(f"    OK  Phase 2  -  SIMIND SPECT  ({using} core(s))")
         if args.dosimetry:
             gate_cfg = cfg.get("phase_2", {}).get("opengate_stage", {}).get("gate", {})
-            nc2 = gate_cfg.get("num_cpu", 1)
+            nc2 = gate_cfg.get("num_threads", 1)
             eff2 = avail if nc2 == 0 else min(nc2, avail)
             using2 = f"using all {avail}" if nc2 == 0 else str(eff2)
             add(f"    OK  Phase 2  -  OpenGATE dosimetry  ({using2} thread(s))")
@@ -147,9 +147,9 @@ class PipelineReporter:
             add(f"  SIMIND        : {eff_nc} core(s)  ({note})")
         if args.dosimetry:
             gate_cfg2 = cfg.get("phase_2", {}).get("opengate_stage", {}).get("gate", {})
-            nc2 = gate_cfg2.get("num_cpu", 1)
+            nc2 = gate_cfg2.get("num_threads", 1)
             eff_nc2 = avail if nc2 == 0 else min(nc2, avail)
-            note2 = f"num_cpu={nc2} -> using all {avail}" if nc2 == 0 else f"num_cpu={nc2}"
+            note2 = f"num_threads={nc2} -> using all {avail}" if nc2 == 0 else f"num_threads={nc2}"
             add(f"  OpenGATE      : {eff_nc2} thread(s)  ({note2})")
         if args.profile:
             add(f"  Profiling     : ON  (interval={args.profile_interval_s:.3g} s)")
@@ -248,14 +248,14 @@ class PipelineReporter:
         if run_dosimetry:
             og_cfg = config.get("phase_2", {}).get("opengate_stage", {})
             gate_cfg = og_cfg.get("gate", {})
-            nc2 = gate_cfg.get("num_cpu", 0)
+            nc2 = gate_cfg.get("num_threads", 0)
             eff2 = avail if nc2 == 0 else min(nc2, avail)
             cpu_note2 = f"all {avail}" if nc2 == 0 else str(eff2)
             add(
                 "    Dosimetry    : "
-                f"histories={gate_cfg.get('total_histories', '?')}  "
-                f"CPUs={cpu_note2}  "
-                f"seed={gate_cfg.get('random_seed', '?')}"
+                f"batch_histories={gate_cfg.get('total_histories_per_batch', '?')}  "
+                f"target_unc={gate_cfg.get('target_uncertainty_percent', '?')}%  "
+                f"threads={cpu_note2}  "
             )
             add(f"                   ROIs : {', '.join(og_cfg.get('roi_subset', roi_list))}")
         else:
@@ -416,14 +416,24 @@ class PipelineReporter:
             lines.append(
                 f"simulated_rois={self._format_seq(og_extra.get('simulated_roi_names', []))}"
             )
-            if og_extra.get("actual_total_histories") is not None:
-                lines.append(f"actual_total_histories={int(og_extra['actual_total_histories'])}")
+            if og_extra.get("simulated_actual_histories_this_run") is not None:
+                lines.append(f"simulated_actual_histories_this_run={int(og_extra['simulated_actual_histories_this_run'])}")
+            if og_extra.get("actual_histories_per_batch") is not None:
+                lines.append(f"actual_histories_per_batch={int(og_extra['actual_histories_per_batch'])}")
+            if og_extra.get("target_uncertainty_percent") is not None:
+                lines.append(f"target_uncertainty={float(og_extra['target_uncertainty_percent']):.6g}%")
+            if og_extra.get("uncertainty_percentile") is not None:
+                lines.append(f"uncertainty_percentile={float(og_extra['uncertainty_percentile']):.6g}")
             if og_extra.get("effective_num_threads") is not None:
                 lines.append(f"threads={int(og_extra['effective_num_threads'])}")
-            if og_extra.get("history_rounding_loss") is not None:
-                lines.append(f"history_rounding_loss={int(og_extra['history_rounding_loss'])}")
+            if og_extra.get("history_rounding_loss_per_batch") is not None:
+                lines.append(f"history_rounding_loss_per_batch={int(og_extra['history_rounding_loss_per_batch'])}")
+            if og_extra.get("nonconverged_rois"):
+                lines.append(f"nonconverged_rois={self._format_seq(og_extra.get('nonconverged_rois', []))}")
             if context.dosimetry_sum_dose_path:
                 lines.append(f"sum_dose={context.dosimetry_sum_dose_path}")
+            if getattr(context, "dosimetry_sum_uncertainty_path", None):
+                lines.append(f"sum_uncertainty={context.dosimetry_sum_uncertainty_path}")
             if context.dosimetry_metadata_path:
                 lines.append(f"metadata={context.dosimetry_metadata_path}")
         elif stage_key == "spect_postprocess":

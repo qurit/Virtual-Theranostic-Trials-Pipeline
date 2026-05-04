@@ -32,7 +32,8 @@ const { useState, useEffect, useRef, useCallback } = React;
 // ─── constants ────────────────────────────────────────────────────────────────
 const DEVELOPER_FIELDS = new Set([
   'output_folder_title','sub_dir_name','file_prefix',
-  'unification_prefix','SIMINDDirectory',
+  'unification_prefix','SIMINDDirectory','start_new_process','random_seed',
+  'save_summed_dose_map','save_uncertainty_map',
 ]);
 const PHASE_LABELS = {
   phase_1:'Phase 1 — Digital Twin & Ground Truth',
@@ -48,7 +49,8 @@ const STAGE_LABELS = {
   spect_postprocess_stage:'SPECT Post-Processing',
   dosemap_postprocess_stage:'Dosimetry Post-Processing',
   gate:'Monte Carlo Engine',source:'Source Definition',physics:'Physics Settings',
-  num_cpu:'CPU Cores / Threads',
+  num_cpu:'CPU Cores',
+  num_threads:'OpenGATE Threads',
 };
 const CLI_FLAGS = [
   {key:'spect',      label:'SPECT Simulation', desc:'Run SIMIND Monte Carlo SPECT projection simulation (Phase 2)'},
@@ -476,42 +478,6 @@ function NullField({call}){
   );
 }
 
-// ─── RandomSeedField ─────────────────────────────────────────────────────────
-function RandomSeedField({value,onChange,desc}){
-  const [showDesc,setShowDesc]=useState(false);
-  const isAuto=value==='auto';
-  const [fixedVal,setFixedVal]=useState(isAuto?'42':String(value));
-  return(
-    <div className="py-2 border-b border-slate-100 last:border-0">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-1.5 flex-shrink-0">
-          <span className="text-sm font-medium text-slate-700">random_seed</span>
-          {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
-        </div>
-        <div className="flex items-center gap-1.5">
-          <button onClick={()=>onChange('auto')}
-            className={`px-3 py-1 text-xs rounded-lg border font-semibold transition-colors
-              ${isAuto?'bg-blue-600 text-white border-blue-600':'bg-white text-slate-500 border-slate-300 hover:border-blue-400'}`}>
-            auto
-          </button>
-          <button onClick={()=>{const n=parseInt(fixedVal);onChange(isNaN(n)?42:n);}}
-            className={`px-3 py-1 text-xs rounded-lg border font-semibold transition-colors
-              ${!isAuto?'bg-slate-700 text-white border-slate-700':'bg-white text-slate-500 border-slate-300 hover:border-slate-400'}`}>
-            fixed
-          </button>
-          {!isAuto&&(
-            <input type="number" value={fixedVal}
-              onChange={e=>setFixedVal(e.target.value)}
-              onBlur={()=>{const n=parseInt(fixedVal);if(!isNaN(n))onChange(n);}}
-              className="w-24 px-2 py-1 text-sm border border-slate-300 rounded-lg text-right focus:outline-none focus:ring-2 focus:ring-blue-400"/>
-          )}
-        </div>
-      </div>
-      {showDesc&&<p className="text-xs text-slate-400 mt-1 leading-relaxed">{desc}</p>}
-    </div>
-  );
-}
-
 // ─── SpecsEditor ─────────────────────────────────────────────────────────────
 // Per-ROI lesion spec UI for synthetic_lesions_stage.specs
 function UserDefinedInputs({nLesions,centers,radii,onUpdateCenters,onUpdateRadii}){
@@ -863,7 +829,7 @@ function FrameTimesSection({frameStartTimes,frameDurations,basePath,patientName,
 }
 
 // ─── NumCpuField ──────────────────────────────────────────────────────────────
-function NumCpuField({value,onChange,desc,systemCpuCount}){
+function NumCpuField({fieldKey='num_cpu',value,onChange,desc,systemCpuCount}){
   const [raw,setRaw]=useState(String(value??0));
   const [err,setErr]=useState('');
   const [showDesc,setShowDesc]=useState(false);
@@ -888,15 +854,16 @@ function NumCpuField({value,onChange,desc,systemCpuCount}){
     }
   }
 
+  const unit=fieldKey==='num_threads'?'threads':'cores';
   const helpText=total
-    ?(raw==='0'||parseInt(raw,10)===0?`Will use all ${total} available cores`:`System has ${total} cores total — set to 0 to use all`)
-    :'0 = use all available cores';
+    ?(raw==='0'||parseInt(raw,10)===0?`Will use all ${total} available ${unit}`:`System has ${total} ${unit} total — set to 0 to use all`)
+    :`0 = use all available ${unit}`;
 
   return(
     <div className="py-2 border-b border-slate-100 last:border-0">
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-1.5 flex-shrink-0">
-          <span className="text-sm font-medium text-slate-700">num_cpu</span>
+          <span className="text-sm font-medium text-slate-700">{fieldKey}</span>
           {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
         </div>
         <div className="flex flex-col items-end gap-0.5">
@@ -907,6 +874,46 @@ function NumCpuField({value,onChange,desc,systemCpuCount}){
           {err
             ?<span className="text-xs text-red-500">{err}</span>
             :<span className="text-xs text-slate-400">{helpText}</span>}
+        </div>
+      </div>
+      {showDesc&&<p className="text-xs text-slate-400 pt-1 leading-relaxed">{desc}</p>}
+    </div>
+  );
+}
+
+// ─── PercentField ──────────────────────────────────────────────────────────────
+function PercentField({fieldKey,value,onChange,desc}){
+  const [raw,setRaw]=useState(String(value??''));
+  const [err,setErr]=useState('');
+  const [showDesc,setShowDesc]=useState(false);
+  function validate(s){
+    if(s===''||s===null||s===undefined) return 'Required';
+    const n=parseFloat(s);
+    if(isNaN(n)) return 'Must be a number';
+    if(n<0||n>100) return 'Must be between 0 and 100%';
+    return '';
+  }
+  function commit(s){
+    const e=validate(s);
+    setErr(e);
+    if(!e) onChange(parseFloat(s));
+  }
+  return(
+    <div className="py-2 border-b border-slate-100 last:border-0">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          <span className="text-sm font-medium text-slate-700">{fieldKey}</span>
+          {desc&&<button onClick={()=>setShowDesc(s=>!s)} className="text-slate-300 hover:text-blue-400 text-[10px] w-3.5 h-3.5 rounded-full border border-current flex items-center justify-center leading-none">?</button>}
+        </div>
+        <div className="flex flex-col items-end gap-0.5">
+          <div className="flex items-center gap-1">
+            <input type="number" min="0" max="100" step="0.1" value={raw}
+              onChange={e=>{setRaw(e.target.value);setErr(validate(e.target.value));}}
+              onBlur={e=>commit(e.target.value)}
+              className={`w-28 px-2 py-1 text-sm border rounded-lg text-right focus:outline-none focus:ring-2 ${err?'border-red-400 focus:ring-red-300 bg-red-50':'border-slate-300 focus:ring-blue-400'}`}/>
+            <span className="text-xs text-slate-400">%</span>
+          </div>
+          {err?<span className="text-xs text-red-500">{err}</span>:<span className="text-xs text-slate-400">0-100%</span>}
         </div>
       </div>
       {showDesc&&<p className="text-xs text-slate-400 pt-1 leading-relaxed">{desc}</p>}
@@ -1076,8 +1083,8 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
   const DescLine=()=>showDesc?<p className="text-xs text-slate-400 pb-2 -mt-1 leading-relaxed">{desc}</p>:null;
 
   if(fieldKey==='xyz_spacing_mm') return<XyzSpacingField value={value} path={path} patientName={patientName} onChange={onChange} desc={desc} nativeSpacing={nativeSpacing} patientShape={patientShape}/>;
-  if(fieldKey==='random_seed') return<RandomSeedField value={value} onChange={call} desc={desc}/>;
-  if(fieldKey==='num_cpu') return<NumCpuField value={value} onChange={call} desc={desc} systemCpuCount={systemCpuCount}/>;
+  if(fieldKey==='num_cpu'||fieldKey==='num_threads') return<NumCpuField fieldKey={fieldKey} value={value} onChange={call} desc={desc} systemCpuCount={systemCpuCount}/>;
+  if(fieldKey==='target_uncertainty_percent') return<PercentField fieldKey={fieldKey} value={value} onChange={call} desc={desc}/>;
   if(fieldKey==='NumProjections') return<NumProjectionsField value={value} onChange={call} desc={desc} opts={opts}/>;
   if(typeof value==='boolean') return<><LabelRow><input type="checkbox" checked={value} onChange={e=>call(e.target.checked)} className="w-4 h-4 accent-blue-600 flex-shrink-0"/></LabelRow><DescLine/></>;
   if(typeof value==='number'&&opts&&Array.isArray(opts)) return(
@@ -1122,8 +1129,7 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
       }
       // Simulation stages: pill selector filtered to PBPK-compatible ROIs from Phase 1 selection
       const pbpkSet=pbpkCompatibleRois instanceof Set?pbpkCompatibleRois:new Set(pbpkCompatibleRois||[]);
-      const p1RoiSet=new Set((cfg?.phase_1?.segmentation_stage?.roi_subset)||[]);
-      const choices=(roiChoices||[]).filter(r=>r!=='remaining_body'&&pbpkSet.has(r)&&p1RoiSet.has(r));
+      const choices=(roiChoices||[]).filter(r=>r!=='remaining_body'&&pbpkSet.has(r));
       const lesionHosts=lesionSpecs&&typeof lesionSpecs==='object'?Object.keys(lesionSpecs):[];
       const pickedLesionHosts=lesionHosts.filter(r=>value.includes(r));
       const missingLesionHosts=lesionHosts.filter(r=>!value.includes(r));
@@ -1722,6 +1728,9 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir}){
       {flags.dosimetry&&og&&(
         <Section title="OpenGATE Dosimetry (Phase 2)">
           {kv('ROI subset', og.roi_subset)}
+          {kv('Threads', og.gate?.num_threads)}
+          {kv('Histories / batch', og.gate?.total_histories_per_batch)}
+          {kv('Target uncertainty', og.gate?.target_uncertainty_percent!==undefined?`${og.gate.target_uncertainty_percent}%`:undefined)}
         </Section>
       )}
       {flags.postprocess&&pp&&(
@@ -1802,11 +1811,24 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
       // Dosimetry: at least one ROI in opengate
       if(flags.dosimetry){
         const roi=cfg?.phase_2?.opengate_stage?.roi_subset;
+        const gate=cfg?.phase_2?.opengate_stage?.gate||{};
+        if('total_histories' in gate)
+          issues.push(`[${p.name}] OpenGATE total_histories was replaced by total_histories_per_batch`);
+        if('num_cpu' in gate)
+          issues.push(`[${p.name}] OpenGATE num_cpu was replaced by num_threads`);
+        if('random_seed' in gate)
+          issues.push(`[${p.name}] OpenGATE random_seed is no longer user-configurable`);
         if(!Array.isArray(roi)||roi.length===0)
           issues.push(`[${p.name}] Dosimetry is ON but no ROIs are selected in the OpenGATE stage`);
         else checkSimulationSubset(roi,'OpenGATE');
         validateXyzSpacingRule(cfg?.phase_2?.opengate_stage?.xyz_spacing_mm,nativeSpacing)
           .forEach(msg=>issues.push(`[${p.name}] OpenGATE xyz_spacing_mm ${msg}`));
+        if(!Number.isInteger(Number(gate.num_threads))||Number(gate.num_threads)<0)
+          issues.push(`[${p.name}] OpenGATE num_threads must be a whole number >= 0`);
+        if(!Number.isInteger(Number(gate.total_histories_per_batch))||Number(gate.total_histories_per_batch)<=0)
+          issues.push(`[${p.name}] OpenGATE total_histories_per_batch must be a positive whole number`);
+        if(isNaN(Number(gate.target_uncertainty_percent))||Number(gate.target_uncertainty_percent)<0||Number(gate.target_uncertainty_percent)>100)
+          issues.push(`[${p.name}] OpenGATE target_uncertainty_percent must be between 0 and 100`);
       }
     });
     setValidation({ok:!issues.length,issues});

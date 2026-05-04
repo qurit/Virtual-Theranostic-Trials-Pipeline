@@ -165,15 +165,16 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "OutputImgSize": "Output projection image size in pixels per side",
     "OutputPixelWidth": "Output pixel pitch in cm (e.g. 0.5 = 5 mm)",
     "OutputSliceWidth": "Output slice thickness in cm",
-    "num_cpu": "CPU cores/threads to use (applies to both SIMIND and OpenGATE). 0 = use all available cores on this system.",
+    "num_cpu": "CPU cores to use for SIMIND. 0 = use all available cores on this system.",
+    "num_threads": "OpenGATE worker threads. 0 = use all available CPU cores on this system.",
     "save_per_roi_dose_maps": "Save a separate dose map NIfTI file for each segmented organ/ROI",
     "save_summed_dose_map": "Save a single NIfTI with the total dose summed across all ROIs",
     "save_uncertainty_map": "Save Monte Carlo statistical uncertainty maps alongside dose maps",
     "save_material_label_image": "Save the Schneider HU→material composition label image used in simulation",
     "write_mhd_outputs": "Also write outputs as MetaImage (.mhd/.raw) in addition to NIfTI",
     "variance_reduction": "Enable forced-detection variance reduction to accelerate Monte Carlo (see config comments for Lu-177 caveats)",
-    "total_histories": "Total Monte Carlo particle histories for dosimetry (e.g. 1e7). Higher = more accurate, slower",
-    "random_seed": "Monte Carlo random seed. 'auto' = unique each run; integer = reproducible",
+    "total_histories_per_batch": "OpenGATE histories per adaptive batch. Larger values reduce startup overhead; smaller values stop closer to the target uncertainty.",
+    "target_uncertainty_percent": "OpenGATE adaptive stopping target as a percent. Each ROI stops when the 95th percentile of ROI voxel uncertainty is below this value.",
     "start_new_process": "Launch OpenGATE in a fresh subprocess (recommended for memory isolation)",
     "density_tolerance_gcm3": "HU-to-material grouping tolerance in g/cm³. Smaller = more distinct materials, larger = faster",
     "world_margin_scale": "Scale factor applied to the simulation bounding box around the patient volume",
@@ -844,9 +845,11 @@ def _validate_patient_rerun(
         og_snapshot = build_opengate_rerun_snapshot(config_full, synthetic_enabled=synthetic_enabled)
         og_markers: List[Path] = []
         if og_cfg.get("save_summed_dose_map", True):
-            og_markers.append(og_stage_dir / f"{og_prefix}_dose_sum.nii.gz")
+            # Sum dose is saved at the phase level (simulations/), not inside the stage subdir.
+            og_markers.append(phase2_dir / f"{og_prefix}_dose_sum.nii.gz")
         if og_cfg.get("save_material_label_image", True):
-            og_markers.append(og_work / f"{og_prefix}_material_labels.nii.gz")
+            # Material labels are saved in the stage output dir, not work_dir.
+            og_markers.append(og_stage_dir / f"{og_prefix}_material_labels.nii.gz")
         og_deps = {
             "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
             "vtt_roi_seg": fingerprint_optional_file(expected_vtt_handoff),

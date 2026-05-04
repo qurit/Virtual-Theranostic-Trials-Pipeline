@@ -13,17 +13,17 @@ Core responsibilities
 - Optionally downsample the simulation inputs for faster Monte Carlo execution.
 - Convert simulation inputs to OpenGATE's centered identity-direction convention.
 - Build one binary voxel-source mask per requested ROI.
-- Run one OpenGATE simulation per ROI using Lu-177 decay physics.
+- Run adaptive OpenGATE batches per ROI using Lu-177 decay physics.
 - Skip simulation for any ROI whose final dose NIfTI output already exists on disk
   (allows resuming a crashed run without re-simulating completed ROIs).
-- Save per-ROI dose maps, optional uncertainty maps, and an optional summed dose map
+- Save per-ROI dose maps, uncertainty maps, and a summed dose map
   on the selected simulation grid.
 - Save stage metadata and optional OpenGATE material-label / MHD outputs.
 
 Dose units
 ----------
-OpenGATE returns dose per simulated primary. In this stage, each per-ROI dose map is
-scaled by the actual total number of simulated histories, so the saved NIfTI outputs are:
+OpenGATE batch dose arrays are accumulated and scaled by the actual total number
+of simulated histories, so the saved NIfTI outputs are:
 
     Gy/decay
 
@@ -91,6 +91,13 @@ from src.utils.opengate_utils import (
 from src.utils.resize_utils import resolve_simulation_grid
 
 
+# Developer-only adaptive stopping controls. These are intentionally not exposed
+# in config/UI because users should choose batch size and target uncertainty only.
+OPENGATE_UNCERTAINTY_PERCENTILE = 95.0
+OPENGATE_MAX_BATCHES_PER_ROI = 100
+OPENGATE_BASE_RANDOM_SEED = 0
+
+
 class OpenGateSimulationStage:
     """
     Run OpenGATE voxel-source dosimetry on the phase-1 CT grid.
@@ -139,8 +146,8 @@ class OpenGateSimulationStage:
 
         # Save / provenance options
         self.save_per_roi_dose_maps: bool = bool(self.stage_cfg.get("save_per_roi_dose_maps", True))
-        self.save_summed_dose_map: bool = bool(self.stage_cfg.get("save_summed_dose_map", True))
-        self.save_uncertainty_map: bool = bool(self.stage_cfg.get("save_uncertainty_map", True))
+        self.save_summed_dose_map: bool = True
+        self.save_uncertainty_map: bool = True
         self.save_material_label_image: bool = bool(self.stage_cfg.get("save_material_label_image", True))
         self.write_mhd_outputs: bool = bool(self.stage_cfg.get("write_mhd_outputs", False))
 
@@ -149,31 +156,58 @@ class OpenGateSimulationStage:
 
         # OpenGATE execution controls
         gate_cfg = self.stage_cfg.get("gate", {})
-        self.requested_total_histories: int = int(gate_cfg.get("total_histories", 100_000))
-        # num_cpu: 0 = use all available CPUs (same convention as SIMIND).
-        requested_num_cpu: int = int(gate_cfg.get("num_cpu", 1))
+        deprecated_gate_fields = {
+            "total_histories": "total_histories_per_batch",
+            "num_cpu": "num_threads",
+            "random_seed": None,
+        }
+        for old_field, new_field in deprecated_gate_fields.items():
+            if old_field in gate_cfg:
+                if new_field is None:
+                    raise ValueError(
+                        f"gate.{old_field} is no longer user-configurable; "
+                        "adaptive OpenGATE batches derive deterministic independent seeds internally."
+                    )
+                raise ValueError(f"gate.{old_field} has been replaced by gate.{new_field}")
+        self.requested_total_histories_per_batch: int = int(
+            gate_cfg.get("total_histories_per_batch", 1_000_000)
+        )
+        # num_threads: 0 = use all available CPUs (same convention as SIMIND).
+        requested_num_threads: int = int(gate_cfg.get("num_threads", 1))
+        self.configured_num_threads: int = requested_num_threads
+        self.target_uncertainty_percent: float = float(gate_cfg.get("target_uncertainty_percent", 5.0))
+        self.target_uncertainty_fraction: float = self.target_uncertainty_percent / 100.0
+        self.uncertainty_percentile: float = OPENGATE_UNCERTAINTY_PERCENTILE
+        self.max_batches_per_roi: int = OPENGATE_MAX_BATCHES_PER_ROI
+        self.random_seed_base: int = OPENGATE_BASE_RANDOM_SEED
         self.start_new_process: bool = bool(gate_cfg.get("start_new_process", True))
-        self.random_seed: Any = gate_cfg.get("random_seed", "auto")
 
-        if self.requested_total_histories <= 0:
-            raise ValueError("gate.total_histories must be > 0")
-        if requested_num_cpu < 0:
-            raise ValueError("gate.num_cpu must be >= 0 (0 = use all available CPUs)")
-        if requested_num_cpu == 0:
-            requested_num_cpu = os.cpu_count() or 1
-        self.requested_num_threads: int = requested_num_cpu
+        if self.requested_total_histories_per_batch <= 0:
+            raise ValueError("gate.total_histories_per_batch must be > 0")
+        if requested_num_threads < 0:
+            raise ValueError("gate.num_threads must be >= 0 (0 = use all available CPUs)")
+        if not 0.0 <= self.target_uncertainty_percent <= 100.0:
+            raise ValueError("gate.target_uncertainty_percent must be between 0 and 100")
+        if requested_num_threads == 0:
+            effective_requested_threads = os.cpu_count() or 1
+        else:
+            effective_requested_threads = requested_num_threads
+        self.requested_num_threads: int = effective_requested_threads
 
-        # OpenGATE source.n is set per thread, so convert requested total histories
-        # into a per-thread count to keep the total under control.
-        self.num_threads: int = min(self.requested_num_threads, self.requested_total_histories)
-        self.histories_per_thread: int = self.requested_total_histories // self.num_threads
-        self.actual_total_histories: int = self.histories_per_thread * self.num_threads
-        self.history_rounding_loss: int = self.requested_total_histories - self.actual_total_histories
-        if self.history_rounding_loss > 0:
+        # OpenGATE source.n is set per thread, so convert requested batch histories
+        # into a per-thread count to keep each batch total under control.
+        self.num_threads: int = min(self.requested_num_threads, self.requested_total_histories_per_batch)
+        self.histories_per_thread_per_batch: int = self.requested_total_histories_per_batch // self.num_threads
+        self.actual_histories_per_batch: int = self.histories_per_thread_per_batch * self.num_threads
+        self.history_rounding_loss_per_batch: int = (
+            self.requested_total_histories_per_batch - self.actual_histories_per_batch
+        )
+        if self.history_rounding_loss_per_batch > 0:
             print(
-                f"[OpenGateSimulationStage] History rounding: requested {self.requested_total_histories}, "
-                f"running {self.actual_total_histories} ({self.histories_per_thread} per thread × "
-                f"{self.num_threads} threads). Loss: {self.history_rounding_loss} histories."
+                "[OpenGateSimulationStage] Batch history rounding: requested "
+                f"{self.requested_total_histories_per_batch}, running {self.actual_histories_per_batch} "
+                f"({self.histories_per_thread_per_batch} per thread x {self.num_threads} threads). "
+                f"Loss per batch: {self.history_rounding_loss_per_batch} histories."
             )
 
         source_cfg = self.stage_cfg.get("source", {})
@@ -292,8 +326,6 @@ class OpenGateSimulationStage:
         markers: List[str] = []
         if self.save_summed_dose_map:
             markers.append(str(Path(self.phase_output_dir) / f"{self.prefix}_dose_sum.nii.gz"))
-        if self.save_material_label_image:
-            markers.append(str(Path(self.work_dir) / f"{self.prefix}_material_labels.nii.gz"))
         return markers
 
     # ------------------------------------------------------------------
@@ -308,6 +340,76 @@ class OpenGateSimulationStage:
     def _roi_dose_nii_path(self, roi_name: str) -> Path:
         """Return the expected final NIfTI output path for a given ROI dose map."""
         return Path(self.stage_output_dir) / f"{self.prefix}_dose_{roi_name}.nii.gz"
+
+    def _roi_unc_nii_path(self, roi_name: str) -> Path:
+        """Return the expected final NIfTI output path for a given ROI uncertainty map."""
+        return Path(self.stage_output_dir) / f"{self.prefix}_unc_{roi_name}.nii.gz"
+
+    def _material_label_nii_path(self) -> Path:
+        """Return the persistent material-label output path."""
+        return Path(self.stage_output_dir) / f"{self.prefix}_material_labels.nii.gz"
+
+    def _roi_batch_dir(self, roi_name: str, batch_index: int) -> Path:
+        """Return the scratch directory for one ROI batch."""
+        return Path(self.work_dir) / roi_name / "batches" / f"batch_{batch_index:06d}"
+
+    def _batch_seed(self, roi_name: str, batch_index: int) -> int:
+        """Return a deterministic seed unique to each ROI/batch pair."""
+        h = self.random_seed_base
+        for ch in roi_name:
+            h = (h * 31 + ord(ch)) & 0x7FFFFFFF
+        return (h + batch_index * 999_983) % 2_147_483_646 + 1
+
+    def _aligned_roi_mask_array(self, mask_path: str) -> np.ndarray:
+        """Load a source mask and flip it into the same voxel order as saved dose arrays."""
+        mask_arr = sitk.GetArrayFromImage(sitk.ReadImage(str(mask_path))).astype(bool)
+        for np_axis in reversed(self._centering_flipped_axes):
+            mask_arr = np.flip(mask_arr, axis=np_axis).copy()
+        return mask_arr
+
+    @staticmethod
+    def _combine_relative_uncertainty(
+        dose_sum_arr: np.ndarray,
+        uncertainty_numerator_var_arr: np.ndarray,
+    ) -> np.ndarray:
+        """Combine independent relative uncertainty contributions for an accumulated dose."""
+        sigma_num = np.sqrt(uncertainty_numerator_var_arr)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rel_unc = np.divide(
+                sigma_num,
+                np.abs(dose_sum_arr),
+                out=np.full_like(dose_sum_arr, np.inf, dtype=np.float64),
+                where=np.abs(dose_sum_arr) > 0,
+            )
+        return rel_unc.astype(np.float32)
+
+    @staticmethod
+    def _relative_uncertainty_variance_numerator(rel_unc: np.ndarray, dose_arr: np.ndarray) -> np.ndarray:
+        """Return ``(relative_uncertainty * dose)^2`` while treating zero-dose voxels safely."""
+        dose_abs = np.abs(np.asarray(dose_arr, dtype=np.float64))
+        unc = np.asarray(rel_unc, dtype=np.float64)
+        clean_unc = np.where(np.isfinite(unc) & (unc >= 0), unc, np.inf)
+        sigma_numerator = np.zeros_like(dose_abs, dtype=np.float64)
+        nonzero = dose_abs > 0
+        sigma_numerator[nonzero] = clean_unc[nonzero] * dose_abs[nonzero]
+        return np.square(sigma_numerator)
+
+    def _uncertainty_percentile_in_mask(self, unc_arr: np.ndarray, mask_arr: np.ndarray) -> float:
+        """Return the configured uncertainty percentile inside an ROI mask.
+
+        Zero-dose voxels carry inf relative uncertainty and are excluded so that
+        unsampled edge voxels in early batches do not permanently block convergence.
+        """
+        vals = np.asarray(unc_arr[mask_arr], dtype=np.float64)
+        vals = vals[np.isfinite(vals) & (vals >= 0)]
+        if vals.size == 0:
+            return float("inf")
+        return float(np.percentile(vals, self.uncertainty_percentile))
+
+    @staticmethod
+    def _finite_float_or_none(value: float) -> Optional[float]:
+        """Return a JSON-safe float, or None for infinity/NaN."""
+        return float(value) if np.isfinite(value) else None
 
     @staticmethod
     def _same_image_grid(a: sitk.Image, b: sitk.Image, *, atol: float = 1e-5) -> bool:
@@ -430,7 +532,7 @@ class OpenGateSimulationStage:
         return mask_paths, counts, names
 
     # ------------------------------------------------------------------
-    # single-ROI simulation
+    # single-batch simulation
     # ------------------------------------------------------------------
 
     def _run_single_roi(
@@ -438,15 +540,17 @@ class OpenGateSimulationStage:
         roi_name: str,
         mask_path: str,
         sim_ct_path: Path,
+        batch_dir: Path,
+        histories_per_thread: int,
+        random_seed: int,
         save_labels: bool,
     ) -> Dict[str, Any]:
         """
-        Run one OpenGATE simulation for a single ROI voxel source.
+        Run one OpenGATE batch for a single ROI voxel source.
 
         Returns a dictionary containing raw arrays, file paths, and provenance fields.
         """
-        roi_dir = Path(self.work_dir) / roi_name
-        roi_dir.mkdir(exist_ok=True, parents=True)
+        batch_dir.mkdir(exist_ok=True, parents=True)
 
         ct = sitk.ReadImage(str(sim_ct_path))
         size_xyz = ct.GetSize()
@@ -462,8 +566,8 @@ class OpenGateSimulationStage:
         sim.g4_verbose = False
         sim.visu = False
         sim.number_of_threads = self.num_threads
-        sim.random_seed = self.random_seed
-        sim.output_dir = roi_dir
+        sim.random_seed = random_seed
+        sim.output_dir = batch_dir
 
         # World volume sized from the CT physical extent with a minimum floor.
         world_size_mm = np.maximum(phys_size_mm * self.world_margin_scale, self.world_min_size_mm)
@@ -494,13 +598,13 @@ class OpenGateSimulationStage:
 
         label_mhd: Optional[Path] = None
         if save_labels and self.save_material_label_image:
-            label_mhd = roi_dir / "patient_material_labels.mhd"
+            label_mhd = batch_dir / "patient_material_labels.mhd"
             patient.dump_label_image = str(label_mhd)
 
-        # Lu-177 voxel source. `src.n` is per thread, so histories_per_thread is used.
+        # Lu-177 voxel source. `src.n` is per thread.
         src = sim.add_source("VoxelSource", "src_lu177")
         src.particle = f"ion {self._isotope_Z} {self._isotope_A} 0 0"
-        src.n = self.histories_per_thread
+        src.n = histories_per_thread
         src.image = str(mask_path)
         src.direction.type = "iso"
         src.energy.type = "mono"
@@ -515,13 +619,12 @@ class OpenGateSimulationStage:
         dose.spacing = [float(s) * mm for s in spacing_xyz]
         dose.dose.active = True
         dose.dose.output_filename = "dose_map.mhd"
-        dose.dose_uncertainty.active = self.save_uncertainty_map
-        if self.save_uncertainty_map:
-            dose.dose_uncertainty.output_filename = "dose_uncertainty.mhd"
+        dose.dose_uncertainty.active = True
+        dose.dose_uncertainty.output_filename = "dose_uncertainty.mhd"
 
         sim.run(start_new_process=self.start_new_process)
 
-        dose_mhd = roi_dir / "dose_map.mhd"
+        dose_mhd = batch_dir / "dose_map.mhd"
         if not dose_mhd.exists():
             raise FileNotFoundError(f"Dose output not found: {dose_mhd}")
 
@@ -541,17 +644,26 @@ class OpenGateSimulationStage:
         for np_axis in reversed(self._centering_flipped_axes):
             dose_arr = np.flip(dose_arr, axis=np_axis).copy()
 
-        unc_arr: Optional[np.ndarray] = None
-        unc_mhd: Optional[Path] = None
-        if self.save_uncertainty_map:
-            unc_mhd = roi_dir / "dose_uncertainty.mhd"
-            if unc_mhd.exists():
-                unc_arr = sitk.GetArrayFromImage(sitk.ReadImage(str(unc_mhd))).astype(np.float32)
-                for np_axis in reversed(self._centering_flipped_axes):
-                    unc_arr = np.flip(unc_arr, axis=np_axis).copy()
+        unc_mhd = batch_dir / "dose_uncertainty.mhd"
+        if not unc_mhd.exists():
+            raise FileNotFoundError(f"Dose uncertainty output not found: {unc_mhd}")
+        unc_arr = sitk.GetArrayFromImage(sitk.ReadImage(str(unc_mhd))).astype(np.float32)
+        for np_axis in reversed(self._centering_flipped_axes):
+            unc_arr = np.flip(unc_arr, axis=np_axis).copy()
+
+        dose_nii_path = save_nii_sitk(
+            self._original_sim_ct_img,
+            dose_arr.astype(np.float32),
+            batch_dir / "dose_raw.nii.gz",
+        )
+        unc_nii_path = save_nii_sitk(
+            self._original_sim_ct_img,
+            unc_arr.astype(np.float32),
+            batch_dir / "dose_uncertainty.nii.gz",
+        )
 
         if self.debug:
-            with open(roi_dir / "coordinate_debug.json", "w", encoding="utf-8") as f:
+            with open(batch_dir / "coordinate_debug.json", "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "dose_mhd_origin": [round(o, 2) for o in dose_img.GetOrigin()],
@@ -574,12 +686,16 @@ class OpenGateSimulationStage:
 
         return {
             "roi_name": roi_name,
-            "roi_work_dir": str(roi_dir),
+            "roi_work_dir": str(batch_dir),
             "dose_mhd_path": str(dose_mhd),
-            "unc_mhd_path": None if unc_mhd is None else str(unc_mhd),
+            "unc_mhd_path": str(unc_mhd),
+            "dose_nii_path": str(dose_nii_path),
+            "unc_nii_path": str(unc_nii_path),
             "label_mhd_path": None if label_mhd is None else str(label_mhd),
             "dose_arr": dose_arr,
             "unc_arr": unc_arr,
+            "random_seed": random_seed,
+            "histories_per_thread": histories_per_thread,
             "size_xyz": tuple(int(v) for v in size_xyz),
             "spacing_xyz": tuple(float(v) for v in spacing_xyz),
             "stats_str": str(stats),
@@ -587,6 +703,145 @@ class OpenGateSimulationStage:
             "mat_table": str(mat_table),
             "den_table": str(den_table),
             "n_materials": len(generated_materials),
+        }
+
+    def _run_roi_batches(
+        self,
+        roi_name: str,
+        mask_path: str,
+        sim_ct: sitk.Image,
+        sim_ct_path: Path,
+        save_labels: bool,
+    ) -> Dict[str, Any]:
+        """Run adaptive OpenGATE batches for one ROI and return accumulated outputs."""
+        mask_arr = self._aligned_roi_mask_array(mask_path)
+        dose_sum_raw: Optional[np.ndarray] = None
+        uncertainty_numerator_var_arr: Optional[np.ndarray] = None
+        total_actual_histories = 0
+        batches: List[Dict[str, Any]] = []
+        final_unc_arr: Optional[np.ndarray] = None
+        final_uncertainty_percentile = float("inf")
+        converged = False
+
+        material_label_nii = self._material_label_nii_path()
+        mat_label_path: Optional[str] = str(material_label_nii) if material_label_nii.exists() else None
+        n_materials: Optional[int] = None
+        mat_table: Optional[str] = None
+        den_table: Optional[str] = None
+        size_xyz: Optional[List[int]] = None
+        spacing_xyz: Optional[List[float]] = None
+
+        for batch_index in range(1, self.max_batches_per_roi + 1):
+            batch_dir = self._roi_batch_dir(roi_name, batch_index)
+            random_seed = self._batch_seed(roi_name, batch_index)
+            res = self._run_single_roi(
+                roi_name,
+                mask_path,
+                sim_ct_path,
+                batch_dir=batch_dir,
+                histories_per_thread=self.histories_per_thread_per_batch,
+                random_seed=random_seed,
+                save_labels=(save_labels and batch_index == 1),
+            )
+
+            batch_dose_raw = np.asarray(res["dose_arr"], dtype=np.float64)
+            batch_unc = np.asarray(res["unc_arr"], dtype=np.float64)
+
+            if dose_sum_raw is None:
+                dose_sum_raw = np.zeros_like(batch_dose_raw, dtype=np.float64)
+                uncertainty_numerator_var_arr = np.zeros_like(batch_dose_raw, dtype=np.float64)
+
+            dose_sum_raw += batch_dose_raw
+            total_actual_histories += self.actual_histories_per_batch
+
+            uncertainty_numerator_var_arr += self._relative_uncertainty_variance_numerator(
+                batch_unc,
+                batch_dose_raw,
+            )
+
+            final_unc_arr = self._combine_relative_uncertainty(
+                dose_sum_raw,
+                uncertainty_numerator_var_arr,
+            )
+            final_uncertainty_percentile = self._uncertainty_percentile_in_mask(final_unc_arr, mask_arr)
+            converged = final_uncertainty_percentile <= self.target_uncertainty_fraction
+
+            batch_meta = {
+                "batch_index": batch_index,
+                "work_dir": res["roi_work_dir"],
+                "random_seed": random_seed,
+                "histories_per_thread": int(res["histories_per_thread"]),
+                "actual_total_histories": int(self.actual_histories_per_batch),
+                "cumulative_actual_histories": int(total_actual_histories),
+                "dose_raw_path": res["dose_nii_path"],
+                "uncertainty_path": res["unc_nii_path"],
+                "uncertainty_percentile": self.uncertainty_percentile,
+                "uncertainty_percentile_fraction": self._finite_float_or_none(final_uncertainty_percentile),
+                "uncertainty_percentile_percent": self._finite_float_or_none(final_uncertainty_percentile * 100.0),
+                "converged_after_batch": bool(converged),
+                "stats": res["stats_str"],
+                "events": res["stats_events"],
+            }
+            batches.append(batch_meta)
+            print(
+                f"[OpenGateSimulationStage] {roi_name} batch {batch_index}: "
+                f"p{self.uncertainty_percentile:g} uncertainty={final_uncertainty_percentile * 100.0:.3g}% "
+                f"(target {self.target_uncertainty_percent:g}%), "
+                f"histories={total_actual_histories:,}"
+            )
+
+            if mat_label_path is None and self.save_material_label_image and res["label_mhd_path"] and os.path.exists(res["label_mhd_path"]):
+                labels = sitk.GetArrayFromImage(sitk.ReadImage(res["label_mhd_path"])).astype(np.int16)
+                mat_label_path = save_nii_sitk(
+                    sim_ct,
+                    labels,
+                    self._material_label_nii_path(),
+                )
+
+            n_materials = int(res["n_materials"])
+            mat_table = res["mat_table"]
+            den_table = res["den_table"]
+            size_xyz = list(res["size_xyz"])
+            spacing_xyz = list(res["spacing_xyz"])
+
+            if not self.write_mhd_outputs:
+                cleanup_mhd(Path(res["dose_mhd_path"]))
+                cleanup_mhd(Path(res["unc_mhd_path"]))
+                if res["label_mhd_path"]:
+                    cleanup_mhd(Path(res["label_mhd_path"]))
+
+            if converged:
+                break
+
+        if dose_sum_raw is None or uncertainty_numerator_var_arr is None or final_unc_arr is None:
+            raise RuntimeError(f"OpenGATE produced no batches for ROI '{roi_name}'")
+
+        if not converged:
+            print(
+                f"[OpenGateSimulationStage] WARNING: '{roi_name}' reached the developer cap of "
+                f"{self.max_batches_per_roi} batches without meeting target uncertainty "
+                f"({final_uncertainty_percentile * 100.0:.3g}% > {self.target_uncertainty_percent:g}%). "
+                "Saving the best accumulated result."
+            )
+
+        dose_grid = dose_sum_raw / float(total_actual_histories)
+        return {
+            "roi_name": roi_name,
+            "dose_arr": dose_grid,
+            "unc_arr": final_unc_arr,
+            "total_actual_histories": int(total_actual_histories),
+            "num_batches": len(batches),
+            "converged": bool(converged),
+            "cap_reached": bool(not converged),
+            "final_uncertainty_percentile_fraction": self._finite_float_or_none(final_uncertainty_percentile),
+            "final_uncertainty_percentile_percent": self._finite_float_or_none(final_uncertainty_percentile * 100.0),
+            "batches": batches,
+            "material_label_path": mat_label_path,
+            "size": size_xyz,
+            "spacing": spacing_xyz,
+            "n_materials": n_materials,
+            "mat_table": mat_table,
+            "den_table": den_table,
         }
 
     # ------------------------------------------------------------------
@@ -602,6 +857,7 @@ class OpenGateSimulationStage:
         dose_paths: Dict[str, str],
         unc_paths: Dict[str, str],
         sum_path: Optional[str],
+        sum_unc_path: Optional[str],
         mat_label_path: Optional[str],
         was_resampled: bool,
         sim_ct_path: str,
@@ -612,6 +868,7 @@ class OpenGateSimulationStage:
             "dose_paths": dose_paths,
             "unc_paths": unc_paths,
             "sum_path": sum_path,
+            "sum_unc_path": sum_unc_path,
             "mat_label_path": mat_label_path,
         }
         extra: Dict[str, Any] = {
@@ -647,13 +904,18 @@ class OpenGateSimulationStage:
                 "write_mhd_outputs": self.write_mhd_outputs,
             },
             "gate": {
-                "requested_total_histories": self.requested_total_histories,
-                "requested_num_threads": self.requested_num_threads,
-                "actual_total_histories": self.actual_total_histories,
+                "requested_total_histories_per_batch": self.requested_total_histories_per_batch,
+                "actual_histories_per_batch": self.actual_histories_per_batch,
+                "configured_num_threads": self.configured_num_threads,
+                "effective_num_threads": self.num_threads,
                 "num_threads": self.num_threads,
-                "histories_per_thread": self.histories_per_thread,
-                "history_rounding_loss": self.history_rounding_loss,
-                "random_seed": self.random_seed,
+                "histories_per_thread_per_batch": self.histories_per_thread_per_batch,
+                "history_rounding_loss_per_batch": self.history_rounding_loss_per_batch,
+                "target_uncertainty_percent": self.target_uncertainty_percent,
+                "target_uncertainty_fraction": self.target_uncertainty_fraction,
+                "uncertainty_percentile": self.uncertainty_percentile,
+                "max_batches_per_roi": self.max_batches_per_roi,
+                "random_seed_base": self.random_seed_base,
                 "start_new_process": self.start_new_process,
             },
             "physics": {
@@ -668,6 +930,7 @@ class OpenGateSimulationStage:
                 "doses": dose_paths,
                 "uncertainties": unc_paths,
                 "sum_dose": sum_path,
+                "sum_uncertainty": sum_unc_path,
                 "material_labels": mat_label_path,
             },
             "roi_metadata": roi_meta,
@@ -717,6 +980,7 @@ class OpenGateSimulationStage:
             self.context.dosimetry_raw_dose_paths = paths.get("doses", {})
             self.context.dosimetry_raw_uncertainty_paths = paths.get("uncertainties", {})
             self.context.dosimetry_sum_dose_path = paths.get("sum_dose")
+            self.context.dosimetry_sum_uncertainty_path = paths.get("sum_uncertainty")
             self.context.dosimetry_material_label_path = paths.get("material_labels")
             self.context.dosimetry_mask_paths = paths.get("masks", {})
             return self.context
@@ -744,10 +1008,14 @@ class OpenGateSimulationStage:
         unc_paths: Dict[str, str] = {}
         roi_meta: Dict[str, Any] = {}
         sum_arr: Optional[np.ndarray] = None
+        sum_uncertainty_var_arr: Optional[np.ndarray] = None
         mat_label_path: Optional[str] = None
+        simulated_actual_histories_this_run = 0
+        nonconverged_rois: List[str] = []
 
         for idx, roi_name in enumerate(roi_names):
             expected_nii = self._roi_dose_nii_path(roi_name)
+            expected_unc_nii = self._roi_unc_nii_path(roi_name)
 
             # ----------------------------------------------------------
             # Resume logic: skip simulation if output already exists.
@@ -763,31 +1031,45 @@ class OpenGateSimulationStage:
                     )
                 dose_grid = sitk.GetArrayFromImage(dose_img).astype(np.float64)
                 dose_paths[roi_name] = str(expected_nii)
-                unc_nii = Path(self.work_dir) / f"{self.prefix}_unc_{roi_name}.nii.gz"
-                if unc_nii.exists():
-                    unc_paths[roi_name] = str(unc_nii)
+                if expected_unc_nii.exists():
+                    unc_paths[roi_name] = str(expected_unc_nii)
+                    unc_grid = sitk.GetArrayFromImage(sitk.ReadImage(str(expected_unc_nii))).astype(np.float64)
+                    unc_contrib = self._relative_uncertainty_variance_numerator(unc_grid, dose_grid)
+                    sum_uncertainty_var_arr = (
+                        unc_contrib.copy()
+                        if sum_uncertainty_var_arr is None
+                        else sum_uncertainty_var_arr + unc_contrib
+                    )
                 roi_meta[roi_name] = {"skipped": True, "loaded_from": str(expected_nii)}
                 sum_arr = dose_grid.copy() if sum_arr is None else sum_arr + dose_grid
                 continue
 
             # ----------------------------------------------------------
-            # Normal path: run the simulation for this ROI.
+            # Normal path: run adaptive batches for this ROI.
             # ----------------------------------------------------------
-            res = self._run_single_roi(
+            res = self._run_roi_batches(
                 roi_name,
                 mask_paths[roi_name],
+                sim_ct,
                 sim_ct_path,
                 save_labels=(idx == 0),
             )
 
-            # Convert Gy/primary -> Gy/decay using the actual simulated history count.
-            dose_sim = np.asarray(res["dose_arr"], dtype=np.float64) / self.actual_total_histories
-
             # Preserve the selected simulation grid. If xyz_spacing_mm requested a
             # coarser grid, saving directly here avoids an extra interpolation back
             # to native CT resolution.
-            dose_grid = dose_sim
+            dose_grid = np.asarray(res["dose_arr"], dtype=np.float64)
+            unc_grid = np.asarray(res["unc_arr"], dtype=np.float64)
             sum_arr = dose_grid.copy() if sum_arr is None else sum_arr + dose_grid
+            unc_contrib = self._relative_uncertainty_variance_numerator(unc_grid, dose_grid)
+            sum_uncertainty_var_arr = (
+                unc_contrib.copy()
+                if sum_uncertainty_var_arr is None
+                else sum_uncertainty_var_arr + unc_contrib
+            )
+            simulated_actual_histories_this_run += int(res["total_actual_histories"])
+            if not res["converged"]:
+                nonconverged_rois.append(roi_name)
 
             if self.save_per_roi_dose_maps:
                 dose_paths[roi_name] = save_nii_sitk(
@@ -796,35 +1078,29 @@ class OpenGateSimulationStage:
                     expected_nii,
                 )
 
-            if self.save_uncertainty_map and res["unc_arr"] is not None:
+            if self.save_uncertainty_map:
                 unc_paths[roi_name] = save_nii_sitk(
                     dose_ref_img,
-                    res["unc_arr"],
-                    Path(self.work_dir) / f"{self.prefix}_unc_{roi_name}.nii.gz",
+                    unc_grid.astype(np.float32),
+                    expected_unc_nii,
                 )
 
-            # Save the material label image from the first successful ROI only.
-            if mat_label_path is None and self.save_material_label_image and res["label_mhd_path"] and os.path.exists(res["label_mhd_path"]):
-                labels = sitk.GetArrayFromImage(sitk.ReadImage(res["label_mhd_path"])).astype(np.int16)
-                mat_label_path = save_nii_sitk(
-                    sim_ct,
-                    labels,
-                    Path(self.work_dir) / f"{self.prefix}_material_labels.nii.gz",
-                )
-
-            if not self.write_mhd_outputs:
-                cleanup_mhd(Path(res["dose_mhd_path"]))
-                if res["unc_mhd_path"]:
-                    cleanup_mhd(Path(res["unc_mhd_path"]))
-                if res["label_mhd_path"]:
-                    cleanup_mhd(Path(res["label_mhd_path"]))
+            if mat_label_path is None and res["material_label_path"]:
+                mat_label_path = res["material_label_path"]
 
             roi_meta[roi_name] = {
-                "work_dir": res["roi_work_dir"],
-                "stats": res["stats_str"],
-                "events": res["stats_events"],
-                "size": list(res["size_xyz"]),
-                "spacing": list(res["spacing_xyz"]),
+                "work_dir": str(Path(self.work_dir) / roi_name),
+                "num_batches": res["num_batches"],
+                "converged": res["converged"],
+                "cap_reached": res["cap_reached"],
+                "total_actual_histories": res["total_actual_histories"],
+                "final_uncertainty_percentile": self.uncertainty_percentile,
+                "final_uncertainty_percentile_fraction": res["final_uncertainty_percentile_fraction"],
+                "final_uncertainty_percentile_percent": res["final_uncertainty_percentile_percent"],
+                "target_uncertainty_percent": self.target_uncertainty_percent,
+                "batches": res["batches"],
+                "size": res["size"],
+                "spacing": res["spacing"],
                 "n_materials": res["n_materials"],
                 "mat_table": res["mat_table"],
                 "den_table": res["den_table"],
@@ -838,6 +1114,15 @@ class OpenGateSimulationStage:
                 Path(self.phase_output_dir) / f"{self.prefix}_dose_sum.nii.gz",
             )
 
+        sum_unc_path: Optional[str] = None
+        if self.save_uncertainty_map and sum_arr is not None and sum_uncertainty_var_arr is not None:
+            sum_unc_arr = self._combine_relative_uncertainty(sum_arr, sum_uncertainty_var_arr)
+            sum_unc_path = save_nii_sitk(
+                dose_ref_img,
+                sum_unc_arr.astype(np.float32),
+                Path(self.phase_output_dir) / f"{self.prefix}_dose_sum_unc.nii.gz",
+            )
+
         self._save_metadata(
             roi_names=roi_names,
             roi_counts=roi_counts,
@@ -846,6 +1131,7 @@ class OpenGateSimulationStage:
             dose_paths=dose_paths,
             unc_paths=unc_paths,
             sum_path=sum_path,
+            sum_unc_path=sum_unc_path,
             mat_label_path=mat_label_path,
             was_resampled=was_resampled,
             sim_ct_path=str(sim_ct_path),
@@ -860,13 +1146,18 @@ class OpenGateSimulationStage:
         self.context.dosimetry_raw_dose_paths = dose_paths
         self.context.dosimetry_raw_uncertainty_paths = unc_paths
         self.context.dosimetry_sum_dose_path = sum_path
+        self.context.dosimetry_sum_uncertainty_path = sum_unc_path
         self.context.dosimetry_material_label_path = mat_label_path
         self.context.extras["opengate_simulation_stage"] = {
             "simulated_roi_names": list(roi_names),
             "requested_roi_subset": list(self.requested_roi_subset),
-            "actual_total_histories": self.actual_total_histories,
+            "simulated_actual_histories_this_run": simulated_actual_histories_this_run,
+            "actual_histories_per_batch": self.actual_histories_per_batch,
+            "target_uncertainty_percent": self.target_uncertainty_percent,
+            "uncertainty_percentile": self.uncertainty_percentile,
+            "nonconverged_rois": nonconverged_rois,
             "effective_num_threads": self.num_threads,
-            "history_rounding_loss": self.history_rounding_loss,
+            "history_rounding_loss_per_batch": self.history_rounding_loss_per_batch,
             "dose_units": "Gy/decay",
             "metadata_path": self.metadata_path,
         }

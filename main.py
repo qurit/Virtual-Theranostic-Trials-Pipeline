@@ -420,6 +420,9 @@ class TdtPipeline:
             simind_work = getattr(context, "simind_work_dir", None)
             if simind_work and os.path.exists(simind_work):
                 self._cleanup_work_dir(simind_work)
+            dosimetry_work = getattr(context, "dosimetry_work_dir", None)
+            if dosimetry_work and os.path.exists(dosimetry_work):
+                self._cleanup_work_dir(dosimetry_work)
 
         pipeline_elapsed = time.perf_counter() - t_pipeline
         logger.info("Pipeline end | total_elapsed=%.2fs", pipeline_elapsed)

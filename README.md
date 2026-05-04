@@ -147,8 +147,9 @@ cp config_template.json inputs/my_config.json
 - `phase_3.spect_postprocess_stage.Iterations`, `Subsets` — OSEM reconstruction settings. `Subsets × Iterations` must not exceed `NumProjections`.
 - `phase_2.simind_stage.xyz_spacing_mm` — target voxel spacing in mm as `[sxy, sxy, sz]`. X and Y must match. The shared XY value must be ≥ both native in-plane spacings; Z must be ≥ the native CT Z spacing (only coarser grids allowed). Voxel counts are derived automatically from the physical CT extent. The native CT spacing is logged at runtime. `null` = native CT resolution.
 - `phase_2.opengate_stage.xyz_spacing_mm` — same rule as above for dosimetry. Dose maps are saved on the selected simulation grid; use `null` to keep native CT resolution.
-- `phase_2.opengate_stage.gate.total_histories` — Monte Carlo histories for dosimetry.
-- `phase_2.opengate_stage.gate.num_cpu` — OpenGATE threads (`0` = use all available).
+- `phase_2.opengate_stage.gate.total_histories_per_batch` — Monte Carlo histories per adaptive OpenGATE batch.
+- `phase_2.opengate_stage.gate.num_threads` — OpenGATE threads (`0` = use all available).
+- `phase_2.opengate_stage.gate.target_uncertainty_percent` — ROI stopping target as a percent. Each ROI stops once the 95th percentile of its voxel uncertainty is below this value, or logs a warning and saves the best result after the developer batch cap.
 
 When `xyz_spacing_mm` is used, the pipeline preserves the physical CT extent and derives integer voxel counts from that extent. This means the realised spacing can be very close to, but not mathematically identical to, the requested value when the extent is not exactly divisible by the target spacing. In the web UI this is edited as `XY` + `Z`; in the JSON config it is still stored as `[sxy, sxy, sz]`.
 
@@ -257,11 +258,15 @@ test_run/
     <prefix>_tot_w1/w2/w3.a00                <- summed projection totals (all ROIs)
     calib.res                                <- SIMIND calibration (sensitivity)
     <prefix>_dose_sum.nii.gz                 <- summed dose map (Gy/decay, if --dosimetry)
+    <prefix>_dose_sum_unc.nii.gz             <- summed relative uncertainty map (if --dosimetry)
     opengate_simulation/                     <- (if --dosimetry)
       <prefix>_dose_<roi>.nii.gz             <- per-ROI dose maps (Gy/decay)
+      <prefix>_unc_<roi>.nii.gz              <- final per-ROI relative uncertainty maps
+      <prefix>_material_labels.nii.gz        <- OpenGATE material labels
       work_dir/
         source_masks/
         resampled_inputs/
+        <roi>/batches/batch_000001/          <- batch dose/uncertainty scratch outputs
   post_processing/                           <- Phase 3
     spect_postprocess/                       <- (if --spect --postprocess)
       <prefix>_<t_hr>_tot_w1/w2/w3.nii.gz   <- PBPK-weighted projections per frame
@@ -276,7 +281,8 @@ test_run/
 **Notes:**
 - `*_tot_w1/w2/w3.a00` are SIMIND energy-window projection totals (lower / photopeak / upper).
 - `calib.res` is produced by SIMIND Jaszczak calibration and converts counts -> activity.
-- All dose maps are saved in native CT resolution. If `xyz_spacing_mm` was set for OpenGATE, the simulation runs on the coarser grid and outputs are resampled back automatically.
+- OpenGATE dose maps are saved on the selected simulation grid. `xyz_spacing_mm: null` keeps native CT resolution; otherwise outputs stay on the coarser dosimetry grid.
+- OpenGATE adaptive batches are independent Monte Carlo runs. Raw batch dose is accumulated and normalized by total simulated histories, so the final saved dose remains Gy/decay. Relative uncertainty improves approximately as `1 / sqrt(N)` as more histories are accumulated.
 
 ### Profiling Output
 
@@ -293,7 +299,7 @@ If `--profile` is enabled, each patient output folder also contains `profiling_C
 This makes the profiler suitable for parameter sweeps where you want to compare how stage runtime, CPU load, and memory footprint change as you vary photon counts, histories, voxel spacing, reconstruction settings, or ROI selections.
 - The total dose map is computed using per-ROI weighting: each ROI's dose-per-decay map is multiplied by that ROI's own cumulated activity (TAC integrated from t=0 over 10x the isotope half-life, capturing >99.9% of all decays), then summed across ROIs. This avoids unphysical cross-terms.
 - PBPK TAC simulation length is derived automatically from the configured isotope half-life (10x multiplier). If any SPECT frame time extends beyond this, the TAC is extended to cover it.
-- In `PRODUCTION` mode, SIMIND `work_dir` is deleted after post-processing to save disk space, but rerun metadata is preserved in `pipeline_metadata/`.
+- In `PRODUCTION` mode, SIMIND and OpenGATE `work_dir` folders are deleted after the pipeline finishes to save disk space, but final outputs and rerun metadata are preserved.
 - Existing outputs are reused only when the saved CT provenance and the relevant stage config still match the persistent metadata. If they do not match, delete the old stage outputs for that patient before rerunning.
 - SIMIND header files are preserved in `headers/` to support reconstruction.
 - PBPK TACs are saved as JSON + npz in Phase 1 and reused by both SPECT and dosimetry post-processing.
