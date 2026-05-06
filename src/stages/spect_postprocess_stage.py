@@ -7,8 +7,8 @@ reconstruction using PyTomography.
 Core responsibilities
 ---------------------
 - For each ROI present in SIMIND projections, read per-organ TAC from Phase 1 PBPK.
-- Fold any PBPK organ TACs that are absent from SIMIND's roi_subset into the
-  remaining_body TAC so that activity from excluded organs is not lost.
+- Fold absent dedicated non-Rest PBPK organ TACs into the remaining_body TAC so
+  activity from excluded organs is not lost.
 - Interpolate TAC values at configured frame start times.
 - Build per-frame activity maps and apply TAC-derived activity to SIMIND projections.
 - Optionally apply Poisson noise to projections.
@@ -67,6 +67,7 @@ from src.utils.simind_projection_utils import (
     write_activity_map_nifti,
     write_projection_nifti,
 )
+from src.utils.tac_utils import get_pbpk_voi_name_for_roi
 
 from pytomography.algorithms import OSEM
 from pytomography.io.SPECT import simind
@@ -180,6 +181,36 @@ class SpectPostprocessStage:
             markers.append(os.path.join(self.output_dir, "recon_atn_img.nii.gz"))
         return markers
 
+    def _header_paths_for_roi(self, roi_name: str) -> Tuple[str, str, str]:
+        """Return lower/photopeak/upper SIMIND header paths for an ROI stem."""
+        lower_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_name}_0_tot_w1.h00")
+        photopeak_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_name}_0_tot_w2.h00")
+        upper_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_name}_0_tot_w3.h00")
+        return lower_h, photopeak_h, upper_h
+
+    def _select_header_roi(self, roi_list: Sequence[str]) -> str:
+        """Pick a simulated ROI whose copied SIMIND headers are available."""
+        for roi_name in roi_list:
+            lower_h, photopeak_h, upper_h = self._header_paths_for_roi(roi_name)
+            if all(os.path.exists(p) for p in (lower_h, photopeak_h, upper_h)):
+                return roi_name
+        raise FileNotFoundError(
+            "No complete SIMIND header triplet found in "
+            f"{self.header_dir} for ROIs: {list(roi_list)}"
+        )
+
+    def _load_metadata_extra(self) -> Dict[str, Any]:
+        """Load previously saved metadata extras when this stage is skipped."""
+        if not os.path.exists(self.metadata_path):
+            return {}
+        try:
+            with open(self.metadata_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            extra = meta.get("extra", {})
+            return extra if isinstance(extra, dict) else {}
+        except Exception:
+            return {}
+
     def _convert_counts_to_mbq_per_ml(
         self,
         reconstructed_image: torch.Tensor,
@@ -244,6 +275,8 @@ class SpectPostprocessStage:
         self,
         pbpk_projection_paths: Dict[str, Dict[str, str]],
         recon_paths: Dict[str, str],
+        folded_remaining_body_rois: Optional[List[str]] = None,
+        rest_owned_skipped_rois: Optional[List[str]] = None,
     ) -> None:
         """Save post-processing stage metadata for debugging / provenance."""
         outputs: Dict[str, Any] = {
@@ -271,6 +304,10 @@ class SpectPostprocessStage:
             "header_dir": self.header_dir,                                             
             "calibration_file": self.calibration_file,                                 
         }
+        if folded_remaining_body_rois is not None:
+            extra["remaining_body_folded_rois"] = list(folded_remaining_body_rois)
+        if rest_owned_skipped_rois is not None:
+            extra["rest_owned_skipped_rois"] = list(rest_owned_skipped_rois)
         metadata = build_stage_metadata(
             stage_name="spect_postprocess_stage",
             config_snapshot=self._rerun_config_snapshot(),
@@ -302,12 +339,18 @@ class SpectPostprocessStage:
             context=self.context,
         )
         if self.context.stage_skipped:
+            metadata_extra = self._load_metadata_extra()
             self.context.reconstruction_output_dir = self.phase_output_dir
             self.context.pbpk_projection_paths = build_frame_projection_paths(
                 self.output_dir, self.prefix, self.frame_start
             )
             self.context.pbpk_frame_start_times_min = np.asarray(self.frame_start, dtype=float)
             self.context.pbpk_frame_durations_s = np.asarray(self.frame_durations_s, dtype=float)
+            self.context.extras["spect_postprocess_stage"] = {
+                "folded_remaining_body_rois": metadata_extra.get("remaining_body_folded_rois", []),
+                "rest_owned_skipped_rois": metadata_extra.get("rest_owned_skipped_rois", []),
+                "metadata_path": self.metadata_path,
+            }
             return self.context
 
         self.context.require(
@@ -329,10 +372,9 @@ class SpectPostprocessStage:
         if not roi_list:
             raise ValueError("No phase-2 SIMIND projection paths found in context.")
 
-        # Locate SIMIND headers from header_dir 
-        photopeak_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0_tot_w2.h00") 
-        lower_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0_tot_w1.h00") 
-        upper_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0_tot_w3.h00") 
+        # Locate SIMIND headers from header_dir.
+        header_roi = self._select_header_roi(roi_list)
+        lower_h, photopeak_h, upper_h = self._header_paths_for_roi(header_roi)
         self.proj_dim1, self.proj_dim2, self.num_proj = read_simind_header_dims(
             photopeak_h, lower_h, upper_h
         )
@@ -343,24 +385,32 @@ class SpectPostprocessStage:
         # mutating context for other stages.
         tac_values: Dict[str, np.ndarray] = dict(self.context.pbpk_tac_values)
 
-        # Aggregate excluded-organ TACs into remaining_body.
-        # SIMIND's roi_subset may be smaller than Phase 1's roi_subset.  Any organ
-        # that was modelled explicitly in PBPK but is NOT present in this simulation's
+        # Aggregate excluded dedicated-organ TACs into remaining_body.
+        # SIMIND's roi_subset may be smaller than Phase 1's roi_subset.  Any ROI
+        # with a dedicated non-Rest PBPK VOI that is NOT present in this simulation's
         # class_seg is geometrically absorbed into SIMIND's remaining_body mask.
-        # Its activity must therefore be folded into the remaining_body TAC so that
-        # the total activity assigned to that mask is correct.
+        # ROIs mapped to Rest are already represented by remaining_body itself.
         simulation_rois: set = set(class_seg.keys()) - {"remaining_body"}
+        folded_remaining_body_rois: List[str] = []
+        rest_owned_skipped_rois: List[str] = []
         if "remaining_body" in tac_values:
             effective_rb = tac_values["remaining_body"].copy().astype(np.float64)
             for _rn, _rt in self.context.pbpk_tac_values.items():
                 if _rn != "remaining_body" and _rn not in simulation_rois:
+                    voi_name = get_pbpk_voi_name_for_roi(self.context, _rn)
+                    if isinstance(voi_name, str) and voi_name.strip().lower() == "rest":
+                        rest_owned_skipped_rois.append(_rn)
+                        continue
                     effective_rb += np.asarray(_rt, dtype=np.float64)
-                    if self.debug:
-                        print(
-                            f"[SpectPostprocessStage] Folding excluded ROI '{_rn}' TAC "
-                            "into remaining_body (not in SIMIND roi_subset)."
-                        )
+                    folded_remaining_body_rois.append(_rn)
             tac_values["remaining_body"] = effective_rb.astype(np.float32)
+        if self.debug and (folded_remaining_body_rois or rest_owned_skipped_rois):
+            print(
+                "[SpectPostprocessStage] Remaining-body TAC folding summary: "
+                f"folded={len(folded_remaining_body_rois)} ROI(s) | "
+                f"skipped_rest_owned={len(rest_owned_skipped_rois)} ROI(s). "
+                f"Details: {self.metadata_path}"
+            )
 
         n_frames = len(self.frame_start)
         roi_body_seg_arr = self.context.roi_body_seg_arr                               
@@ -458,7 +508,7 @@ class SpectPostprocessStage:
 
             cor_path: Optional[str] = None
             if self.detector_distance < 0:
-                cor_path = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0.cor") 
+                cor_path = os.path.join(self.header_dir, f"{self.simind_prefix}_{header_roi}_0.cor")
                 if not os.path.exists(cor_path):
                     raise FileNotFoundError(f"Missing COR file: {cor_path}")
                 _ = load_cor_data(cor_path)
@@ -470,7 +520,7 @@ class SpectPostprocessStage:
                 photopeak_h, lower_h, upper_h
             )
 
-            path_amap = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0.hct") 
+            path_amap = os.path.join(self.header_dir, f"{self.simind_prefix}_{header_roi}_0.hct")
             if not os.path.exists(path_amap):
                 raise FileNotFoundError(f"Missing attenuation map header (.hct): {path_amap}")
 
@@ -539,6 +589,8 @@ class SpectPostprocessStage:
         self._save_stage_metadata(
             pbpk_projection_paths=pbpk_projection_paths,
             recon_paths=recon_paths,
+            folded_remaining_body_rois=folded_remaining_body_rois,
+            rest_owned_skipped_rois=rest_owned_skipped_rois,
         )
 
         self.context.activity_map_sum = activity_map_sum
@@ -548,5 +600,10 @@ class SpectPostprocessStage:
         self.context.pbpk_frame_durations_s = np.asarray(self.frame_durations_s, dtype=float)
         self.context.pbpk_projection_paths = pbpk_projection_paths
         self.context.reconstruction_output_dir = self.phase_output_dir
+        self.context.extras["spect_postprocess_stage"] = {
+            "folded_remaining_body_rois": folded_remaining_body_rois,
+            "rest_owned_skipped_rois": rest_owned_skipped_rois,
+            "metadata_path": self.metadata_path,
+        }
 
         return self.context

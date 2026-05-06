@@ -566,7 +566,19 @@ class SimindSimulationStage:
             self.calibration_path,
         ]
         markers.extend(get_summed_projection_paths(self.output_dir, self.prefix).values())
-        for organ_name in ["remaining_body", *self.simind_roi_subset]:
+
+        cached_roi_list = None
+        if os.path.exists(self.metadata_path):
+            try:
+                meta = load_json(self.metadata_path)
+            except (OSError, json.JSONDecodeError):
+                meta = {}
+            roi_list = meta.get("roi_list")
+            if isinstance(roi_list, list) and roi_list:
+                cached_roi_list = [str(r) for r in roi_list if str(r).strip()]
+
+        marker_rois = cached_roi_list or ["remaining_body", *self.simind_roi_subset]
+        for organ_name in marker_rois:
             markers.extend(get_projection_paths_for_organ(self.work_dir, self.prefix, organ_name).values())
         return markers
 
@@ -621,6 +633,10 @@ class SimindSimulationStage:
             "header_dir": self.header_dir,
             "preprocess_dir": self.preprocess_dir,
         }
+        skipped_zero_voxel_rois = [
+            roi for roi in self.simind_roi_subset
+            if roi not in roi_list
+        ]
         extra: Dict[str, Any] = {
             "stage": "simind_simulation_stage",
             "phase_output_dir": self.phase_output_dir,
@@ -645,6 +661,8 @@ class SimindSimulationStage:
             "energy_window_width": self.energy_window_width,
             "num_cpu": self.num_cpu,
             "simind_roi_subset": list(self.simind_roi_subset),                         
+            "requested_roi_subset": ["remaining_body", *self.simind_roi_subset],
+            "skipped_zero_voxel_rois": skipped_zero_voxel_rois,
             "xyz_spacing_mm": self.xyz_spacing_mm,
             "roi_list": roi_list,
             "geometry": geometry,
@@ -700,7 +718,19 @@ class SimindSimulationStage:
             self.context.simind_header_dir = self.header_dir
             # Restore path dicts and scalars from metadata.
             meta = load_json(self.metadata_path)
-            self.context.simind_projection_paths = meta.get("simind_projection_paths", {})
+            cached_roi_list = [
+                str(r) for r in meta.get("roi_list", [])
+                if str(r).strip()
+            ]
+            cached_projection_paths = meta.get("simind_projection_paths", {})
+            if cached_roi_list and isinstance(cached_projection_paths, dict):
+                self.context.simind_projection_paths = {
+                    roi: cached_projection_paths[roi]
+                    for roi in cached_roi_list
+                    if roi in cached_projection_paths
+                }
+            else:
+                self.context.simind_projection_paths = cached_projection_paths
             self.context.simind_summed_projection_paths = meta.get("summed_projection_paths", {})
             self.context.simind_num_cpu = self.num_cpu
             self.context.simind_geometry = meta.get("geometry")
@@ -713,7 +743,7 @@ class SimindSimulationStage:
                 ct_nii_path=self.context.ct_nii_path,
                 vtt_roi_seg_path=self.context.vtt_roi_seg_path,
                 vtt_name2id=self.vtt_name2id,
-                roi_subset=self.simind_roi_subset,
+                roi_subset=cached_roi_list or self.simind_roi_subset,
                 output_dir=self.preprocess_dir,
                 prefix=self.prefix,
                 xyz_spacing_mm=self.xyz_spacing_mm,
@@ -722,6 +752,16 @@ class SimindSimulationStage:
                 debug=self.debug,
             )
             preprocess_results = preprocessor.run()
+            if cached_roi_list:
+                roi_body_arr = filter_roi_seg_to_subset(
+                    preprocess_results["roi_body_seg_arr"],
+                    cached_roi_list,
+                    self.vtt_name2id,
+                )
+                id_to_name = {v: k for k, v in self.vtt_name2id.items()}
+                preprocess_results["roi_body_seg_arr"] = roi_body_arr
+                preprocess_results["masks"] = build_label_masks(roi_body_arr)
+                preprocess_results["class_seg"] = build_class_map(roi_body_arr, id_to_name)
             self.context.body_seg_arr = preprocess_results["body_seg_arr"]
             self.context.roi_body_seg_arr = preprocess_results["roi_body_seg_arr"]
             self.context.mask_roi_body = preprocess_results["masks"]
@@ -730,6 +770,23 @@ class SimindSimulationStage:
             self.context.binary_roi_act_map_paths = preprocess_results["binary_roi_act_map_paths"]
             self.context.arr_px_spacing_cm = preprocess_results["arr_px_spacing_cm"]
             self.context.arr_shape_new = preprocess_results["arr_shape_new"]
+            requested_roi_subset = meta.get("requested_roi_subset", ["remaining_body", *self.simind_roi_subset])
+            simulated_roi_names = list((self.context.simind_projection_paths or {}).keys())
+            skipped_zero_voxel_rois = meta.get("skipped_zero_voxel_rois")
+            if skipped_zero_voxel_rois is None:
+                skipped_zero_voxel_rois = [
+                    roi for roi in requested_roi_subset
+                    if roi not in simulated_roi_names
+                ]
+                meta["requested_roi_subset"] = requested_roi_subset
+                meta["skipped_zero_voxel_rois"] = skipped_zero_voxel_rois
+                write_json(self.metadata_path, meta)
+            self.context.extras["simind_simulation_stage"] = {
+                "requested_roi_subset": requested_roi_subset,
+                "simulated_roi_names": simulated_roi_names,
+                "skipped_zero_voxel_rois": skipped_zero_voxel_rois,
+                "metadata_path": self.metadata_path,
+            }
             return self.context
 
         preprocessor = _SimindPreprocessor(
@@ -884,5 +941,14 @@ class SimindSimulationStage:
         self.context.simind_scale_factor = scale_factor
         self.context.simind_switches_by_organ = simind_switches_by_organ
         self.context.simind_header_dir = self.header_dir                               
+        self.context.extras["simind_simulation_stage"] = {
+            "requested_roi_subset": ["remaining_body", *self.simind_roi_subset],
+            "simulated_roi_names": list(simind_projection_paths.keys()),
+            "skipped_zero_voxel_rois": [
+                roi for roi in self.simind_roi_subset
+                if roi not in roi_list
+            ],
+            "metadata_path": self.metadata_path,
+        }
 
         return self.context

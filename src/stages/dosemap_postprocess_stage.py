@@ -8,8 +8,8 @@ Core responsibilities
 ---------------------
 - Load per-ROI dose maps from OpenGATE (Gy/decay).
 - Load PBPK TACs from Phase 1.
-- Fold any PBPK organ TACs absent from OpenGATE's roi_subset into remaining_body
-  so that excluded-organ activity is correctly accounted for in the dose weighting.
+- Fold absent dedicated non-Rest PBPK organ TACs into remaining_body so excluded
+  organ activity is correctly accounted for in the dose weighting.
 - Integrate each ROI's TAC from t=0 to the end of the TAC (which covers 10x the
   isotope half-life, capturing >99.9% of all decays) to get total cumulated activity.
 - Multiply each ROI's dose_per_decay by its own cumulated activity, then sum
@@ -73,7 +73,7 @@ from src.io.rerun_guard import (
     write_json,
 )
 from src.utils.nifti_utils import save_nii_sitk
-from src.utils.tac_utils import compute_roi_cumulated_activity
+from src.utils.tac_utils import compute_roi_cumulated_activity, get_pbpk_voi_name_for_roi
 
 
 class DosemapPostprocessStage:
@@ -158,6 +158,18 @@ class DosemapPostprocessStage:
             and np.allclose(a.GetDirection(), b.GetDirection(), atol=atol)
         )
 
+    def _load_metadata_extra(self) -> Dict[str, Any]:
+        """Load previously saved metadata extras when this stage is skipped."""
+        if not os.path.exists(self.metadata_path):
+            return {}
+        try:
+            with open(self.metadata_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            extra = meta.get("extra", {})
+            return extra if isinstance(extra, dict) else {}
+        except Exception:
+            return {}
+
     def _save_stage_metadata(
         self,
         dose_path: str,
@@ -166,6 +178,7 @@ class DosemapPostprocessStage:
         integration_end_min: float,
         dose_ref_img: sitk.Image,
         folded_remaining_body_decays: Optional[Dict[str, float]] = None,
+        rest_owned_skipped_rois: Optional[List[str]] = None,
     ) -> None:
         """Save post-processing metadata."""
         roi_contribution_paths = {
@@ -199,6 +212,9 @@ class DosemapPostprocessStage:
         if folded_remaining_body_decays:
             extra["remaining_body_folded_from_decays"] = folded_remaining_body_decays
             extra["remaining_body_folded_total_decays"] = float(sum(folded_remaining_body_decays.values()))
+            extra["remaining_body_folded_rois"] = list(folded_remaining_body_decays.keys())
+        if rest_owned_skipped_rois is not None:
+            extra["rest_owned_skipped_rois"] = list(rest_owned_skipped_rois)
         metadata = build_stage_metadata(
             stage_name="dosemap_postprocess_stage",
             config_snapshot=self._rerun_config_snapshot(),
@@ -235,25 +251,32 @@ class DosemapPostprocessStage:
         tac_values: Dict[str, np.ndarray] = dict(self.context.pbpk_tac_values)
         integration_end_min = float(tac_time[-1])
         folded_remaining_body_decays: Dict[str, float] = {}
+        rest_owned_skipped_rois: List[str] = []
 
-        # Aggregate excluded-organ TACs into remaining_body.
-        # OpenGATE's roi_subset may be smaller than Phase 1's roi_subset.  Any organ
-        # that was modelled in PBPK but not present in the OpenGATE dose maps is
-        # geometrically absorbed into OpenGATE's remaining_body mask.  Its cumulated
-        # activity must be folded into remaining_body so the dose weighting is correct.
+        # Aggregate excluded dedicated-organ TACs into remaining_body.
+        # OpenGATE's roi_subset may be smaller than Phase 1's roi_subset.  Any ROI
+        # with a dedicated non-Rest PBPK VOI that is not present in the OpenGATE
+        # dose maps is geometrically absorbed into OpenGATE's remaining_body mask.
+        # ROIs mapped to Rest are already represented by remaining_body itself.
         simulation_rois: set = set(raw_dose_paths.keys()) - {"remaining_body"}
         if "remaining_body" in tac_values:
             effective_rb = tac_values["remaining_body"].copy().astype(np.float64)
             for _rn, _rt in self.context.pbpk_tac_values.items():
                 if _rn != "remaining_body" and _rn not in simulation_rois:
+                    voi_name = get_pbpk_voi_name_for_roi(self.context, _rn)
+                    if isinstance(voi_name, str) and voi_name.strip().lower() == "rest":
+                        rest_owned_skipped_rois.append(_rn)
+                        continue
                     effective_rb += np.asarray(_rt, dtype=np.float64)
                     folded_remaining_body_decays[_rn] = compute_roi_cumulated_activity(tac_time, _rt)
-                    if self.debug:
-                        print(
-                            f"[DosemapPostprocessStage] Folding excluded ROI '{_rn}' TAC "
-                            "into remaining_body (not in OpenGATE roi_subset)."
-                        )
             tac_values["remaining_body"] = effective_rb.astype(np.float32)
+        if self.debug and (folded_remaining_body_decays or rest_owned_skipped_rois):
+            print(
+                "[DosemapPostprocessStage] Remaining-body TAC folding summary: "
+                f"folded={len(folded_remaining_body_decays)} ROI(s) | "
+                f"skipped_rest_owned={len(rest_owned_skipped_rois)} ROI(s). "
+                f"Details: {self.metadata_path}"
+            )
 
         # Final output path
         output_path = os.path.join(
@@ -273,12 +296,21 @@ class DosemapPostprocessStage:
         if self.context.stage_skipped or os.path.exists(output_path):
             if self.debug:
                 print("[DosemapPostprocessStage] Total dose map already exists, skipping.")
+            metadata_extra = self._load_metadata_extra()
             self.context.dosemap_postprocess_output_dir = self.stage_output_dir
             self.context.dosemap_postprocess_dose_path = output_path
             self.context.extras["dosemap_postprocess_stage"] = {
                 "stage_output_dir": self.stage_output_dir,
                 "dose_path": output_path,
                 "metadata_path": self.metadata_path,
+                "folded_remaining_body_rois": metadata_extra.get(
+                    "remaining_body_folded_rois",
+                    list(folded_remaining_body_decays.keys()),
+                ),
+                "rest_owned_skipped_rois": metadata_extra.get(
+                    "rest_owned_skipped_rois",
+                    rest_owned_skipped_rois,
+                ),
             }
             return self.context
 
@@ -371,6 +403,7 @@ class DosemapPostprocessStage:
             integration_end_min,
             dose_ref_img,
             folded_remaining_body_decays,
+            rest_owned_skipped_rois,
         )
 
         self.context.dosemap_postprocess_output_dir = self.stage_output_dir
@@ -380,6 +413,8 @@ class DosemapPostprocessStage:
             "stage_output_dir": self.stage_output_dir,
             "dose_path": output_path,
             "metadata_path": self.metadata_path,
+            "folded_remaining_body_rois": list(folded_remaining_body_decays.keys()),
+            "rest_owned_skipped_rois": rest_owned_skipped_rois,
         }
 
         return self.context

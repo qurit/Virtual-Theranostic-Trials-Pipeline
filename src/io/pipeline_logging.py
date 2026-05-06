@@ -401,8 +401,14 @@ class PipelineReporter:
             if pbpk_extra.get("metadata_path"):
                 lines.append(f"metadata={pbpk_extra['metadata_path']}")
         elif stage_key == "simind":
+            simind_extra = extras.get("simind_simulation_stage", {})
             roi_names = sorted((context.simind_projection_paths or {}).keys())
             lines.append(f"simulated_rois={self._format_seq(roi_names)}")
+            if simind_extra.get("skipped_zero_voxel_rois"):
+                lines.append(
+                    "skipped_zero_voxel_rois="
+                    f"{self._format_seq(simind_extra.get('skipped_zero_voxel_rois', []))}"
+                )
             if context.arr_shape_new is not None:
                 lines.append(f"grid_zyx={tuple(context.arr_shape_new)}")
             if context.simind_total_num_voxels is not None:
@@ -413,9 +419,17 @@ class PipelineReporter:
                 lines.append(f"metadata={context.simind_metadata_path}")
         elif stage_key == "opengate":
             og_extra = extras.get("opengate_simulation_stage", {})
+            simulated_rois = og_extra.get("simulated_roi_names")
+            if not simulated_rois and isinstance(context.dosimetry_raw_dose_paths, dict):
+                simulated_rois = sorted(context.dosimetry_raw_dose_paths.keys())
             lines.append(
-                f"simulated_rois={self._format_seq(og_extra.get('simulated_roi_names', []))}"
+                f"simulated_rois={self._format_seq(simulated_rois or [])}"
             )
+            if og_extra.get("skipped_zero_voxel_rois"):
+                lines.append(
+                    "skipped_zero_voxel_rois="
+                    f"{self._format_seq(og_extra.get('skipped_zero_voxel_rois', []))}"
+                )
             if og_extra.get("simulated_actual_histories_this_run") is not None:
                 lines.append(f"simulated_actual_histories_this_run={int(og_extra['simulated_actual_histories_this_run'])}")
             if og_extra.get("actual_histories_per_batch") is not None:
@@ -437,11 +451,22 @@ class PipelineReporter:
             if context.dosimetry_metadata_path:
                 lines.append(f"metadata={context.dosimetry_metadata_path}")
         elif stage_key == "spect_postprocess":
+            spect_extra = extras.get("spect_postprocess_stage", {})
             frame_paths = context.pbpk_projection_paths or {}
             if isinstance(frame_paths, dict):
                 lines.append(f"frames={len(frame_paths)}")
             if context.reconstruction_output_dir:
                 lines.append(f"recon_output_dir={context.reconstruction_output_dir}")
+            folded_rois = spect_extra.get("folded_remaining_body_rois") or spect_extra.get("remaining_body_folded_rois")
+            if folded_rois:
+                lines.append(f"remaining_body_folded_rois={self._format_seq(folded_rois)}")
+            if spect_extra.get("rest_owned_skipped_rois"):
+                lines.append(
+                    "rest_owned_skipped_rois="
+                    f"{self._format_seq(spect_extra.get('rest_owned_skipped_rois', []))}"
+                )
+            if spect_extra.get("metadata_path"):
+                lines.append(f"metadata={spect_extra['metadata_path']}")
         elif stage_key == "dosemap_postprocess":
             dose_extra = extras.get("dosemap_postprocess_stage", {})
             if context.dosemap_postprocess_dose_path:
@@ -449,6 +474,14 @@ class PipelineReporter:
             roi_inputs = context.dosimetry_raw_dose_paths or {}
             if isinstance(roi_inputs, dict):
                 lines.append(f"dose_source_rois={len(roi_inputs)}")
+            folded_rois = dose_extra.get("folded_remaining_body_rois") or dose_extra.get("remaining_body_folded_rois")
+            if folded_rois:
+                lines.append(f"remaining_body_folded_rois={self._format_seq(folded_rois)}")
+            if dose_extra.get("rest_owned_skipped_rois"):
+                lines.append(
+                    "rest_owned_skipped_rois="
+                    f"{self._format_seq(dose_extra.get('rest_owned_skipped_rois', []))}"
+                )
             if dose_extra.get("metadata_path"):
                 lines.append(f"metadata={dose_extra['metadata_path']}")
 

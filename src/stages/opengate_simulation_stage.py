@@ -879,6 +879,10 @@ class OpenGateSimulationStage:
             "label_map_path": str(self.label_map_path),
             "requested_roi_subset": list(self.requested_roi_subset),
             "simulated_roi_names": list(roi_names),
+            "skipped_zero_voxel_rois": [
+                roi for roi in self.requested_roi_subset
+                if roi not in roi_names
+            ],
             "roi_voxel_counts": {k: int(v) for k, v in roi_counts.items()},
             "downsampling": {
                 "xyz_spacing_mm": self.xyz_spacing_mm,
@@ -983,6 +987,31 @@ class OpenGateSimulationStage:
             self.context.dosimetry_sum_uncertainty_path = paths.get("sum_uncertainty")
             self.context.dosimetry_material_label_path = paths.get("material_labels")
             self.context.dosimetry_mask_paths = paths.get("masks", {})
+            gate_meta = meta.get("gate", {}) if isinstance(meta.get("gate"), dict) else {}
+            simulated_roi_names = list(meta.get("simulated_roi_names", []))
+            requested_roi_subset = list(meta.get("requested_roi_subset", self.requested_roi_subset))
+            skipped_zero_voxel_rois = meta.get("skipped_zero_voxel_rois")
+            if skipped_zero_voxel_rois is None:
+                skipped_zero_voxel_rois = [
+                    roi for roi in requested_roi_subset
+                    if roi not in simulated_roi_names
+                ]
+                meta["skipped_zero_voxel_rois"] = skipped_zero_voxel_rois
+                write_json(self.metadata_path, meta)
+            self.context.extras["opengate_simulation_stage"] = {
+                "simulated_roi_names": simulated_roi_names,
+                "requested_roi_subset": requested_roi_subset,
+                "skipped_zero_voxel_rois": list(skipped_zero_voxel_rois),
+                "simulated_actual_histories_this_run": 0,
+                "actual_histories_per_batch": gate_meta.get("actual_histories_per_batch"),
+                "target_uncertainty_percent": gate_meta.get("target_uncertainty_percent"),
+                "uncertainty_percentile": gate_meta.get("uncertainty_percentile"),
+                "nonconverged_rois": [],
+                "effective_num_threads": gate_meta.get("effective_num_threads", gate_meta.get("num_threads")),
+                "history_rounding_loss_per_batch": gate_meta.get("history_rounding_loss_per_batch"),
+                "dose_units": meta.get("dose_units", "Gy/decay"),
+                "metadata_path": self.metadata_path,
+            }
             return self.context
 
         # Lazy import: opengate is only available on compatible platforms.
@@ -1151,6 +1180,10 @@ class OpenGateSimulationStage:
         self.context.extras["opengate_simulation_stage"] = {
             "simulated_roi_names": list(roi_names),
             "requested_roi_subset": list(self.requested_roi_subset),
+            "skipped_zero_voxel_rois": [
+                roi for roi in self.requested_roi_subset
+                if roi not in roi_names
+            ],
             "simulated_actual_histories_this_run": simulated_actual_histories_this_run,
             "actual_histories_per_batch": self.actual_histories_per_batch,
             "target_uncertainty_percent": self.target_uncertainty_percent,
