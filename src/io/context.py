@@ -1,5 +1,5 @@
 """
-Shared runtime context for the Virtual Theranostic Trials pipeline.
+Shared runtime context for the PyTheraTwin pipeline.
 
 `Context` is the handoff object passed between stages. It stores the parsed
 configuration, run metadata, and stage outputs so later phases can reuse
@@ -58,7 +58,7 @@ class Context:
         self.head_glands_cavities_ml_path: Optional[str] = None       # Head-gland task multilabel mask
         self.total_ml_path: Optional[str] = None                      # Total task multilabel mask
         self.totseg_plan: Optional[Dict[str, Any]] = None             # TotalSegmentator execution plan
-        self.vtt_roi_seg_path: Optional[str] = None                   # Unified label map handoff
+        self.pytheratwin_roi_seg_path: Optional[str] = None                   # Unified label map handoff
 
         # Phase 1.2: Synthetic lesions
         self.synthetic_lesions_outdir: Optional[str] = None

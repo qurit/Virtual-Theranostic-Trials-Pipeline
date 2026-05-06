@@ -1,4 +1,4 @@
-name: vtt
+name: pytheratwin
 channels:
   - conda-forge
   - defaults

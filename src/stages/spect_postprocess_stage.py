@@ -1,5 +1,5 @@
 """
-SPECT post-processing for the VTT pipeline.
+SPECT post-processing for the PyTheraTwin pipeline.
 
 This stage combines PBPK TAC weighting of SIMIND projections with OSEM+TEW
 reconstruction using PyTomography.

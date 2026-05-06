@@ -1,9 +1,9 @@
 """
-TotalSegmentator-based segmentation and ROI unification for the VTT pipeline.
+TotalSegmentator-based segmentation and ROI unification for the PyTheraTwin pipeline.
 
 This stage standardizes the CT input to NIfTI, runs the required
 TotalSegmentator tasks for the requested ROI set, and combines the resulting
-masks into a single multilabel volume in the shared VTT label space.
+masks into a single multilabel volume in the shared PyTheraTwin label space.
 
 Expected Context interface
 --------------------------
@@ -21,7 +21,7 @@ On success, this stage sets:
 - context.total_ml_path : Optional[str]  (None if not required by requested ROIs)
 - context.head_glands_cavities_ml_path : Optional[str]  (None if not required)
 - context.totseg_plan : dict  (which tasks ran, which roi_subsets were passed to TotalSegmentator)
-- context.vtt_roi_seg_path : str  (path to unified multilabel NIfTI handoff)
+- context.pytheratwin_roi_seg_path : str  (path to unified multilabel NIfTI handoff)
 """
 
 from __future__ import annotations
@@ -78,16 +78,16 @@ class TotSegPlan(TypedDict):
     run_head_glands_cavities: bool
     total_roi_subset: List[str]   # TotalSegmentator ROI names for the total task
     head_roi_subset: List[str]    # TotalSegmentator ROI names for head_glands_cavities task
-    vtt_roi_subset: List[str]     # User-facing VTT ROI names (passed in from config)
+    pytheratwin_roi_subset: List[str]     # User-facing PyTheraTwin ROI names (passed in from config)
 
 
 class SegmentationStage:
     """
-    VTT segmentation stage: TotalSegmentator + ROI unification.
+    PyTheraTwin segmentation stage: TotalSegmentator + ROI unification.
 
     Always runs the `body` task (used downstream as a patient mask for all ROI operations).
     The `total` and `head_glands_cavities` tasks run only if needed by the requested ROIs.
-    After segmentation, combines outputs into a single multilabel volume in VTT label space.
+    After segmentation, combines outputs into a single multilabel volume in PyTheraTwin label space.
 
     Parameters
     ----------
@@ -140,13 +140,13 @@ class SegmentationStage:
         self.head_name2id: Dict[str, int] = {
             name: int(lab) for lab, name in ts_map_json["head_glands_cavities"].items()
         }
-        self.vtt_name2id: Dict[str, int] = {
-            name: int(lab) for lab, name in ts_map_json["VTT_Pipeline"].items()
+        self.pytheratwin_name2id: Dict[str, int] = {
+            name: int(lab) for lab, name in ts_map_json["PyTheraTwin_Pipeline"].items()
         }
-        # VTT_allowed_rois and VTT_to_totseg live in pipeline_roi_naming_map.json — loaded
+        # PyTheraTwin_allowed_rois and PyTheraTwin_to_totseg live in pipeline_roi_naming_map.json — loaded
         # here so the stage has no hardcoded ROI or TotalSegmentator coupling.
-        self.vtt_allowed_rois: set = set(ts_map_json["VTT_allowed_rois"])
-        self.vtt_to_totseg: Dict[str, Any] = ts_map_json["VTT_to_totseg"]
+        self.pytheratwin_allowed_rois: set = set(ts_map_json["PyTheraTwin_allowed_rois"])
+        self.pytheratwin_to_totseg: Dict[str, Any] = ts_map_json["PyTheraTwin_to_totseg"]
 
     def _rerun_config_snapshot(self, plan: TotSegPlan) -> Dict[str, Any]:
         """Return the config subset that must match for cached outputs to remain valid."""
@@ -214,13 +214,13 @@ class SegmentationStage:
 
         if not rois:
             raise ValueError(
-                f"roi_subset must contain at least one ROI from: {sorted(self.vtt_allowed_rois)}"
+                f"roi_subset must contain at least one ROI from: {sorted(self.pytheratwin_allowed_rois)}"
             )
 
-        invalid = [r for r in rois if r not in self.vtt_allowed_rois]
+        invalid = [r for r in rois if r not in self.pytheratwin_allowed_rois]
         if invalid:
             raise ValueError(
-                f"Invalid ROI(s): {invalid}. Allowed: {sorted(self.vtt_allowed_rois)}"
+                f"Invalid ROI(s): {invalid}. Allowed: {sorted(self.pytheratwin_allowed_rois)}"
             )
 
         total_rois: List[str] = []
@@ -229,7 +229,7 @@ class SegmentationStage:
         seen_head: set = set()
 
         for r in rois:
-            entry = self.vtt_to_totseg[r]
+            entry = self.pytheratwin_to_totseg[r]
             task, expanded = entry["task"], entry["totseg_rois"]
             if task == "total":
                 for x in expanded:
@@ -248,7 +248,7 @@ class SegmentationStage:
             run_head_glands_cavities=bool(head_rois),
             total_roi_subset=total_rois,
             head_roi_subset=head_rois,
-            vtt_roi_subset=rois,
+            pytheratwin_roi_subset=rois,
         )
 
     def _files_exist(self) -> Tuple[bool, bool, bool]:
@@ -306,10 +306,10 @@ class SegmentationStage:
         plan: TotSegPlan,
     ) -> np.ndarray:
         """
-        Build the unified VTT multilabel volume by painting ROIs in priority order.
+        Build the unified PyTheraTwin multilabel volume by painting ROIs in priority order.
 
         Fully data-driven: reads totseg_rois lists from pipeline_roi_naming_map.json
-        via self.vtt_to_totseg — no hardcoded per-organ logic.
+        via self.pytheratwin_to_totseg — no hardcoded per-organ logic.
 
         Parameters
         ----------
@@ -320,10 +320,10 @@ class SegmentationStage:
 
         Returns
         -------
-        np.ndarray  (uint8, VTT label IDs)
+        np.ndarray  (uint8, PyTheraTwin label IDs)
         """
         roi_unified = np.zeros(body_seg.shape, dtype=np.uint8)
-        roi_unified[body_seg > 0] = self.vtt_name2id["remaining_body"]
+        roi_unified[body_seg > 0] = self.pytheratwin_name2id["remaining_body"]
 
         if total_seg is not None and total_seg.shape != body_seg.shape:
             raise ValueError(
@@ -334,13 +334,13 @@ class SegmentationStage:
                 f"Shape mismatch body vs head: {body_seg.shape} vs {head_seg.shape}"
             )
 
-        assigned_voxels = roi_unified > self.vtt_name2id["remaining_body"]
-        for vtt_roi in plan["vtt_roi_subset"]:
-            entry = self.vtt_to_totseg.get(vtt_roi)
+        assigned_voxels = roi_unified > self.pytheratwin_name2id["remaining_body"]
+        for pytheratwin_roi in plan["pytheratwin_roi_subset"]:
+            entry = self.pytheratwin_to_totseg.get(pytheratwin_roi)
             if not entry:
                 continue
-            vtt_label = self.vtt_name2id.get(vtt_roi)
-            if vtt_label is None:
+            pytheratwin_label = self.pytheratwin_name2id.get(pytheratwin_roi)
+            if pytheratwin_label is None:
                 continue
             task = entry["task"]
             totseg_rois = entry["totseg_rois"]
@@ -358,10 +358,10 @@ class SegmentationStage:
             overlap = new_mask & assigned_voxels
             if overlap.any():
                 raise AssertionError(
-                    f"ROI '{vtt_roi}' overlaps with previously assigned voxels in the unified label map. "
-                    "Check VTT_to_totseg for duplicate totseg_rois entries across ROIs."
+                    f"ROI '{pytheratwin_roi}' overlaps with previously assigned voxels in the unified label map. "
+                    "Check PyTheraTwin_to_totseg for duplicate totseg_rois entries across ROIs."
                 )
-            roi_unified[new_mask] = vtt_label
+            roi_unified[new_mask] = pytheratwin_label
             assigned_voxels |= new_mask
 
         return roi_unified
@@ -370,7 +370,7 @@ class SegmentationStage:
         """
         Run ROI unification and write the unified segmentation NIfTI.
 
-        Combines TotalSegmentator outputs into a single multilabel VTT volume.
+        Combines TotalSegmentator outputs into a single multilabel PyTheraTwin volume.
         Skips if the final output already exists.
         """
         # Skip if unified output already exists 
@@ -492,7 +492,7 @@ class SegmentationStage:
                 self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None
             )
             self.context.totseg_plan = plan
-            self.context.vtt_roi_seg_path = self.final_output_path
+            self.context.pytheratwin_roi_seg_path = self.final_output_path
             return self.context
 
         device = "gpu" if torch.cuda.is_available() else "cpu"
@@ -542,7 +542,7 @@ class SegmentationStage:
             self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None
         )
         self.context.totseg_plan = plan
-        self.context.vtt_roi_seg_path = self.final_output_path                         
+        self.context.pytheratwin_roi_seg_path = self.final_output_path
         self.context.extras["segmentation_stage"] = {
             "output_dir": self.output_dir,
             "work_dir": self.work_dir,

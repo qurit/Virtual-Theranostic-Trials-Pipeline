@@ -1,5 +1,5 @@
 """
-Dosimetry post-processing for the VTT pipeline.
+Dosimetry post-processing for the PyTheraTwin pipeline.
 
 This stage applies PBPK time-activity curves to OpenGATE per-ROI dose maps to produce
 a single total absorbed dose map in absolute units (Gy).

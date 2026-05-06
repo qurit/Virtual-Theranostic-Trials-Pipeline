@@ -1,8 +1,8 @@
 // Pipeline ROI Naming Map — single source of truth for all ROI definitions.
 //
-// DEVELOPER REFERENCE — VTT ROI ↔ PBPK VOI connections:
+// DEVELOPER REFERENCE — PyTheraTwin ROI ↔ PBPK VOI connections:
 // ┌─────────────────────────┬──────────────────────┬──────────────────────────────────────────┐
-// │ VTT ROI (pipeline name) │ PBPK VOI (PyCNO)     │ TotalSegmentator source labels           │
+// │ PyTheraTwin ROI (pipeline name) │ PBPK VOI (PyCNO)     │ TotalSegmentator source labels           │
 // ├─────────────────────────┼──────────────────────┼──────────────────────────────────────────┤
 // │ kidney                  │ Kidney               │ kidney_left + kidney_right               │
 // │ liver                   │ Liver                │ liver                                    │
@@ -200,7 +200,7 @@
         "18": "soft_palate",
         "19": "hard_palate"
     },
-    "VTT_Pipeline": { // VTT pipeline label space — integer ID → ROI name in the unified segmentation
+    "PyTheraTwin_Pipeline": { // PyTheraTwin pipeline label space — integer ID → ROI name in the unified segmentation
         "0":  "background",
         "1":  "remaining_body",
         "2":  "kidney",
@@ -262,7 +262,7 @@
         "58": "bone",
         "59": "muscle"
     },
-    "VTT_allowed_rois": [
+    "PyTheraTwin_allowed_rois": [
         // -- total task: organs --
         "kidney", "liver", "prostate", "spleen", "heart", "lungs",
         "adrenal_glands", "thyroid_gland", "gallbladder", "gi_tract", "stomach",
@@ -288,7 +288,7 @@
         "TumorRest", "Spleen", "Liver", "Prostate", "GI", "Rest",
         "Skin", "Muscle", "Brain", "RedMarrow", "Lungs", "Adipose"
     ],
-    "VTT_to_totseg": {
+    "PyTheraTwin_to_totseg": {
         // ── ORGANS ─────────────────────────────────────────────────────────────────
         "kidney": {
             "task": "total",

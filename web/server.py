@@ -1,5 +1,5 @@
 """
-FastAPI backend for the Virtual Theranostic Trials web UI.
+FastAPI backend for the PyTheraTwin web UI.
 
 Serves the single-page web app and exposes the API used to scan CT inputs,
 build per-patient configs, preview CT data, and stream logs from pipeline
@@ -79,7 +79,7 @@ PIPELINE_OPTIONS  = REPO_ROOT / "src" / "data" / "pipeline_options.json"
 UPLOAD_TTL_SECONDS = 7 * 24 * 60 * 60
 
 # Written by /api/run; read by run_server.py after uvicorn exits to exec main.py.
-_PENDING_FILE = REPO_ROOT / ".vtt_pending_run.json"
+_PENDING_FILE = REPO_ROOT / ".pytheratwin_pending_run.json"
 
 
 def _prune_old_uploads(now: float | None = None) -> None:
@@ -89,7 +89,7 @@ def _prune_old_uploads(now: float | None = None) -> None:
     if not uploads_root.is_dir():
         return
     for entry in uploads_root.iterdir():
-        if not entry.is_dir() or not entry.name.startswith("vtt_ct_upload_"):
+        if not entry.is_dir() or not entry.name.startswith("pytheratwin_ct_upload_"):
             continue
         try:
             age = now - entry.stat().st_mtime
@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
     _prune_old_uploads()
     yield
 
-app = FastAPI(title="Virtual Theranostic Trials", lifespan=lifespan)
+app = FastAPI(title="PyTheraTwin", lifespan=lifespan)
 
 
 # ── Static / SPA ──────────────────────────────────────────────────────────────
@@ -230,13 +230,13 @@ async def get_config_template() -> Dict:
 
         # Flat list for backward-compat (all user-selectable ROIs)
         roi_choices = [
-            name for name in roi_map.get("VTT_Pipeline", {}).values()
+            name for name in roi_map.get("PyTheraTwin_Pipeline", {}).values()
             if name not in _RESERVED
         ]
 
         # Structured by TotalSegmentator task + ui_category for the task-based UI
-        vtt_to_totseg = roi_map.get("VTT_to_totseg", {})
-        for roi_name, entry in vtt_to_totseg.items():
+        pytheratwin_to_totseg = roi_map.get("PyTheraTwin_to_totseg", {})
+        for roi_name, entry in pytheratwin_to_totseg.items():
             if roi_name in _RESERVED or roi_name not in roi_choices:
                 continue
             task = entry.get("task")
@@ -249,14 +249,14 @@ async def get_config_template() -> Dict:
 
         # ROIs with a dedicated non-null PBPK VOI (simulation-eligible)
         pbpk_compatible_rois = [
-            roi for roi, entry in vtt_to_totseg.items()
+            roi for roi, entry in pytheratwin_to_totseg.items()
             if roi not in _RESERVED and entry.get("pbpk_voi") not in (None, "Rest")
         ]
 
         # ROI groups that share TotalSegmentator source labels are mutually exclusive
         # in Phase 1; selecting both would make label-painting order affect output.
         roi_sources: Dict[str, set] = {}
-        for roi_name, entry in vtt_to_totseg.items():
+        for roi_name, entry in pytheratwin_to_totseg.items():
             if roi_name in _RESERVED or roi_name not in roi_choices:
                 continue
             task = entry.get("task")
@@ -720,7 +720,7 @@ def _validate_patient_rerun(
     seg_cfg = config_full["phase_1"]["segmentation_stage"]
     seg_prefix = seg_cfg["file_prefix"]
     seg_stage_dir = phase1_dir / "segmentation_stage"
-    expected_vtt_handoff = phase1_dir / "digital_twin.nii.gz"
+    expected_pytheratwin_handoff = phase1_dir / "digital_twin.nii.gz"
     seg_markers = [
         seg_stage_dir / f"{seg_prefix}_body_ml.nii.gz",
         seg_stage_dir / f"{seg_cfg['unification_prefix']}.nii.gz",
@@ -816,7 +816,7 @@ def _validate_patient_rerun(
             )
         simind_deps = {
             "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
-            "vtt_roi_seg": fingerprint_optional_file(expected_vtt_handoff),
+            "pytheratwin_roi_seg": fingerprint_optional_file(expected_pytheratwin_handoff),
             "label_map_json": fingerprint_optional_file(_label_map_path),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(output_dir, "segmentation_stage")
@@ -852,7 +852,7 @@ def _validate_patient_rerun(
             og_markers.append(og_stage_dir / f"{og_prefix}_material_labels.nii.gz")
         og_deps = {
             "ct_nii": fingerprint_optional_file(phase1_dir / "ct.nii.gz"),
-            "vtt_roi_seg": fingerprint_optional_file(expected_vtt_handoff),
+            "pytheratwin_roi_seg": fingerprint_optional_file(expected_pytheratwin_handoff),
             "label_map_json": fingerprint_optional_file(_label_map_path),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(output_dir, "segmentation_stage")
@@ -1020,7 +1020,7 @@ async def upload_ct(request: Request) -> Dict:
     # Save uploads to a permanent directory so the path stays valid across reruns.
     uploads_root = REPO_ROOT / "uploads"
     uploads_root.mkdir(exist_ok=True)
-    upload_dir = Path(tempfile.mkdtemp(prefix="vtt_ct_upload_", dir=str(uploads_root)))
+    upload_dir = Path(tempfile.mkdtemp(prefix="pytheratwin_ct_upload_", dir=str(uploads_root)))
     try:
         for f in files:
             # Normalise path separators (browser may send \ on Windows)

@@ -1,12 +1,12 @@
 """
-SIMIND simulation for the VTT pipeline.
+SIMIND simulation for the PyTheraTwin pipeline.
 
 This stage prepares inputs for SIMIND and runs Monte Carlo SPECT projection simulations.
 
 Preprocessing:
 - Converting CT + segmentation NIfTIs into the SIMIND grid convention (z, y, x with y-flip).
 - Optionally resizing to a target in-plane dimension via isotropic zoom.
-- Building ROI masks and a label->name class map from the unified VTT multilabel segmentation.
+- Building ROI masks and a label->name class map from the unified PyTheraTwin multilabel segmentation.
 - Writing binary files used by SIMIND (attenuation map, body mask, per-ROI binary source maps).
 
 Simulation:
@@ -29,7 +29,7 @@ Incoming `context` is expected to provide:
 - context.subdir_paths["phase_2"] : str
 - context.mode : str  ("DEBUG" or "PRODUCTION")
 - context.ct_nii_path : str
-- context.vtt_roi_seg_path : str  (unified VTT ROI segmentation NIfTI)
+- context.pytheratwin_roi_seg_path : str  (unified PyTheraTwin ROI segmentation NIfTI)
 - context.downstream_roi_subset : list[str] | None
 
 On success, this stage sets:
@@ -68,7 +68,7 @@ from src.io.rerun_guard import (
     stage_metadata_path,
     write_json,
 )
-from src.utils.label_utils import load_vtt_label_map, build_class_map, build_label_masks, filter_roi_seg_to_subset, load_isotope_config
+from src.utils.label_utils import load_pytheratwin_label_map, build_class_map, build_label_masks, filter_roi_seg_to_subset, load_isotope_config
 from src.utils.resize_utils import resolve_simulation_grid
 from src.utils.simind_runtime_utils import (
     aggregate_core_projection_totals,
@@ -106,8 +106,8 @@ class _SimindPreprocessor:
     def __init__(
         self,
         ct_nii_path: str,
-        vtt_roi_seg_path: str,
-        vtt_name2id: Dict[str, int],
+        pytheratwin_roi_seg_path: str,
+        pytheratwin_name2id: Dict[str, int],
         roi_subset: Sequence[str],
         output_dir: str,
         prefix: str,
@@ -117,8 +117,8 @@ class _SimindPreprocessor:
         debug: bool = False,
     ) -> None:
         self.ct_nii_path = ct_nii_path
-        self.vtt_roi_seg_path = vtt_roi_seg_path
-        self.vtt_name2id = vtt_name2id
+        self.pytheratwin_roi_seg_path = pytheratwin_roi_seg_path
+        self.pytheratwin_name2id = pytheratwin_name2id
         self.roi_subset = roi_subset
         self.output_dir = output_dir
         self.prefix = prefix
@@ -240,7 +240,7 @@ class _SimindPreprocessor:
         body_seg_arr = np.fromfile(body_path, dtype=np.float32).reshape(shape)
         roi_body_arr = np.fromfile(roi_body_path, dtype=np.float32).reshape(shape).astype(np.int16)
 
-        id_to_name = {v: k for k, v in self.vtt_name2id.items()}
+        id_to_name = {v: k for k, v in self.pytheratwin_name2id.items()}
         class_seg = build_class_map(roi_body_arr, id_to_name)
         masks = build_label_masks(roi_body_arr)
 
@@ -276,8 +276,8 @@ class _SimindPreprocessor:
         """
         if self.ct_nii_path is None or not os.path.exists(self.ct_nii_path):
             raise FileNotFoundError(f"ct_nii_path not found: {self.ct_nii_path}")
-        if self.vtt_roi_seg_path is None or not os.path.exists(self.vtt_roi_seg_path):
-            raise FileNotFoundError(f"Unified VTT ROI seg not found: {self.vtt_roi_seg_path}")
+        if self.pytheratwin_roi_seg_path is None or not os.path.exists(self.pytheratwin_roi_seg_path):
+            raise FileNotFoundError(f"Unified PyTheraTwin ROI seg not found: {self.pytheratwin_roi_seg_path}")
         if not self.roi_subset:
             raise ValueError("No ROI subset provided for SIMIND preprocessing.")
 
@@ -315,7 +315,7 @@ class _SimindPreprocessor:
                 )
 
         ct_nii = nib.load(self.ct_nii_path)
-        roi_nii = nib.load(self.vtt_roi_seg_path)
+        roi_nii = nib.load(self.pytheratwin_roi_seg_path)
 
         # Convert to SIMIND grid (z, y, x) with optional resampling.
         # CT uses linear interpolation; seg uses nearest-neighbour.
@@ -330,21 +330,21 @@ class _SimindPreprocessor:
         roi_arr_full, _, _, _ = self._to_simind_grid(roi_nii, xyz_spacing_mm=self.xyz_spacing_mm, zoom_order=0)
         roi_arr_full = roi_arr_full.astype(np.int16)
 
-        body_label = self.vtt_name2id.get("remaining_body")
+        body_label = self.pytheratwin_name2id.get("remaining_body")
         if body_label is None:
-            raise ValueError("VTT label map does not contain a 'remaining_body' label.")
+            raise ValueError("PyTheraTwin label map does not contain a 'remaining_body' label.")
         if not np.any(roi_arr_full != 0):
-            raise ValueError("Unified VTT segmentation is empty (no labelled voxels).")
+            raise ValueError("Unified PyTheraTwin segmentation is empty (no labelled voxels).")
 
         # Body mask: all non-zero voxels in the unified seg (patient boundary).
         body_mask = (roi_arr_full != 0).astype(np.float32)
 
-        roi_arr = filter_roi_seg_to_subset(roi_arr_full, self.roi_subset, self.vtt_name2id)
+        roi_arr = filter_roi_seg_to_subset(roi_arr_full, self.roi_subset, self.pytheratwin_name2id)
         # Mask ROI labels to body to prevent out-of-body artifacts.
         roi_body_arr = (roi_arr * body_mask).astype(np.int16)
 
         masks = build_label_masks(roi_body_arr)
-        id_to_name = {v: k for k, v in self.vtt_name2id.items()}
+        id_to_name = {v: k for k, v in self.pytheratwin_name2id.items()}
         class_seg = build_class_map(roi_body_arr, id_to_name)
 
         # Spacing: original NIfTI zooms (x, y, z) in mm, each divided by its own
@@ -405,7 +405,7 @@ class SimindSimulationStage:
             "subdir_paths",
             "config",
             "ct_nii_path",
-            "vtt_roi_seg_path",
+            "pytheratwin_roi_seg_path",
             "output_folder_path",
             "ct_input_identity",
         )
@@ -510,9 +510,9 @@ class SimindSimulationStage:
                 f"Available: {sorted(phase1_rois)}"
             )                                                                          
 
-        # Load VTT label map
+        # Load PyTheraTwin label map
         self.ts_map_path: str = get_label_map_path()
-        self.vtt_name2id: Dict[str, int] = load_vtt_label_map(self.ts_map_path)
+        self.pytheratwin_name2id: Dict[str, int] = load_pytheratwin_label_map(self.ts_map_path)
 
         # CPU count: 0 or invalid -> use all available cores
         _cfg_num_cpu = self.stage_cfg.get("num_cpu", 1)
@@ -544,7 +544,7 @@ class SimindSimulationStage:
         """Return fingerprints for the current stage inputs that affect SIMIND outputs."""
         deps = {
             "ct_nii": fingerprint_optional_file(self.context.ct_nii_path),
-            "vtt_roi_seg": fingerprint_optional_file(self.context.vtt_roi_seg_path),
+            "pytheratwin_roi_seg": fingerprint_optional_file(self.context.pytheratwin_roi_seg_path),
             "label_map_json": fingerprint_optional_file(self.ts_map_path),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
@@ -741,8 +741,8 @@ class SimindSimulationStage:
             # (body/ROI segmentation arrays and masks) needed by SpectPostprocessStage.
             preprocessor = _SimindPreprocessor(
                 ct_nii_path=self.context.ct_nii_path,
-                vtt_roi_seg_path=self.context.vtt_roi_seg_path,
-                vtt_name2id=self.vtt_name2id,
+                pytheratwin_roi_seg_path=self.context.pytheratwin_roi_seg_path,
+                pytheratwin_name2id=self.pytheratwin_name2id,
                 roi_subset=cached_roi_list or self.simind_roi_subset,
                 output_dir=self.preprocess_dir,
                 prefix=self.prefix,
@@ -756,9 +756,9 @@ class SimindSimulationStage:
                 roi_body_arr = filter_roi_seg_to_subset(
                     preprocess_results["roi_body_seg_arr"],
                     cached_roi_list,
-                    self.vtt_name2id,
+                    self.pytheratwin_name2id,
                 )
-                id_to_name = {v: k for k, v in self.vtt_name2id.items()}
+                id_to_name = {v: k for k, v in self.pytheratwin_name2id.items()}
                 preprocess_results["roi_body_seg_arr"] = roi_body_arr
                 preprocess_results["masks"] = build_label_masks(roi_body_arr)
                 preprocess_results["class_seg"] = build_class_map(roi_body_arr, id_to_name)
@@ -791,8 +791,8 @@ class SimindSimulationStage:
 
         preprocessor = _SimindPreprocessor(
             ct_nii_path=self.context.ct_nii_path,
-            vtt_roi_seg_path=self.context.vtt_roi_seg_path,
-            vtt_name2id=self.vtt_name2id,
+            pytheratwin_roi_seg_path=self.context.pytheratwin_roi_seg_path,
+            pytheratwin_name2id=self.pytheratwin_name2id,
             roi_subset=self.simind_roi_subset,
             output_dir=self.preprocess_dir,
             prefix=self.prefix,

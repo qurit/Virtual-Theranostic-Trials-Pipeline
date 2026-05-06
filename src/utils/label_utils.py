@@ -1,7 +1,7 @@
 """
 Label map and segmentation mask utilities shared across pipeline stages.
 
-The VTT_Pipeline section of pipeline_roi_naming_map.json maps integer label IDs
+The PyTheraTwin_Pipeline section of pipeline_roi_naming_map.json maps integer label IDs
 to organ names. All stages load and use this map through the canonical functions below.
 """
 
@@ -50,16 +50,16 @@ def load_pipeline_roi_map(path: str | Path | None = None) -> Dict[str, Any]:
     """
     Load the pipeline ROI metadata map.
 
-    This is the single source of truth for VTT ROI labels, TotalSegmentator source
+    This is the single source of truth for PyTheraTwin ROI labels, TotalSegmentator source
     labels, PBPK VOI mappings, and UI grouping metadata.
     """
     return _load_pipeline_roi_map_cached(_normalise_roi_map_path(path))
 
 
-def load_vtt_to_totseg(path: str | Path | None = None) -> Dict[str, Dict[str, Any]]:
-    """Return the VTT ROI -> TotalSegmentator/PBPK metadata table."""
+def load_pytheratwin_to_totseg(path: str | Path | None = None) -> Dict[str, Dict[str, Any]]:
+    """Return the PyTheraTwin ROI -> TotalSegmentator/PBPK metadata table."""
     data = load_pipeline_roi_map(path)
-    raw = data.get("VTT_to_totseg", {})
+    raw = data.get("PyTheraTwin_to_totseg", {})
     return {str(k): dict(v) for k, v in raw.items() if isinstance(v, dict)}
 
 
@@ -80,7 +80,7 @@ def load_pbpk_observables(path: str | Path | None = None) -> list[str]:
 
     seen: set[str] = set()
     out: list[str] = []
-    for entry in load_vtt_to_totseg(path).values():
+    for entry in load_pytheratwin_to_totseg(path).values():
         voi = entry.get("pbpk_voi")
         if isinstance(voi, str) and voi.strip() and voi not in seen:
             out.append(voi)
@@ -94,14 +94,14 @@ def load_roi_to_pbpk_voi(
     include_internal: bool = True,
 ) -> Dict[str, str]:
     """
-    Return {VTT ROI name: PyCNO VOI name} for ROIs with a non-null PBPK mapping.
+    Return {PyTheraTwin ROI name: PyCNO VOI name} for ROIs with a non-null PBPK mapping.
 
     ``include_internal=False`` excludes reserved/internal labels such as
     ``remaining_body`` and ``synthetic_lesion``; this is useful for user-facing
     PBPK/simulation eligibility checks.
     """
     mapping: Dict[str, str] = {}
-    for roi_name, entry in load_vtt_to_totseg(path).items():
+    for roi_name, entry in load_pytheratwin_to_totseg(path).items():
         if not include_internal and roi_name in RESERVED_ROIS:
             continue
         voi = entry.get("pbpk_voi")
@@ -125,15 +125,15 @@ def load_pbpk_compatible_rois(path: str | Path | None = None) -> set[str]:
 
 
 def roi_to_voi(roi_name: str, path: str | Path | None = None) -> str | None:
-    """Map a VTT ROI name to its PyCNO VOI name, or None if no dedicated mapping exists."""
+    """Map a PyTheraTwin ROI name to its PyCNO VOI name, or None if no dedicated mapping exists."""
     return load_roi_to_pbpk_voi(path, include_internal=True).get(roi_name)
 
 
-def load_vtt_label_map(path: str | Path) -> Dict[str, int]:
+def load_pytheratwin_label_map(path: str | Path) -> Dict[str, int]:
     """
-    Load the VTT_Pipeline section of pipeline_roi_naming_map.json as {roi_name: label_id}.
+    Load the PyTheraTwin_Pipeline section of pipeline_roi_naming_map.json as {roi_name: label_id}.
 
-    The JSON format is:  {"VTT_Pipeline": {"1": "kidney", "2": "liver", ...}}
+    The JSON format is:  {"PyTheraTwin_Pipeline": {"1": "kidney", "2": "liver", ...}}
     This function inverts it to {"kidney": 1, "liver": 2, ...}.
 
     Parameters
@@ -144,12 +144,12 @@ def load_vtt_label_map(path: str | Path) -> Dict[str, int]:
     Raises
     ------
     FileNotFoundError  if the file does not exist.
-    KeyError           if the JSON is missing the 'VTT_Pipeline' key.
+    KeyError           if the JSON is missing the 'PyTheraTwin_Pipeline' key.
     """
     data = load_pipeline_roi_map(path)
-    if "VTT_Pipeline" not in data:
-        raise KeyError(f"Label map JSON at '{path}' is missing the 'VTT_Pipeline' key")
-    return {name: int(label_id) for label_id, name in data["VTT_Pipeline"].items()}
+    if "PyTheraTwin_Pipeline" not in data:
+        raise KeyError(f"Label map JSON at '{path}' is missing the 'PyTheraTwin_Pipeline' key")
+    return {name: int(label_id) for label_id, name in data["PyTheraTwin_Pipeline"].items()}
 
 
 def build_class_map(seg_arr: np.ndarray, id_to_name: Dict[int, str]) -> Dict[str, int]:
@@ -189,7 +189,7 @@ def filter_roi_seg_to_subset(
     ----------
     seg_arr    : integer segmentation array (any shape, in-memory copy is made)
     roi_subset : ROI names for this stage ("remaining_body" is handled automatically)
-    name2id    : {roi_name: label_id} from the VTT label map
+    name2id    : {roi_name: label_id} from the PyTheraTwin label map
     """
     remaining_body_id = name2id.get("remaining_body")
 

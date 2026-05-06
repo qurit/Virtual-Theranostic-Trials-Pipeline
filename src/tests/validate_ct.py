@@ -1,5 +1,5 @@
 """
-Pre-flight CT input validation helpers for the VTT pipeline.
+Pre-flight CT input validation helpers for the PyTheraTwin pipeline.
 
 These checks are intentionally lightweight and filesystem-focused. They are
 used by ``main.py`` before any patient run starts so obvious input mistakes are

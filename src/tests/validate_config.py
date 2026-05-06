@@ -1,5 +1,5 @@
 """
-Pre-flight configuration validator for the VTT pipeline.
+Pre-flight configuration validator for the PyTheraTwin pipeline.
 
 This module is called by ``main.py`` immediately after the config JSON is
 parsed, before any CT is touched.  All problems are collected into a single
@@ -10,8 +10,8 @@ Checks performed
 ----------------
 - ``output_folder_title``      — non-empty string
 - ``label_map_path``           — loaded from ``pipeline_paths.json`` and must exist
-- ``roi_subset`` (seg.)        — non-empty list of recognised VTT ROI names
-                                 (validated against ``VTT_allowed_rois`` in
+- ``roi_subset`` (seg.)        — non-empty list of recognised PyTheraTwin ROI names
+                                 (validated against ``PyTheraTwin_allowed_rois`` in
                                  ``pipeline_roi_naming_map.json``)
 - ``pbpk_tac_stage.isotope``   — string; must be in pipeline_options.json allowed list
 - PBPK VOIs                   — loaded from the configured ROI metadata map
@@ -168,7 +168,7 @@ def validate_config(
 
     # Load ROI map for validation (allowed ROI names + PBPK-compatible subset)
     _roi_map = _load_roi_map(repo_root, config)
-    _vtt_allowed_rois: Set[str] = set(_roi_map.get("VTT_allowed_rois", [])) if _roi_map else set()
+    _pytheratwin_allowed_rois: Set[str] = set(_roi_map.get("PyTheraTwin_allowed_rois", [])) if _roi_map else set()
     _label_map_path = get_pipeline_input_paths(repo_root).get("label_map_path")
     try:
         _pbpk_compatible: Set[str] = load_pbpk_compatible_rois(_label_map_path)
@@ -367,11 +367,11 @@ def validate_config(
         """Reject ROI selections that would paint the same TotalSegmentator label twice."""
         if not _roi_map:
             return
-        vtt_to_totseg = _roi_map.get("VTT_to_totseg", {})
+        pytheratwin_to_totseg = _roi_map.get("PyTheraTwin_to_totseg", {})
         seen: Dict[tuple[str, str], str] = {}
         overlaps: List[str] = []
         for roi_name in rois:
-            entry = vtt_to_totseg.get(roi_name)
+            entry = pytheratwin_to_totseg.get(roi_name)
             if not isinstance(entry, dict):
                 continue
             task = str(entry.get("task", ""))
@@ -484,11 +484,11 @@ def validate_config(
                     f"'phase_1.segmentation_stage.roi_subset[{i}]' must be "
                     f"a string, got {type(r).__name__}: {r!r}"
                 )
-            elif _vtt_allowed_rois and r not in _vtt_allowed_rois:
+            elif _pytheratwin_allowed_rois and r not in _pytheratwin_allowed_rois:
                 _err(
                     f"'phase_1.segmentation_stage.roi_subset[{i}]' value {r!r} is not "
-                    f"a recognised VTT ROI name. See src/data/pipeline_roi_naming_map.json "
-                    f"VTT_allowed_rois for the full list."
+                    f"a recognised PyTheraTwin ROI name. See src/data/pipeline_roi_naming_map.json "
+                    f"PyTheraTwin_allowed_rois for the full list."
                 )
         _check_no_overlapping_totseg_sources(roi_subset, "phase_1.segmentation_stage.roi_subset")
     # Guard downstream cross-checks if roi_subset is malformed

@@ -1,5 +1,5 @@
 """
-Synthetic lesion generation for the VTT pipeline.
+Synthetic lesion generation for the PyTheraTwin pipeline.
 
 Goal
 ----
@@ -37,9 +37,9 @@ Debug / QC only (inside work_dir, safe to delete):
 
 Primary side effect
 -------------------
-Overwrites `context.vtt_roi_seg_path` on disk so that:
+Overwrites `context.pytheratwin_roi_seg_path` on disk so that:
 - organ voxels remain their organ label
-- lesion voxels become label = VTT_Pipeline["synthetic_lesion"] (e.g. 8)
+- lesion voxels become label = PyTheraTwin_Pipeline["synthetic_lesion"] (e.g. 8)
 
 Expected Context interface
 --------------------------
@@ -50,7 +50,7 @@ Incoming `context` must provide:
     - "specs": dict | None
 - context.config["phase_1"]["segmentation_stage"]["roi_subset"]
 - label map loaded from ``src/data/pipeline_paths.json`` input_paths.label_map_path
-- context.vtt_roi_seg_path: str (unified multilabel seg produced by TdtRoiUnifyStage)
+- context.pytheratwin_roi_seg_path: str (unified multilabel seg produced by SegmentationStage)
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ from src.io.rerun_guard import (
     write_json,
 )
 from src.utils.nifti_utils import xyz_to_zyx, zyx_to_xyz, get_spacing_zyx_mm, save_nifti_nib
-from src.utils.label_utils import load_vtt_label_map
+from src.utils.label_utils import load_pytheratwin_label_map
 from src.utils.lesion_utils import (
     auto_place_lesions,
     build_lesion_labelmap_zyx,
@@ -85,8 +85,8 @@ from src.utils.lesion_utils import (
 
 class SyntheticLesionsStage:
     """
-    Generate synthetic spherical lesions inside organ ROIs of a unified VTT segmentation,
-    then overwrite `context.vtt_roi_seg_path` by painting lesion voxels as the
+    Generate synthetic spherical lesions inside organ ROIs of a unified PyTheraTwin segmentation,
+    then overwrite `context.pytheratwin_roi_seg_path` by painting lesion voxels as the
     `synthetic_lesion` label.
 
     Notes on conventions
@@ -111,7 +111,7 @@ class SyntheticLesionsStage:
         context.require(
             "subdir_paths",
             "config",
-            "vtt_roi_seg_path",
+            "pytheratwin_roi_seg_path",
             "output_folder_path",
             "ct_input_identity",
         )
@@ -132,7 +132,7 @@ class SyntheticLesionsStage:
         self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
         # Input unified segmentation path (multilabel) - will be overwritten on disk by this stage with lesions inserted
-        self.vtt_roi_seg_path: Optional[str] = getattr(context, "vtt_roi_seg_path", None)
+        self.pytheratwin_roi_seg_path: Optional[str] = getattr(context, "pytheratwin_roi_seg_path", None)
 
         # Keep ROI subset updated so downstream TAC can include synthetic_lesion if needed
         roi_subset = getattr(self.context, "downstream_roi_subset", None)  
@@ -162,13 +162,13 @@ class SyntheticLesionsStage:
 
         # Load label map from pipeline_paths.json
         _label_map_path = get_label_map_path()
-        self.vtt_name2id = load_vtt_label_map(_label_map_path)
-        if "synthetic_lesion" not in self.vtt_name2id:
+        self.pytheratwin_name2id = load_pytheratwin_label_map(_label_map_path)
+        if "synthetic_lesion" not in self.pytheratwin_name2id:
             raise ValueError(
-                "The label map is missing 'synthetic_lesion' in VTT_Pipeline. "
+                "The label map is missing 'synthetic_lesion' in PyTheraTwin_Pipeline. "
                 "Add it (e.g. \"8\": \"synthetic_lesion\")."
             )
-        self.synthetic_lesion_id: int = int(self.vtt_name2id["synthetic_lesion"])
+        self.synthetic_lesion_id: int = int(self.pytheratwin_name2id["synthetic_lesion"])
 
     def _rerun_config_snapshot(self) -> Dict[str, Any]:
         """Return the config subset that must match for cached lesion outputs to remain valid."""
@@ -176,7 +176,7 @@ class SyntheticLesionsStage:
 
     def _current_dependency_fingerprints(self) -> Dict[str, Any]:
         """Return fingerprints for dependencies that must remain unchanged on rerun."""
-        pre_lesion_seg_path = self.backup_path if os.path.exists(self.backup_path) else self.vtt_roi_seg_path
+        pre_lesion_seg_path = self.backup_path if os.path.exists(self.backup_path) else self.pytheratwin_roi_seg_path
         return {
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
@@ -215,10 +215,10 @@ class SyntheticLesionsStage:
         seg_zyx : np.ndarray (Z,Y,X) int
         spacing_zyx_mm : np.ndarray (3,) float64
         """
-        if self.vtt_roi_seg_path is None or (not os.path.exists(self.vtt_roi_seg_path)):
-            raise FileNotFoundError(f"Unified VTT ROI seg not found: {self.vtt_roi_seg_path}")
+        if self.pytheratwin_roi_seg_path is None or (not os.path.exists(self.pytheratwin_roi_seg_path)):
+            raise FileNotFoundError(f"Unified PyTheraTwin ROI seg not found: {self.pytheratwin_roi_seg_path}")
 
-        seg_nii = nib.load(self.vtt_roi_seg_path)
+        seg_nii = nib.load(self.pytheratwin_roi_seg_path)
         seg_xyz = np.asanyarray(seg_nii.dataobj).astype(np.uint8, copy=False)
         seg_zyx = xyz_to_zyx(seg_xyz)
         spacing_zyx = get_spacing_zyx_mm(seg_nii)
@@ -242,14 +242,14 @@ class SyntheticLesionsStage:
             "backup_seg_path": backup_path,
             "global_binary_path": global_bin_path,
             "global_labels_path": global_lbl_path,
-            "vtt_roi_seg_path": self.vtt_roi_seg_path,
+            "pytheratwin_roi_seg_path": self.pytheratwin_roi_seg_path,
         }
         extra = {
             "stage": "synthetic_lesions_stage",
             "output_dir": self.output_dir,
             "work_dir": self.work_dir,
             "file_prefix": self.prefix,
-            "vtt_roi_seg_path": self.vtt_roi_seg_path,
+            "pytheratwin_roi_seg_path": self.pytheratwin_roi_seg_path,
             "synthetic_lesion_id": int(self.synthetic_lesion_id),
             "default_seed": int(self.default_seed),
             "auto_shrink_factor": float(self.auto_shrink_factor),
@@ -278,8 +278,8 @@ class SyntheticLesionsStage:
 
     def _validate_roi_name(self, roi_name: str) -> None:
         """Validate ROI exists in label map and is not synthetic_lesion itself."""
-        if roi_name not in self.vtt_name2id:
-            raise ValueError(f"ROI '{roi_name}' not found in VTT_Pipeline label map.")
+        if roi_name not in self.pytheratwin_name2id:
+            raise ValueError(f"ROI '{roi_name}' not found in PyTheraTwin_Pipeline label map.")
         if roi_name == "synthetic_lesion":
             raise ValueError("Do not specify lesions inside ROI='synthetic_lesion'.")
 
@@ -434,7 +434,7 @@ class SyntheticLesionsStage:
         self._validate_roi_name(roi_name) # fail hard if invalid
         parsed = self._parse_roi_spec(roi_name, spec) # checks + returns normalized spec dict; fail hard if invalid
 
-        roi_id = int(self.vtt_name2id[roi_name])
+        roi_id = int(self.pytheratwin_name2id[roi_name])
         organ_mask_zyx = (seg_zyx == roi_id) # boolean mask of the organ ROI in zyx order
         if int(organ_mask_zyx.sum()) == 0:
             raise ValueError(f"[{roi_name}] mask is empty in unified segmentation.")
@@ -546,14 +546,14 @@ class SyntheticLesionsStage:
         global_lesion_binary_zyx: np.ndarray,
     ) -> None:
         """
-        Overwrite `context.vtt_roi_seg_path` so that lesion voxels become synthetic_lesion_id.
+        Overwrite `context.pytheratwin_roi_seg_path` so that lesion voxels become synthetic_lesion_id.
         Saved as uint8 to avoid label truncation.
         """
         seg_zyx_mod = seg_zyx.copy()
         seg_zyx_mod[global_lesion_binary_zyx > 0] = int(self.synthetic_lesion_id)
 
         seg_xyz_mod = zyx_to_xyz(seg_zyx_mod).astype(np.uint8, copy=False)
-        save_nifti_nib(self.vtt_roi_seg_path, seg_xyz_mod, seg_nii, dtype=np.uint8)
+        save_nifti_nib(self.pytheratwin_roi_seg_path, seg_xyz_mod, seg_nii, dtype=np.uint8)
 
     # -------------------------------------------------------------------------
     # Public entrypoint
@@ -601,7 +601,7 @@ class SyntheticLesionsStage:
             self.context.synthetic_lesions_backup_seg_path = cache_meta.get("backup_seg_path")
             self.context.synthetic_lesions_global_binary_path = cache_meta.get("global_binary_path")
             self.context.synthetic_lesions_global_labels_path = cache_meta.get("global_labels_path")
-            self.context.vtt_roi_seg_path = self.vtt_roi_seg_path
+            self.context.pytheratwin_roi_seg_path = self.pytheratwin_roi_seg_path
             self.context.extras["synthetic_lesions_stage"] = {
                 "output_dir": self.output_dir,
                 "work_dir": self.work_dir,
@@ -677,7 +677,7 @@ class SyntheticLesionsStage:
         self.context.synthetic_lesions_backup_seg_path = backup_path
         self.context.synthetic_lesions_global_binary_path = global_bin_path
         self.context.synthetic_lesions_global_labels_path = global_lbl_path
-        self.context.vtt_roi_seg_path = self.vtt_roi_seg_path
+        self.context.pytheratwin_roi_seg_path = self.pytheratwin_roi_seg_path
         self.context.extras["synthetic_lesions_stage"] = {
             "output_dir": self.output_dir,
             "work_dir": self.work_dir,

@@ -1,4 +1,4 @@
-# Virtual Theranostic Trials (VTT) Pipeline
+# PyTheraTwin Pipeline
 
 This pipeline creates patient-specific **theranostic digital twins** by combining CT-based anatomy/segmentation with PBPK kinetics and physics-based SPECT simulation/reconstruction, supporting research in diagnosis and therapy planning.
 
@@ -10,7 +10,7 @@ This pipeline creates patient-specific **theranostic digital twins** by combinin
 
 **Radiopharmaceuticals (RPTs)** couple a targeting molecule with a radionuclide that accumulates in tissues expressing a biomarker (e.g., tumors). As the radionuclide decays, emitted particles can deliver therapy while emitted photons enable quantitative imaging. For example, **¹⁷⁷Lu-PSMA** targets PSMA-expressing prostate cancer and supports post-therapy SPECT imaging.
 
-The **Virtual Theranostic Trials (VTT) Pipeline** is a quantitative software framework that uses real patient CT data to build end-to-end digital twins for theranostics research. It integrates:
+The **PyTheraTwin Pipeline** is a quantitative software framework that uses real patient CT data to build end-to-end digital twins for theranostics research. It integrates:
 
 - **Patient-specific anatomy** from clinical CT scans
 - **Organ/tumor segmentation** (TotalSegmentator-based workflows)
@@ -18,9 +18,9 @@ The **Virtual Theranostic Trials (VTT) Pipeline** is a quantitative software fra
 - **Monte Carlo SPECT simulation + reconstruction** (SIMIND/PyTomography) to produce quantitative images
 - **Monte Carlo dosimetry simulation** (OpenGATE/Geant4) to generate organ-level dose maps
 
-Because uptake and dose can vary substantially between patients, VTT support personalized evaluation of therapy strategies by enabling controlled, repeatable experiments across anatomy, kinetics, and imaging physics. A key objective is demonstrating agreement with patient measurements to support reliability and validation; longer-term, this work supports **Virtual Theranostic Trials (VTTs)** and patient-specific dosimetry prediction.
+Because uptake and dose can vary substantially between patients, PyTheraTwin supports personalized evaluation of therapy strategies by enabling controlled, repeatable experiments across anatomy, kinetics, and imaging physics. A key objective is demonstrating agreement with patient measurements to support reliability and validation; longer-term, this work supports virtual theranostic studies and patient-specific dosimetry prediction.
 
-![VTT Pipeline Overview](figures/pipeline_overview.png)
+![PyTheraTwin Pipeline Overview](figures/pipeline_overview.png)
 
 ---
 
@@ -49,7 +49,7 @@ Because uptake and dose can vary substantially between patients, VTT support per
 
 ```bash
 conda env create -f environment.yml
-conda activate vtt
+conda activate pytheratwin
 ```
 
 > This environment includes all required Python dependencies (TotalSegmentator, PyTomography, OpenGATE, PyCNO, etc.).
@@ -94,7 +94,7 @@ Two interfaces are available — both call the same `main.py` entry point and no
 #### Launch
 
 ```bash
-conda activate vtt
+conda activate pytheratwin
 python run_server.py
 ```
 
@@ -244,7 +244,7 @@ test_run/
     dosemap_postprocess_stage.json
   digital_twin/                              <- Phase 1
     ct.nii.gz                                <- standardized CT handoff
-    digital_twin.nii.gz                      <- unified VTT multilabel segmentation handoff
+    digital_twin.nii.gz                      <- unified PyTheraTwin multilabel segmentation handoff
     segmentation_stage/
     synthetic_lesions_stage/                  <- (if synthetic lesions enabled)
     pbpk_tac_stage/
@@ -347,7 +347,7 @@ src/
 
   data/
     isotope_config.json             <- Isotope data: half-lives, attenuation coefficients, nuclear params
-    pipeline_roi_naming_map.json    <- Full ROI definition table: VTT label IDs, TotalSegmentator task mappings, PBPK VOI names, PBPK observables, UI categories
+    pipeline_roi_naming_map.json    <- Full ROI definition table: PyTheraTwin label IDs, TotalSegmentator task mappings, PBPK VOI names, PBPK observables, UI categories
     pipeline_paths.json             <- Developer-facing path configuration (SIMIND dir, output root)
     pipeline_options.json           <- Stage defaults and UI option lists
     smc.smc / scattwin.win          <- SIMIND template files

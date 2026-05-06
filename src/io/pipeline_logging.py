@@ -102,7 +102,7 @@ class PipelineReporter:
             lines.append(text)
 
         add(f"+{border}+")
-        add(f"|  {'Virtual Theranostic Trials  -  VTT Pipeline'.center(width - 4)}  |")
+        add(f"|  {'PyTheraTwin Pipeline'.center(width - 4)}  |")
         add(f"|  {'BC Cancer  -  QURIT Lab'.center(width - 4)}  |")
         add(f"+{border}+")
         add()
@@ -375,8 +375,8 @@ class PipelineReporter:
 
         if stage_key == "segmentation":
             seg_extra = extras.get("segmentation_stage", {})
-            if context.vtt_roi_seg_path:
-                lines.append(f"roi_handoff={context.vtt_roi_seg_path}")
+            if context.pytheratwin_roi_seg_path:
+                lines.append(f"roi_handoff={context.pytheratwin_roi_seg_path}")
             if seg_extra.get("metadata_path"):
                 lines.append(f"metadata={seg_extra['metadata_path']}")
         elif stage_key == "synthetic_lesions":

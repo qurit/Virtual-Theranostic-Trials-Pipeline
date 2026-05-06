@@ -6,8 +6,8 @@ inputs/config.json
 .DS_Store
 /inputs/config.json
 post_processing_script.ipynb
-TDT_Output*/
-TDT_Output*
+PyTheraTwin_Output*/
+PyTheraTwin_Output*
 testing.ipynb
 post_process/
 testing*
@@ -23,4 +23,4 @@ cpu_test/
 test_full_run_CT_0/
 
 
-.vtt*
+.pytheratwin*

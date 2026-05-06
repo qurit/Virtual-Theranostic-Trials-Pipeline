@@ -1,5 +1,5 @@
 """
-Command-line entry point for the Virtual Theranostic Trials pipeline.
+Command-line entry point for the PyTheraTwin pipeline.
 
 This module defines the per-patient pipeline runner, injects developer-controlled
 paths into the live config, and provides the batch CLI used by both local runs
@@ -30,9 +30,9 @@ from src.stages.simind_simulation_stage import SimindSimulationStage
 from src.stages.spect_postprocess_stage import SpectPostprocessStage
 from src.stages.opengate_simulation_stage import OpenGateSimulationStage
 from src.stages.dosemap_postprocess_stage import DosemapPostprocessStage
-class TdtPipeline:
+class PyTheraTwinPipeline:
     """
-    Orchestrates the full VTT pipeline for a single CT input.
+    Orchestrates the full PyTheraTwin pipeline for a single CT input.
 
     Parameters
     ----------
@@ -103,7 +103,7 @@ class TdtPipeline:
         self.run_synthetic_lesions: bool = False
         self.sub_dir_names: Dict[str, str] = {}
 
-        self.logger: logging.Logger = logging.getLogger(f"VTT_PIPELINE_CT_{self.ct_index}")
+        self.logger: logging.Logger = logging.getLogger(f"PyTheraTwin_PIPELINE_CT_{self.ct_index}")
         self.logger.setLevel(logging.DEBUG if self.mode == "DEBUG" else logging.INFO)
         self.logger.propagate = False
         self.reporter = PipelineReporter(mode=self.mode, logger=self.logger)
@@ -431,14 +431,14 @@ class TdtPipeline:
             profiler.save(profile_path, pipeline_elapsed, self.config)
             print(f"Profiling data saved to: {profile_path}")
 
-        print("VTT pipeline completed successfully.")
+        print("PyTheraTwin pipeline completed successfully.")
         return context
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build the CLI argument parser for the VTT pipeline."""
+    """Build the CLI argument parser for the PyTheraTwin pipeline."""
     parser = argparse.ArgumentParser(
-        description="Virtual Theranostic Trials pipeline runner"
+        description="PyTheraTwin pipeline runner"
     )
 
     parser.add_argument("--config_file", required=True, type=str,
@@ -586,10 +586,10 @@ def main() -> int:
     any_failed = False
     for idx, name in enumerate(items, start=args.ct_index_start):
         ct_path = os.path.join(ct_inputs_dir, name)
-        pipeline: Optional[TdtPipeline] = None
+        pipeline: Optional[PyTheraTwinPipeline] = None
 
         try:
-            pipeline = TdtPipeline(
+            pipeline = PyTheraTwinPipeline(
                 config_path=args.config_file,
                 ct_input=ct_path,
                 ct_index=idx,

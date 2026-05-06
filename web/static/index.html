@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Virtual Theranostic Trials</title>
+  <title>PyTheraTwin</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
@@ -140,12 +140,12 @@ function Page1Welcome({onNext}){
   return(
     <div className="max-w-3xl mx-auto px-6 py-12">
       <div className="mb-8">
-        <h1 className="text-4xl font-bold text-slate-900 mb-1">Virtual Theranostic Trials</h1>
+        <h1 className="text-4xl font-bold text-slate-900 mb-1">PyTheraTwin</h1>
         <p className="text-blue-600 font-semibold text-lg">BC Cancer Research Centre</p>
       </div>
       <div className="bg-blue-50 border border-blue-100 rounded-2xl p-6 mb-6">
         <h2 className="font-semibold text-blue-900 mb-3 text-lg">Pipeline Overview</h2>
-        <p className="text-slate-600 text-sm mb-5">VTT builds a patient-specific digital twin from a CT scan and simulates personalised theranostic treatment end-to-end:</p>
+        <p className="text-slate-600 text-sm mb-5">PyTheraTwin builds a patient-specific digital twin from a CT scan and simulates personalised theranostic treatment end-to-end:</p>
         {[
           {n:'1',color:'bg-blue-100 text-blue-700',title:'Digital Twin & Ground Truth',lines:['TotalSegmentator organ segmentation','Optional synthetic lesion insertion','PBPK time-activity curve generation']},
           {n:'2',color:'bg-violet-100 text-violet-700',title:'Monte Carlo Simulations',lines:['SIMIND SPECT projection simulation','OpenGATE absorbed-dose Monte Carlo']},
@@ -162,7 +162,7 @@ function Page1Welcome({onNext}){
       <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 mb-8">
         <p className="font-semibold text-amber-800 mb-2 text-sm">Before you start</p>
         <ul className="space-y-1 text-amber-700 text-xs">
-          <li>· Conda environment active: <code className="bg-amber-100 px-1 rounded font-mono">conda activate vtt</code></li>
+          <li>· Conda environment active: <code className="bg-amber-100 px-1 rounded font-mono">conda activate pytheratwin</code></li>
           <li>· SIMIND path set in <code className="bg-amber-100 px-1 rounded font-mono">src/data/pipeline_paths.json</code></li>
           <li>· CT data as DICOM subfolders or <code className="bg-amber-100 px-1 rounded font-mono">.nii / .nii.gz</code> files</li>
         </ul>
@@ -719,7 +719,7 @@ function SpecsEditor({value,onChange,roiChoices,pbpkCompatibleRois,desc}){
   const usedRois=Object.keys(specs);
   // Only ROIs with dedicated PBPK VOIs can have synthetic lesions
   const pbpkSet=pbpkCompatibleRois instanceof Set?pbpkCompatibleRois:new Set(pbpkCompatibleRois||[]);
-  const available=(roiChoices||[]).filter(r=>r!=='body'&&!usedRois.includes(r)&&pbpkSet.has(r));
+  const available=(roiChoices||[]).filter(r=>r!=='remaining_body'&&!usedRois.includes(r)&&pbpkSet.has(r));
   const handleAdd=()=>{if(!addRoi)return;onChange({...specs,[addRoi]:{n_lesions:1,prob:'uniform',margin_mm:1.0,seed:0}});setAddRoi('');};
   const handleUpdateSpec=(roi,newSpec)=>onChange({...specs,[roi]:newSpec});
   const handleRemove=(roi)=>{const u={...specs};delete u[roi];onChange(Object.keys(u).length?u:null);};
@@ -760,7 +760,7 @@ function SpecsEditor({value,onChange,roiChoices,pbpkCompatibleRois,desc}){
             </div>
           ):(
             <p className="text-xs text-slate-400 italic mt-2">
-              {pbpkSet.size===0||(roiChoices||[]).filter(r=>r!=='body'&&pbpkSet.has(r)).length===0
+              {pbpkSet.size===0||(roiChoices||[]).filter(r=>r!=='remaining_body'&&pbpkSet.has(r)).length===0
                 ?'Select Phase 1 ROIs with dedicated PBPK VOIs first to unlock lesion placement.'
                 :'All PBPK-compatible ROIs are already configured.'}
             </p>

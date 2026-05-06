@@ -1,5 +1,5 @@
 """
-PBPK TAC generation (PyCNO PSMA model) for the VTT pipeline.
+PBPK TAC generation (PyCNO PSMA model) for the PyTheraTwin pipeline.
 
 This stage generates time-activity curves (TACs) for all segmented ROIs and saves
 them for use by downstream simulation and post-processing stages.

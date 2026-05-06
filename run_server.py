@@ -1,7 +1,7 @@
 """
-Entry point for the Virtual Theranostic Trials web UI server.
+Entry point for the PyTheraTwin web UI server.
 
-Checks and installs required web dependencies, stops an older VTT web UI
+Checks and installs required web dependencies, stops an older PyTheraTwin web UI
 server on the same port when one is found, then launches the FastAPI
 application via uvicorn.  An
 OS browser window is opened automatically unless --no-browser is passed.
@@ -33,12 +33,12 @@ if str(REPO_ROOT) not in sys.path:
 
 def _pid_file_path(port: int) -> Path:
     """Return the pid-file path for one bound web-server port."""
-    return REPO_ROOT / f".vtt_webui_server_{port}.json"
+    return REPO_ROOT / f".pytheratwin_webui_server_{port}.json"
 
 
 def _parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the server launcher."""
-    p = argparse.ArgumentParser(description="Launch the VTT web UI server.")
+    p = argparse.ArgumentParser(description="Launch the PyTheraTwin web UI server.")
     p.add_argument("--port", type=int, default=8766, help="Port to listen on (default: 8766).")
     p.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1).")
     p.add_argument("--no-browser", action="store_true", help="Do not auto-open the browser.")
@@ -58,7 +58,7 @@ def _process_command(pid: int) -> str:
         return ""
 
 
-def _looks_like_vtt_server(pid: int) -> bool:
+def _looks_like_pytheratwin_server(pid: int) -> bool:
     """Return True when *pid* looks like this repo's web UI server."""
     cmd = _process_command(pid)
     if not cmd:
@@ -71,7 +71,7 @@ def _looks_like_vtt_server(pid: int) -> bool:
 
 
 def _read_pid_file(port: int) -> dict | None:
-    """Read the persisted VTT server pid file if it exists and is valid JSON."""
+    """Read the persisted PyTheraTwin server pid file if it exists and is valid JSON."""
     pid_file = _pid_file_path(port)
     if not pid_file.exists():
         return None
@@ -82,7 +82,7 @@ def _read_pid_file(port: int) -> dict | None:
 
 
 def _write_pid_file(host: str, port: int) -> None:
-    """Persist the current VTT web server process metadata."""
+    """Persist the current PyTheraTwin web server process metadata."""
     payload = {
         "pid": os.getpid(),
         "host": host,
@@ -156,9 +156,9 @@ def _port_in_use(host: str, port: int) -> bool:
         sock.close()
 
 
-def _maybe_stop_existing_vtt_server(host: str, port: int) -> None:
+def _maybe_stop_existing_pytheratwin_server(host: str, port: int) -> None:
     """
-    Stop only a prior VTT web UI server on *port*.
+    Stop only a prior PyTheraTwin web UI server on *port*.
 
     Never kills an unrelated process. If the port remains busy afterwards, the
     caller should fail with a clear message and let the user decide what to do.
@@ -167,7 +167,7 @@ def _maybe_stop_existing_vtt_server(host: str, port: int) -> None:
     if pid_info:
         pid = int(pid_info.get("pid", 0) or 0)
         if pid and pid != os.getpid():
-            if _looks_like_vtt_server(pid) and int(pid_info.get("port", -1)) == port:
+            if _looks_like_pytheratwin_server(pid) and int(pid_info.get("port", -1)) == port:
                 _stop_pid(pid)
             elif not _is_pid_alive(pid):
                 _remove_pid_file(port)
@@ -175,12 +175,12 @@ def _maybe_stop_existing_vtt_server(host: str, port: int) -> None:
     for pid in _listener_pids(port):
         if pid == os.getpid():
             continue
-        if _looks_like_vtt_server(pid):
+        if _looks_like_pytheratwin_server(pid):
             _stop_pid(pid)
 
     if _port_in_use(host, port):
         raise RuntimeError(
-            f"Port {port} is already in use by a non-VTT process. "
+            f"Port {port} is already in use by a non-PyTheraTwin process. "
             "The launcher will not kill unrelated services automatically."
         )
 
@@ -230,12 +230,12 @@ def _ensure_deps() -> None:
 
 
 def main() -> None:
-    """Resolve dependencies, stop an older VTT server if present, and start uvicorn."""
+    """Resolve dependencies, stop an older PyTheraTwin server if present, and start uvicorn."""
     args = _parse_args()
     url = f"http://{args.host}:{args.port}"
 
     print("=" * 60)
-    print("  Virtual Theranostic Trials — Web UI")
+    print("  PyTheraTwin — Web UI")
     print("=" * 60)
     print(f"  URL : {url}")
     print("  Stop: Ctrl+C")
@@ -244,7 +244,7 @@ def main() -> None:
 
     _ensure_deps()
     try:
-        _maybe_stop_existing_vtt_server(args.host, args.port)
+        _maybe_stop_existing_pytheratwin_server(args.host, args.port)
     except RuntimeError as exc:
         print(f"[ERROR] {exc}")
         sys.exit(1)
@@ -262,7 +262,7 @@ def main() -> None:
         print("  Run:  pip install 'uvicorn[standard]' fastapi")
         sys.exit(1)
 
-    pending_file = REPO_ROOT / ".vtt_pending_run.json"
+    pending_file = REPO_ROOT / ".pytheratwin_pending_run.json"
 
     try:
         _write_pid_file(args.host, args.port)

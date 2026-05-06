@@ -1,6 +1,6 @@
 {
   // ---------------------------------------------------------------------------
-  // Virtual Theranostic Trials (VTT) — Pipeline Configuration Template
+  // PyTheraTwin — Pipeline Configuration Template
   // ---------------------------------------------------------------------------
   //
   // QUICK-START
@@ -24,8 +24,8 @@
     "segmentation_stage": {
 
       // Organs to segment and carry into all downstream stages.
-      // Valid names: see "VTT_allowed_rois" in src/data/pipeline_roi_naming_map.json.
-      // Reserved labels (background, body, synthetic_lesion) must NOT appear here.
+      // Valid names: see "PyTheraTwin_allowed_rois" in src/data/pipeline_roi_naming_map.json.
+      // Reserved labels (background, remaining_body, synthetic_lesion) must NOT appear here.
       // Every ROI used in simulation or lesion specs must be listed here.
       "roi_subset": ["kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"]
     },

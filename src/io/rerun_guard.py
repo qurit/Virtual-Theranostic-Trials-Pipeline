@@ -1,5 +1,5 @@
 """
-Shared rerun-safety checks for the VTT pipeline.
+Shared rerun-safety checks for the PyTheraTwin pipeline.
 
 The low-level fingerprinting, metadata storage, and per-stage snapshot builders
 live in smaller helper modules so this file can stay focused on the actual

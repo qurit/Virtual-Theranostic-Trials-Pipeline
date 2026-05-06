@@ -1,5 +1,5 @@
 """
-OpenGATE dosimetry for the VTT pipeline.
+OpenGATE dosimetry for the PyTheraTwin pipeline.
 
 This stage runs voxel-source Monte Carlo dose calculations on the phase-1 CT grid
 (using the native CT grid or an optional downsampled simulation grid) with OpenGATE.
@@ -9,7 +9,7 @@ resulting dose maps are saved and summed on that same simulation grid.
 Core responsibilities
 ---------------------
 - Validate required context fields and stage configuration.
-- Load the phase-1 CT and unified VTT ROI segmentation.
+- Load the phase-1 CT and unified PyTheraTwin ROI segmentation.
 - Optionally downsample the simulation inputs for faster Monte Carlo execution.
 - Convert simulation inputs to OpenGATE's centered identity-direction convention.
 - Build one binary voxel-source mask per requested ROI.
@@ -43,7 +43,7 @@ Incoming `context` is expected to provide:
 - context.subdir_paths["phase_2"] : str
 - context.config["phase_2"]["opengate_stage"] : dict (including roi_subset)
 - context.ct_nii_path : str
-- context.vtt_roi_seg_path : str
+- context.pytheratwin_roi_seg_path : str
 - context.downstream_roi_subset : list[str] | str
 - label map loaded from ``src/data/pipeline_paths.json`` input_paths.label_map_path
 
@@ -81,7 +81,7 @@ from src.io.rerun_guard import (
     write_json,
 )
 from src.utils.nifti_utils import save_nii_sitk
-from src.utils.label_utils import load_vtt_label_map, filter_roi_seg_to_subset, load_isotope_config
+from src.utils.label_utils import load_pytheratwin_label_map, filter_roi_seg_to_subset, load_isotope_config
 from src.utils.opengate_utils import (
     cleanup_mhd,
     find_hu_tables,
@@ -105,7 +105,7 @@ class OpenGateSimulationStage:
     Notes
     -----
     - Simulation may run on the native CT grid or on an optional downsampled grid.
-    - Source masks are binary voxel maps derived from the unified VTT segmentation.
+    - Source masks are binary voxel maps derived from the unified PyTheraTwin segmentation.
     - ROI dose outputs are accumulated into a summed dose map in simulation space.
     - If a per-ROI dose NIfTI already exists on disk the simulation for that ROI is
       skipped, allowing a crashed run to be resumed from where it left off.
@@ -116,7 +116,7 @@ class OpenGateSimulationStage:
             "subdir_paths",
             "config",
             "ct_nii_path",
-            "vtt_roi_seg_path",
+            "pytheratwin_roi_seg_path",
             "downstream_roi_subset",
             "output_folder_path",
             "ct_input_identity",
@@ -223,9 +223,9 @@ class OpenGateSimulationStage:
 
         # Input paths
         self.ct_nii_path: Path = Path(context.ct_nii_path)
-        self.vtt_roi_seg_path: Path = Path(context.vtt_roi_seg_path)
+        self.pytheratwin_roi_seg_path: Path = Path(context.pytheratwin_roi_seg_path)
         self.label_map_path: Path = Path(get_label_map_path())
-        self.vtt_name2id: Dict[str, int] = load_vtt_label_map(self.label_map_path)
+        self.pytheratwin_name2id: Dict[str, int] = load_pytheratwin_label_map(self.label_map_path)
 
         _nuclear = load_isotope_config()["nuclear"].get(self.isotope)
         if _nuclear is None:
@@ -278,7 +278,7 @@ class OpenGateSimulationStage:
             )                                                                          
 
         roi_list: List[str] = []
-        if "remaining_body" in self.vtt_name2id:
+        if "remaining_body" in self.pytheratwin_name2id:
             roi_list.append("remaining_body")
         for roi_name in opengate_roi_subset:
             if roi_name not in roi_list:
@@ -302,7 +302,7 @@ class OpenGateSimulationStage:
         """Return fingerprints for the current stage inputs that affect dosimetry outputs."""
         deps = {
             "ct_nii": fingerprint_optional_file(self.ct_nii_path),
-            "vtt_roi_seg": fingerprint_optional_file(self.vtt_roi_seg_path),
+            "pytheratwin_roi_seg": fingerprint_optional_file(self.pytheratwin_roi_seg_path),
             "label_map_json": fingerprint_optional_file(self.label_map_path),
             "segmentation_stage_metadata": fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
@@ -503,16 +503,16 @@ class OpenGateSimulationStage:
             Only ROIs with non-zero voxels are returned.
         """
         seg_arr = sitk.GetArrayFromImage(sim_seg).astype(np.int32)
-        seg_arr = filter_roi_seg_to_subset(seg_arr, self.requested_roi_subset, self.vtt_name2id)
+        seg_arr = filter_roi_seg_to_subset(seg_arr, self.requested_roi_subset, self.pytheratwin_name2id)
 
         mask_paths: Dict[str, str] = {}
         counts: Dict[str, int] = {}
         names: List[str] = []
 
         for roi_name in self.requested_roi_subset:
-            label_id = self.vtt_name2id.get(roi_name)
+            label_id = self.pytheratwin_name2id.get(roi_name)
             if label_id is None:
-                raise ValueError(f"ROI '{roi_name}' not in VTT label map")
+                raise ValueError(f"ROI '{roi_name}' not in PyTheraTwin label map")
 
             mask = (seg_arr == int(label_id)).astype(np.uint8)
             n_vox = int(np.count_nonzero(mask))
@@ -875,7 +875,7 @@ class OpenGateSimulationStage:
             "stage": "opengate_simulation_stage",
             "dose_units": "Gy/decay",
             "ct_nii_path": str(self.ct_nii_path),
-            "vtt_roi_seg_path": str(self.vtt_roi_seg_path),
+            "pytheratwin_roi_seg_path": str(self.pytheratwin_roi_seg_path),
             "label_map_path": str(self.label_map_path),
             "requested_roi_subset": list(self.requested_roi_subset),
             "simulated_roi_names": list(roi_names),
@@ -1021,7 +1021,7 @@ class OpenGateSimulationStage:
         import opengate as gate  # noqa: F811
 
         native_ct = sitk.ReadImage(str(self.ct_nii_path))
-        native_seg = sitk.ReadImage(str(self.vtt_roi_seg_path))
+        native_seg = sitk.ReadImage(str(self.pytheratwin_roi_seg_path))
 
         sim_ct, sim_seg, sim_ct_path, sim_seg_path, was_resampled = self._prepare_simulation_images(
             native_ct,
