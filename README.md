@@ -10,7 +10,7 @@ This pipeline creates patient-specific **theranostic digital twins** by combinin
 
 **Radiopharmaceuticals (RPTs)** couple a targeting molecule with a radionuclide that accumulates in tissues expressing a biomarker (e.g., tumors). As the radionuclide decays, emitted particles can deliver therapy while emitted photons enable quantitative imaging. For example, **¹⁷⁷Lu-PSMA** targets PSMA-expressing prostate cancer and supports post-therapy SPECT imaging.
 
-The **PyTheraTwin Pipeline** is a quantitative software framework that uses real patient CT data to build end-to-end digital twins for theranostics research. It integrates:
+The *PyTheraTwin Pipeline** is a quantitative software framework that uses real patient CT data to build end-to-end digital twins for theranostics research. It integrates:
 
 - **Patient-specific anatomy** from clinical CT scans
 - **Organ/tumor segmentation** (TotalSegmentator-based workflows)
