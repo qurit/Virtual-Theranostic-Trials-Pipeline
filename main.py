@@ -58,6 +58,9 @@ class PyTheraTwinPipeline:
         If True, runs OpenGATE dosimetry simulation in Phase 2.
     run_postprocess : bool, default=False
         If True, runs post-processing in Phase 3 for whichever simulations ran.
+    startup_banner_lines : list of str, optional
+        Pre-rendered banner lines from the batch startup banner, written into
+        the per-CT log file header so the log is self-contained.
     profile_interval_s : float or None, default=None
         When set to a float (0.1–3.0 s), enables CPU/RAM profiling per stage
         and writes ``profiling_CT_<ct_index>.json`` into the output folder.

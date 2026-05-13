@@ -28,9 +28,9 @@ Because uptake and dose can vary substantially between patients, PyTheraTwin sup
 
 | Phase | Description |
 |-------|-------------|
-| **Phase 1: Digital Twin & Ground Truth** | CT → TotalSegmentator + ROI unification → (optional) synthetic lesion generation → PBPK TAC generation |
-| **Phase 2: Simulations** | SIMIND SPECT simulation (optional, `--spect`) · OpenGATE dosimetry (optional, `--dosimetry`) |
-| **Phase 3: Post-Processing** | SPECT post-processing (optional, `--postprocess` + `--spect`) · Dosimetry post-processing (optional, `--postprocess` + `--dosimetry`) |
+| **Phase 1: Digital Twin & Ground Truth** | Segmentation + ROI unification (`--segmentation`) · Synthetic lesion generation (`--synthetic_lesions`, requires specs in config) · PBPK TAC generation (`--pbpk`) |
+| **Phase 2: Simulations** | SIMIND SPECT simulation (`--spect`) · OpenGATE dosimetry (`--dosimetry`) |
+| **Phase 3: Post-Processing** | SPECT post-processing (`--postprocess` + `--spect`) · Dosimetry post-processing (`--postprocess` + `--dosimetry`) |
 
 ---
 

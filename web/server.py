@@ -45,6 +45,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.io.config_paths import get_pipeline_input_paths, inject_pipeline_paths, load_pipeline_paths, strip_developer_fields
+from src.io.profiler import validate_profile_interval_s
 from src.io.rerun_fingerprints import flatten_paths
 from src.io.rerun_guard import (
     STAGE_LABELS,
@@ -1421,6 +1422,13 @@ async def start_run(req: RunRequest) -> Dict:
         if req.flags.get(key, False):
             flag_args.append(cli_flag)
     if req.flags.get("profile", False):
+        try:
+            validate_profile_interval_s(float(req.profile_interval_s))
+        except ValueError:
+            raise HTTPException(
+                400,
+                "profile_interval_s must be between 0.1 and 3.0 seconds when profiling is enabled.",
+            )
         flag_args.extend(["--profile", str(float(req.profile_interval_s))])
 
     # Build one combined temp CT directory with all patients' CTs symlinked in
