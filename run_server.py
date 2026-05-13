@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -294,6 +295,9 @@ def main() -> None:
             result = subprocess.run(job["cmd"], cwd=str(REPO_ROOT))
             if result.returncode != 0:
                 any_failed = True
+            tmp_ct_dir = job.get("tmp_ct_dir")
+            if tmp_ct_dir:
+                shutil.rmtree(tmp_ct_dir, ignore_errors=True)
         sys.exit(1 if any_failed else 0)
 
 

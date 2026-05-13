@@ -114,11 +114,18 @@ class PipelineReporter:
             add(f"  Ignored   : {len(skipped_items)} unsupported entr{suffix}")
         add()
 
-        phase1_tasks = ["segmentation", "PBPK"]
-        if cfg.get("phase_1", {}).get("synthetic_lesions_stage", {}).get("specs"):
+        phase1_tasks: List[str] = []
+        if getattr(args, "segmentation", False):
+            phase1_tasks.append("segmentation")
+        if getattr(args, "pbpk", False):
+            phase1_tasks.append("PBPK")
+        if getattr(args, "synthetic_lesions", False):
             phase1_tasks.append("synthetic lesions")
         add("  Phases to run:")
-        add(f"    OK  Phase 1  -  {', '.join(phase1_tasks)}")
+        if phase1_tasks:
+            add(f"    OK  Phase 1  -  {', '.join(phase1_tasks)}")
+        else:
+            add("    --  Phase 1  -  skipped (no Phase 1 flags set)")
         if args.spect:
             nc = cfg.get("phase_2", {}).get("simind_stage", {}).get("num_cpu", 1)
             eff = avail if nc == 0 else min(nc, avail)
@@ -151,8 +158,8 @@ class PipelineReporter:
             eff_nc2 = avail if nc2 == 0 else min(nc2, avail)
             note2 = f"num_threads={nc2} -> using all {avail}" if nc2 == 0 else f"num_threads={nc2}"
             add(f"  OpenGATE      : {eff_nc2} thread(s)  ({note2})")
-        if args.profile:
-            add(f"  Profiling     : ON  (interval={args.profile_interval_s:.3g} s)")
+        if getattr(args, "profile", None) is not None:
+            add(f"  Profiling     : ON  (interval={args.profile:.3g} s)")
         add()
         add("  Existing stage outputs are reused only when CT/config metadata still match.")
         add()
@@ -172,6 +179,8 @@ class PipelineReporter:
         ct_index: int,
         ct_input_type: str,
         output_folder_path: str,
+        run_segmentation: bool,
+        run_pbpk: bool,
         run_synthetic_lesions: bool,
         run_spect: bool,
         run_dosimetry: bool,
@@ -212,14 +221,22 @@ class PipelineReporter:
         pbpk_cfg = config.get("phase_1", {}).get("pbpk_tac_stage", {})
         les_cfg = config.get("phase_1", {}).get("synthetic_lesions_stage", {})
 
-        roi_list = seg_cfg.get("roi_subset", [])
-        roi_str = ", ".join(roi_list) if roi_list else "-"
         add("  Phase 1  -  Digital Twin & Ground Truth")
-        add(f"    ROI subset   : {roi_str}")
-        add(
-            "    PBPK model   : "
-            f"{pbpk_cfg.get('model_type', '?')}  -  isotope : {pbpk_cfg.get('isotope', '?')}"
-        )
+
+        if run_segmentation:
+            roi_list = seg_cfg.get("roi_subset", [])
+            roi_str = ", ".join(roi_list) if roi_list else "-"
+            add(f"    Segmentation : {roi_str}")
+        else:
+            add("    Segmentation : skipped")
+
+        if run_pbpk:
+            add(
+                "    PBPK model   : "
+                f"{pbpk_cfg.get('model_type', '?')}  -  isotope : {pbpk_cfg.get('isotope', '?')}"
+            )
+        else:
+            add("    PBPK model   : skipped")
 
         if run_synthetic_lesions:
             specs = les_cfg.get("specs") or {}

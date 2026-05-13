@@ -1,17 +1,4 @@
 {
-  // ---------------------------------------------------------------------------
-  // PyTheraTwin — Pipeline Configuration Template
-  // ---------------------------------------------------------------------------
-  //
-  // QUICK-START
-  // -----------
-  // 1. Copy and rename this file (e.g. inputs/my_config.json).
-  // 2. Set "output_folder_title" to your study name.
-  // 3. Set SIMINDDirectory in src/data/pipeline_paths.json.
-  // 4. Adjust roi_subset and simulation parameters for your study.
-  // 5. Run: python main.py --config_file inputs/my_config.json --input_ct_dir /path/to/cts [--spect] [--dosimetry] [--postprocess]
-  // ---------------------------------------------------------------------------
-
   // Project folder name created under the repo root. Each patient CT gets its own subfolder: <title>/CT_<index>/
   "output_folder_title": "test_run",
 

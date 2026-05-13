@@ -42,24 +42,26 @@ class PyTheraTwinPipeline:
         Path to a CT input (either a .nii/.nii.gz file OR a DICOM directory).
     ct_index : int
         Index used for naming (e.g., output folder suffix "_CT_{ct_index}").
-    logging_on : bool, default=True
-        If True, writes a per-CT log file into the CT output folder.
-        The log records launched_via, config path, output folder, and timing.
-    save_config : bool, default=False
-        If True, saves a copy of the config JSON into the output folder.
     mode : {"DEBUG", "PRODUCTION"}, default="PRODUCTION"
         Controls verbosity and whether intermediate files are cleaned up.
+    web_ui : bool, default=False
+        Set to True when launched from the web UI; recorded in the log file.
+    run_segmentation : bool, default=False
+        If True, runs TotalSegmentator segmentation + ROI unification in Phase 1.
+    run_pbpk : bool, default=False
+        If True, runs PBPK TAC generation in Phase 1.
+    run_synthetic_lesions : bool, default=False
+        If True, runs synthetic lesion generation in Phase 1 (requires specs in config).
     run_spect : bool, default=False
         If True, runs SIMIND SPECT simulation in Phase 2.
     run_dosimetry : bool, default=False
         If True, runs OpenGATE dosimetry simulation in Phase 2.
     run_postprocess : bool, default=False
         If True, runs post-processing in Phase 3 for whichever simulations ran.
-    profile : bool, default=False
-        If True, samples pipeline process-tree CPU/RAM per stage
+    profile_interval_s : float or None, default=None
+        When set to a float (0.1–3.0 s), enables CPU/RAM profiling per stage
         and writes ``profiling_CT_<ct_index>.json`` into the output folder.
-    profile_interval_s : float, default=2.0
-        Sampling interval in seconds used when profiling is enabled.
+        None disables profiling.
     """
 
     def __init__(
@@ -67,41 +69,43 @@ class PyTheraTwinPipeline:
         config_path: str,
         ct_input: str,
         ct_index: int,
-        logging_on: bool = True,
-        save_config: bool = False,
         mode: Literal["DEBUG", "PRODUCTION"] = "PRODUCTION",
+        web_ui: bool = False,
+        run_segmentation: bool = False,
+        run_pbpk: bool = False,
+        run_synthetic_lesions: bool = False,
         run_spect: bool = False,
         run_dosimetry: bool = False,
         run_postprocess: bool = False,
-        launched_via: str = "cli",
         startup_banner_lines: Optional[List[str]] = None,
-        profile: bool = False,
-        profile_interval_s: float = StageProfiler.DEFAULT_INTERVAL_S,
+        profile_interval_s: Optional[float] = None,
     ) -> None:
         self.config_path: str = config_path
         self.ct_input: str = ct_input
         self.ct_index: int = ct_index
         self.current_dir_path: str = os.path.abspath(os.path.dirname(__file__))
 
-        self.logging_on: bool = logging_on
-        self.save_config: bool = save_config
-        self.launched_via: str = launched_via
+        self.launched_via: str = "web_ui" if web_ui else "cli"
         self.mode: Literal["DEBUG", "PRODUCTION"] = mode
+        self.run_segmentation: bool = run_segmentation
+        self.run_pbpk: bool = run_pbpk
+        self.run_synthetic_lesions: bool = run_synthetic_lesions
         self.run_spect: bool = run_spect
         self.run_dosimetry: bool = run_dosimetry
         self.run_postprocess: bool = run_postprocess
         self.startup_banner_lines: List[str] = startup_banner_lines or []
-        self.profile: bool = profile
-        self.profile_interval_s: float = profile_interval_s
+        self.profile: bool = profile_interval_s is not None
+        self.profile_interval_s: float = profile_interval_s if profile_interval_s is not None else StageProfiler.DEFAULT_INTERVAL_S
 
         self.config: Dict[str, Any] = {}
         self.output_folder_path: str = ""
         self.metadata_dir_path: str = ""
-        self.ct_input_type: CTInputType = "dicom"
         self.ct_saved_copy_path: str = ""
         self.ct_input_identity: Dict[str, Any] = {}
-        self.run_synthetic_lesions: bool = False
         self.sub_dir_names: Dict[str, str] = {}
+
+        # Validate CT input before creating any output directories
+        self.ct_input_type: CTInputType = validate_ct_input_path(self.ct_input)
 
         self.logger: logging.Logger = logging.getLogger(f"PyTheraTwin_PIPELINE_CT_{self.ct_index}")
         self.logger.setLevel(logging.DEBUG if self.mode == "DEBUG" else logging.INFO)
@@ -110,20 +114,17 @@ class PyTheraTwinPipeline:
 
         self._config_setup(config_path)
 
-        if self.logging_on:
-            PipelineReporter.configure_file_logger(
-                self.logger,
-                log_path=os.path.join(
-                    self.output_folder_path,
-                    f"logging_file_CT_{self.ct_index}.log",
-                ),
-                startup_banner_lines=self.startup_banner_lines,
-                launched_via=self.launched_via,
-                config_path=self.config_path,
-                output_folder_path=self.output_folder_path,
-            )
-        else:
-            self.logger.disabled = True
+        PipelineReporter.configure_file_logger(
+            self.logger,
+            log_path=os.path.join(
+                self.output_folder_path,
+                f"logging_file_CT_{self.ct_index}.log",
+            ),
+            startup_banner_lines=self.startup_banner_lines,
+            launched_via=self.launched_via,
+            config_path=self.config_path,
+            output_folder_path=self.output_folder_path,
+        )
 
         self.context = Context.from_pipeline_run(
             logger=self.logger,
@@ -144,9 +145,6 @@ class PyTheraTwinPipeline:
             run_postprocess=self.run_postprocess,
         )
         self.logger.debug("Context initialized for CT_%s", self.ct_index)
-
-        if not self.logging_on:
-            self.context._log_enabled = False
 
     def _save_config_copy(self, config_path: str) -> None:
         """Copy the config JSON into the output folder for provenance."""
@@ -184,9 +182,7 @@ class PyTheraTwinPipeline:
         Raises
         ------
         FileNotFoundError
-            If the config file or CT input path does not exist.
-        ValueError
-            If the CT input file is not a supported NIfTI extension.
+            If the config file does not exist.
         """
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Configuration file not found: {config_path}")
@@ -203,16 +199,8 @@ class PyTheraTwinPipeline:
         os.makedirs(self.output_folder_path, exist_ok=True)
         self.metadata_dir_path = str(ensure_metadata_dir(self.output_folder_path))
 
-        self.ct_input_type = validate_ct_input_path(self.ct_input)
-
-        if self.save_config:
-            self._save_config_copy(config_path)
-
+        self._save_config_copy(config_path)
         self._save_ct_scan_copy()
-
-        # Run synthetic lesions automatically when specs are defined in config.
-        lesion_specs = self.config["phase_1"]["synthetic_lesions_stage"].get("specs")
-        self.run_synthetic_lesions = bool(lesion_specs)
 
         # Create phase subdirs
         phases = ["phase_1", "phase_2", "phase_3"]                                     
@@ -313,6 +301,8 @@ class PyTheraTwinPipeline:
             ct_index=self.ct_index,
             ct_input_type=self.ct_input_type,
             output_folder_path=self.output_folder_path,
+            run_segmentation=self.run_segmentation,
+            run_pbpk=self.run_pbpk,
             run_synthetic_lesions=self.run_synthetic_lesions,
             run_spect=self.run_spect,
             run_dosimetry=self.run_dosimetry,
@@ -321,11 +311,11 @@ class PyTheraTwinPipeline:
 
         if self.mode == "DEBUG":
             self.reporter.debug(
-                f"run_spect={self.run_spect} | run_dosimetry={self.run_dosimetry} | run_postprocess={self.run_postprocess}",
+                f"run_segmentation={self.run_segmentation} | run_pbpk={self.run_pbpk} | run_synthetic_lesions={self.run_synthetic_lesions}",
                 "INIT",
             )
             self.reporter.debug(
-                f"synthetic_lesions={self.run_synthetic_lesions}",
+                f"run_spect={self.run_spect} | run_dosimetry={self.run_dosimetry} | run_postprocess={self.run_postprocess}",
                 "INIT",
             )
 
@@ -335,15 +325,20 @@ class PyTheraTwinPipeline:
         logger.info("CT input | path=%s | type=%s", self.ct_input, self.ct_input_type)
 
         # ── Phase 1: Digital Twin & Ground Truth ──────────────────────────────────
-        self.reporter.print_phase_banner(1, "Digital Twin & Ground Truth")
+        if self.run_segmentation or self.run_pbpk or self.run_synthetic_lesions:
+            self.reporter.print_phase_banner(1, "Digital Twin & Ground Truth")
+        else:
+            print("Phase 1: Digital Twin & Ground Truth (skipped — no Phase 1 flags set)")
+            logger.info("Phase 1 skipped: no Phase 1 flags set")
 
-        context = self._run_stage(
-            context,
-            stage_label="Segmentation + ROI Unification",
-            stage_key="segmentation",
-            stage_cls=SegmentationStage,
-            profiler=profiler,
-        )
+        if self.run_segmentation:
+            context = self._run_stage(
+                context,
+                stage_label="Segmentation + ROI Unification",
+                stage_key="segmentation",
+                stage_cls=SegmentationStage,
+                profiler=profiler,
+            )
 
         if self.run_synthetic_lesions:
             context = self._run_stage(
@@ -354,13 +349,14 @@ class PyTheraTwinPipeline:
                 profiler=profiler,
             )
 
-        context = self._run_stage(
-            context,
-            stage_label="PBPK TAC Generation",
-            stage_key="pbpk_tac",
-            stage_cls=PbpkTacStage,
-            profiler=profiler,
-        )
+        if self.run_pbpk:
+            context = self._run_stage(
+                context,
+                stage_label="PBPK TAC Generation",
+                stage_key="pbpk_tac",
+                stage_cls=PbpkTacStage,
+                profiler=profiler,
+            )
 
         # ── Phase 2: Simulations ───────────────────────────────────────────────
         if self.run_spect or self.run_dosimetry:
@@ -444,11 +440,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config_file", required=True, type=str,
                         help="Path to JSON config file.")
 
-    ct_group = parser.add_mutually_exclusive_group(required=True)
-    ct_group.add_argument("--input_ct_dir", type=str,
-                          help="Directory containing CT inputs (NIfTI files or DICOM folders).")
-    ct_group.add_argument("--input_ct", type=str,
-                          help="Direct path to a single CT input (NIfTI file or DICOM directory).")
+    parser.add_argument("--input_ct_dir", required=True, type=str,
+                        help="Directory containing CT inputs (NIfTI files or DICOM folders).")
 
     parser.add_argument(
         "--mode",
@@ -457,74 +450,64 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Pipeline mode. DEBUG keeps more intermediate files. Default: PRODUCTION.",
     )
     parser.add_argument(
-        "--logging_on",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable per-CT log file writing. Default: enabled.",
-    )
-    parser.add_argument(
-        "--ct_index_start",
-        type=int,
-        default=1,
-        help="Starting CT index for output folder naming (e.g. 1 → _CT_1, _CT_2, …). Default: 1.",
-    )
-    parser.add_argument(
-        "--save_config",
-        action=argparse.BooleanOptionalAction,
+        "--segmentation",
+        action="store_true",
         default=False,
-        help="Copy the config JSON into each CT output folder. Default: disabled.",
+        help="Run TotalSegmentator segmentation + ROI unification in Phase 1. Default: disabled.",
+    )
+    parser.add_argument(
+        "--pbpk",
+        action="store_true",
+        default=False,
+        help="Run PBPK TAC generation in Phase 1. Default: disabled.",
+    )
+    parser.add_argument(
+        "--synthetic_lesions",
+        action="store_true",
+        default=False,
+        help="Run synthetic lesion generation in Phase 1 (requires specs in config). Default: disabled.",
     )
     parser.add_argument(
         "--spect",
-        action=argparse.BooleanOptionalAction, 
-        default=False, 
-        help="Run SIMIND SPECT projection simulation in Phase 2. Default: disabled.", 
-    ) 
-    parser.add_argument( 
-        "--dosimetry", 
-        action=argparse.BooleanOptionalAction, 
-        default=False, 
-        help="Run OpenGATE dosimetry simulation in Phase 2. Default: disabled.", 
-    ) 
-    parser.add_argument( 
-        "--postprocess", 
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
+        default=False,
+        help="Run SIMIND SPECT projection simulation in Phase 2. Default: disabled.",
+    )
+    parser.add_argument(
+        "--dosimetry",
+        action="store_true",
+        default=False,
+        help="Run OpenGATE dosimetry simulation in Phase 2. Default: disabled.",
+    )
+    parser.add_argument(
+        "--postprocess",
+        action="store_true",
         default=False,
         help="Run post-processing in Phase 3 for whichever simulations ran. Default: disabled.",
     )
     parser.add_argument(
-        "--launched_via",
-        default="cli",
-        choices=["cli", "web_ui"],
-        help="How the pipeline was invoked — recorded in the log file. Default: cli.",
-    )
-    parser.add_argument(
         "--profile",
-        action=argparse.BooleanOptionalAction,
-        default=False,
+        type=parse_profile_interval_arg,
+        default=None,
+        metavar="INTERVAL_S",
         help=(
-            "Sample pipeline CPU/RAM per stage and write "
-            "profiling_CT_<index>.json into each CT output folder. "
-            "Requires psutil. Default: disabled."
+            "Enable CPU/RAM profiling and write profiling_CT_<index>.json into each CT output folder. "
+            f"Pass the sampling interval in seconds "
+            f"({StageProfiler.MIN_INTERVAL_S}–{StageProfiler.MAX_INTERVAL_S}). "
+            "Requires psutil."
         ),
     )
     parser.add_argument(
-        "--profile_interval_s",
-        type=parse_profile_interval_arg,
-        default=StageProfiler.DEFAULT_INTERVAL_S,
-        help=(
-            "Profiler sampling interval in seconds when --profile is enabled. "
-            f"Range: {StageProfiler.MIN_INTERVAL_S}-{StageProfiler.MAX_INTERVAL_S}. "
-            f"Default: {StageProfiler.DEFAULT_INTERVAL_S}."
-        ),
+        "--web_ui",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
     )
 
     return parser
 def main() -> int:
     """
     CLI entrypoint. Iterates through all CT inputs and runs the pipeline.
-
-    Accepts either --input_ct_dir (directory of CT items) or --input_ct (single CT path).
 
     Returns
     -------
@@ -534,29 +517,21 @@ def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    # Resolve CT input items from either --input_ct or --input_ct_dir.
-    if args.input_ct:
-        ct_path = os.path.abspath(args.input_ct)
-        validate_ct_input_path(ct_path)
-        ct_inputs_dir = os.path.dirname(ct_path)
-        items = [os.path.basename(ct_path)]
-        skipped_items: List[str] = []
-    else:
-        ct_inputs_dir = os.path.abspath(args.input_ct_dir)
-        if not os.path.isdir(ct_inputs_dir):
-            raise NotADirectoryError(f"input_ct_dir must be a directory: {ct_inputs_dir}")
-        items, skipped_items = discover_ct_inputs(ct_inputs_dir)
-        if not items:
-            msg = f"\n[ERROR] No supported CT inputs found in: {ct_inputs_dir}\n"
-            if skipped_items:
-                msg += (
-                    "Ignored unsupported entries: "
-                    + ", ".join(skipped_items[:10])
-                    + (" ..." if len(skipped_items) > 10 else "")
-                    + "\n"
-                )
-            print(msg)
-            return 1
+    ct_inputs_dir = os.path.abspath(args.input_ct_dir)
+    if not os.path.isdir(ct_inputs_dir):
+        raise NotADirectoryError(f"input_ct_dir must be a directory: {ct_inputs_dir}")
+    items, skipped_items = discover_ct_inputs(ct_inputs_dir)
+    if not items:
+        msg = f"\n[ERROR] No supported CT inputs found in: {ct_inputs_dir}\n"
+        if skipped_items:
+            msg += (
+                "Ignored unsupported entries: "
+                + ", ".join(skipped_items[:10])
+                + (" ..." if len(skipped_items) > 10 else "")
+                + "\n"
+            )
+        print(msg)
+        return 1
 
     # Pre-flight: validate config before touching any CT.
     # Inject computed paths first so validation sees the real values.
@@ -584,7 +559,7 @@ def main() -> int:
     )
 
     any_failed = False
-    for idx, name in enumerate(items, start=args.ct_index_start):
+    for idx, name in enumerate(items, start=1):
         ct_path = os.path.join(ct_inputs_dir, name)
         pipeline: Optional[PyTheraTwinPipeline] = None
 
@@ -593,16 +568,16 @@ def main() -> int:
                 config_path=args.config_file,
                 ct_input=ct_path,
                 ct_index=idx,
-                logging_on=args.logging_on,
-                save_config=args.save_config,
                 mode=args.mode,
+                web_ui=args.web_ui,
+                run_segmentation=args.segmentation,
+                run_pbpk=args.pbpk,
+                run_synthetic_lesions=args.synthetic_lesions,
                 run_spect=args.spect,
                 run_dosimetry=args.dosimetry,
                 run_postprocess=args.postprocess,
-                launched_via=args.launched_via,
                 startup_banner_lines=_banner_lines,
-                profile=args.profile,
-                profile_interval_s=args.profile_interval_s,
+                profile_interval_s=args.profile,
             )
             pipeline.run()
         except Exception:
@@ -619,4 +594,3 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-# quick run: python main.py --config_file inputs/my_config.json --input_ct_dir inputs/ct_testing --mode DEBUG --logging_on --save_config --spect --dosimetry --postprocess

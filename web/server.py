@@ -45,7 +45,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.io.config_paths import get_pipeline_input_paths, inject_pipeline_paths, load_pipeline_paths, strip_developer_fields
-from src.io.profiler import validate_profile_interval_s
 from src.io.rerun_fingerprints import flatten_paths
 from src.io.rerun_guard import (
     STAGE_LABELS,
@@ -1409,32 +1408,25 @@ async def start_run(req: RunRequest) -> Dict:
             + "\n".join(summary_lines),
         )
 
-    if req.flags.get("profile", False):
-        try:
-            validate_profile_interval_s(float(req.profile_interval_s))
-        except ValueError:
-            raise HTTPException(
-                400,
-                "profile_interval_s must be between 0.1 and 3.0 seconds when profiling is enabled.",
-            )
-
     flag_map = {
+        "segmentation": "--segmentation",
+        "pbpk": "--pbpk",
+        "synthetic_lesions": "--synthetic_lesions",
         "spect": "--spect",
         "dosimetry": "--dosimetry",
         "postprocess": "--postprocess",
-        "logging_on": "--logging_on",
-        "save_config": "--save_config",
-        "profile": "--profile",
     }
     flag_args: List[str] = []
     for key, cli_flag in flag_map.items():
-        val = req.flags.get(key, False)
-        if val:
+        if req.flags.get(key, False):
             flag_args.append(cli_flag)
-        elif key == "logging_on":
-            flag_args.append("--no-logging_on")
+    if req.flags.get("profile", False):
+        flag_args.extend(["--profile", str(float(req.profile_interval_s))])
 
-    jobs = []
+    # Build one combined temp CT directory with all patients' CTs symlinked in
+    # index order using a numeric prefix so the pipeline's sorted discovery
+    # assigns CT_1, CT_2, … matching the pre-created output directories.
+    tmp_ct_dir = tempfile.mkdtemp(prefix="pytheratwin_ct_")
     for i, patient in enumerate(req.patients, start=1):
         nm = patient["name"]
         out_dir = Path(req.project_dirs.get(nm, ""))
@@ -1453,18 +1445,19 @@ async def start_run(req: RunRequest) -> Dict:
                     f"and no saved copy exists in '{out_dir}'. "
                     "Please re-upload or re-scan the CT directory.",
                 )
+        link_name = f"{i:05d}_{ct_path.name}"
+        os.symlink(str(ct_path), os.path.join(tmp_ct_dir, link_name))
 
-        cmd = [
-            sys.executable, "-u", str(MAIN_PY),
-            "--config_file", str(out_dir / "config.json"),
-            "--input_ct", str(ct_path),
-            "--mode", req.mode,
-            "--ct_index_start", str(i),
-            "--launched_via", "web_ui",
-        ] + flag_args
-        if req.flags.get("profile", False):
-            cmd.extend(["--profile_interval_s", str(float(req.profile_interval_s))])
-        jobs.append({"cmd": cmd, "patient_name": nm})
+    first_nm = req.patients[0]["name"]
+    first_out_dir = Path(req.project_dirs.get(first_nm, ""))
+    cmd = [
+        sys.executable, "-u", str(MAIN_PY),
+        "--config_file", str(first_out_dir / "config.json"),
+        "--input_ct_dir", tmp_ct_dir,
+        "--mode", req.mode,
+        "--web_ui",
+    ] + flag_args
+    jobs = [{"cmd": cmd, "patient_name": "all", "tmp_ct_dir": tmp_ct_dir}]
 
     _PENDING_FILE.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
     asyncio.create_task(_shutdown_after_delay())
