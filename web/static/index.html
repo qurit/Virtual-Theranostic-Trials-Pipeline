@@ -53,17 +53,23 @@ const STAGE_LABELS = {
   num_threads:'OpenGATE Threads',
 };
 const CLI_FLAGS = [
-  {key:'spect',      label:'SPECT Simulation', desc:'Run SIMIND Monte Carlo SPECT projection simulation (Phase 2)'},
-  {key:'dosimetry',  label:'Dosimetry',         desc:'Run OpenGATE Monte Carlo absorbed-dose simulation (Phase 2)'},
-  {key:'postprocess',label:'Post-Processing',   desc:'Apply TAC weighting, Poisson noise, OSEM reconstruction (Phase 3)'},
-  {key:'logging_on', label:'Logging',           desc:"Write a detailed pipeline log file to each patient's output directory"},
-  {key:'profile',    label:'Profiling',         desc:'Sample per-stage pipeline CPU, RAM, and system CPU and save profiling_CT_<index>.json in each patient output folder'},
+  {key:'segmentation',      label:'Segmentation',        desc:'Run TotalSegmentator organ segmentation + ROI unification (Phase 1)'},
+  {key:'pbpk',              label:'PBPK',                desc:'Run PBPK pharmacokinetic TAC generation (Phase 1)'},
+  {key:'synthetic_lesions', label:'Synthetic Lesions',   desc:'Run synthetic lesion insertion (Phase 1 — requires specs in config)'},
+  {key:'spect',             label:'SPECT Simulation',    desc:'Run SIMIND Monte Carlo SPECT projection simulation (Phase 2)'},
+  {key:'dosimetry',         label:'Dosimetry',           desc:'Run OpenGATE Monte Carlo absorbed-dose simulation (Phase 2)'},
+  {key:'postprocess',       label:'Post-Processing',     desc:'Apply TAC weighting, Poisson noise, OSEM reconstruction (Phase 3)'},
+  {key:'logging_on',        label:'Logging',             desc:"Write a detailed pipeline log file to each patient's output directory"},
+  {key:'profile',           label:'Profiling',           desc:'Sample per-stage pipeline CPU, RAM, and system CPU and save profiling_CT_<index>.json in each patient output folder'},
 ];
 const PROFILE_INTERVAL_OPTIONS = [0.1,0.2,0.5,1.0,2.0,3.0];
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
 const RESERVED_ROIS = new Set(['background','remaining_body','synthetic_lesion']);
 // Maps each stage key to the flag that gates it (stage hidden + cleared when flag is OFF)
 const STAGE_FLAG_MAP = {
+  segmentation_stage:        'segmentation',
+  synthetic_lesions_stage:   'synthetic_lesions',
+  pbpk_tac_stage:            'pbpk',
   simind_stage:              'spect',
   opengate_stage:            'dosimetry',
   spect_postprocess_stage:   'postprocess',
@@ -1700,10 +1706,12 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir}){
         {projectDir&&<span className="text-[10px] terminal-font text-slate-400 truncate max-w-xs">{projectDir}</span>}
       </div>
       <div className="flex flex-wrap gap-1.5 mb-4">
+        {flags.segmentation&&<Badge label="Segmentation" color="teal"/>}
+        {flags.pbpk&&<Badge label="PBPK" color="teal"/>}
+        {flags.synthetic_lesions&&<Badge label="Synthetic Lesions" color="orange"/>}
         {flags.spect&&<Badge label="SPECT Simulation" color="blue"/>}
         {flags.dosimetry&&<Badge label="Dosimetry" color="purple"/>}
         {flags.postprocess&&<Badge label="Post-Processing" color="teal"/>}
-        {synth?.specs&&Object.keys(synth.specs).length>0&&<Badge label="Synthetic Lesions" color="orange"/>}
       </div>
 
       {tac&&(
@@ -1784,9 +1792,11 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
         const reserved=roi.filter(r=>RESERVED_ROIS.has(r));
         if(reserved.length)
           issues.push(`[${p.name}] ${stageName} contains internal ROI(s): ${reserved.join(', ')}. The pipeline adds internal sources automatically.`);
-        const missingP1=roi.filter(r=>!p1Set.has(r)&&!RESERVED_ROIS.has(r));
-        if(missingP1.length)
-          issues.push(`[${p.name}] ${stageName} ROI(s) not selected in Phase 1: ${missingP1.join(', ')}`);
+        if(flags.segmentation){
+          const missingP1=roi.filter(r=>!p1Set.has(r)&&!RESERVED_ROIS.has(r));
+          if(missingP1.length)
+            issues.push(`[${p.name}] ${stageName} ROI(s) not selected in Phase 1: ${missingP1.join(', ')}`);
+        }
         if(lesionRois.length===0) return;
         const picked=lesionRois.filter(r=>roi.includes(r));
         const missing=lesionRois.filter(r=>!roi.includes(r));
@@ -1993,7 +2003,7 @@ function App(){
   const [projectDirs,setProjectDirs]=useState({});
   const [patientConfigs,setPatientConfigs]=useState({});
   const [mode,setMode]=useState('PRODUCTION');
-  const [flags,setFlags]=useState({spect:true,dosimetry:true,postprocess:true,logging_on:true,profile:false});
+  const [flags,setFlags]=useState({segmentation:false,pbpk:false,synthetic_lesions:false,spect:true,dosimetry:true,postprocess:true,logging_on:true,profile:false});
   const [profileIntervalS,setProfileIntervalS]=useState(2.0);
   const [systemCpuCount,setSystemCpuCount]=useState(null);
 

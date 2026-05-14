@@ -263,6 +263,37 @@ This makes the profiler suitable for parameter sweeps where you want to compare 
 
 ---
 
+## ROI Configuration
+
+The pipeline uses two data files to manage regions of interest:
+
+| File | Purpose |
+|------|---------|
+| `pipeline_roi_naming_map.json` | Complete technical definition of every PyTheraTwin ROI — label IDs, TotalSegmentator task/label mappings, PBPK VOI names, UI categories, and parent/child group relationships. Update this file when changing the underlying segmentor or PBPK model. |
+| `pipeline_options.json` | Developer-curated user-selectable subset. The web UI and config validator both derive available choices from this file. Remove an entry here to disable an option without touching the label map. |
+
+### Parent/child ROI groups
+
+Some ROIs in `pipeline_roi_naming_map.json` are marked with a `parent_group` field. These are individual anatomical sub-structures whose TotalSegmentator labels are fully covered by the named parent ROI. The parent is the user-selectable entry; children are retained in `PyTheraTwin_allowed_rois` so a developer can re-enable them individually via `pipeline_options.json` if needed.
+
+| Parent (selectable) | Children (grouped under parent) |
+|---------------------|---------------------------------|
+| `bone` | `spine`, `skull`, `ribs`, `humerus`, `scapula`, `clavicula`, `femur`, `hip` |
+| `muscle` | `gluteus_maximus`, `gluteus_medius`, `gluteus_minimus`, `autochthon`, `iliopsoas` |
+| `gi_tract` | `stomach`, `small_bowel`, `duodenum`, `colon` |
+
+### Bilateral TotalSegmentator labels vs PyTheraTwin ROIs
+
+`parent_group` is a **PyTheraTwin ROI-level** concept. It is distinct from TotalSegmentator's bilateral label convention, where many structures are segmented as left/right pairs and then merged into a single PyTheraTwin ROI (e.g. `kidney` combines `kidney_left` + `kidney_right`; `nasal_cavity` combines `nasal_cavity_right` + `nasal_cavity_left`). These bilateral labels are `totseg_rois` implementation details — they do not get their own PyTheraTwin label ID or `PyTheraTwin_to_totseg` entry, and `parent_group` does not apply to them.
+
+`parent_group` only applies where both the parent **and** the child have their own `PyTheraTwin_Pipeline` label ID and `PyTheraTwin_to_totseg` entry.
+
+### PBPK model changes
+
+The `pbpk_voi` field is independent of `parent_group`. When the active PBPK model no longer provides a dedicated observable for a ROI, set `pbpk_voi` to `null` on that entry in `pipeline_roi_naming_map.json`. This demotes the ROI from simulation-eligible to anatomy-only without any other changes required.
+
+---
+
 ## Source Layout
 
 ```
@@ -304,9 +335,17 @@ src/
 
   data/
     isotope_config.json             <- Isotope data: half-lives, attenuation coefficients, nuclear params
-    pipeline_roi_naming_map.json    <- Full ROI definition table: PyTheraTwin label IDs, TotalSegmentator task mappings, PBPK VOI names, PBPK observables, UI categories
+    pipeline_roi_naming_map.json    <- Complete ROI definition table: PyTheraTwin label IDs, TotalSegmentator
+                                       task/label mappings, PBPK VOI names, PBPK observables, UI categories,
+                                       and parent_group relationships (bone/muscle/gi_tract hierarchies).
+                                       Updated when the underlying segmentor or PBPK model changes.
     pipeline_paths.json             <- Developer-facing path configuration (SIMIND dir, output root)
-    pipeline_options.json           <- Stage defaults and UI option lists
+    pipeline_options.json           <- User-selectable ROI subset and stage option lists (dropdowns).
+                                       Narrows pipeline_roi_naming_map.json to what is exposed in the
+                                       web UI and accepted by config validation. Remove an entry here to
+                                       disable an option without editing the underlying label map.
+                                       ROIs with a parent_group must be selected as a unit via their
+                                       parent (e.g. select "bone" not individual "spine" or "ribs").
     smc.smc / scattwin.win          <- SIMIND template files
     jaszak.smc                      <- SIMIND Jaszczak calibration template
 ```

@@ -119,6 +119,7 @@ class SegmentationStage:
         self.head_glands_cavities_ml_path: Optional[str] = None
         self.total_ml_path: Optional[str] = None
         self.metadata_path: str = stage_metadata_path(context.output_folder_path, "segmentation_stage")
+        self.unification_overlap_counts: List[Dict[str, Any]] = []
 
         # Phase handoff: overwritten by every run so downstream stages always have a clean path. 
         self.final_output_path: str = os.path.join(self.phase_output_dir, "digital_twin.nii.gz") 
@@ -143,6 +144,9 @@ class SegmentationStage:
         self.pytheratwin_name2id: Dict[str, int] = {
             name: int(lab) for lab, name in ts_map_json["PyTheraTwin_Pipeline"].items()
         }
+        self.pytheratwin_id2name: Dict[int, str] = {
+            lab: name for name, lab in self.pytheratwin_name2id.items()
+        }
         # PyTheraTwin_allowed_rois and PyTheraTwin_to_totseg live in pipeline_roi_naming_map.json — loaded
         # here so the stage has no hardcoded ROI or TotalSegmentator coupling.
         self.pytheratwin_allowed_rois: set = set(ts_map_json["PyTheraTwin_allowed_rois"])
@@ -161,6 +165,35 @@ class SegmentationStage:
     # ------------------------------------------------------------------
     # helpers — segmentation
     # ------------------------------------------------------------------
+
+    def _roi_paint_priority(
+        self,
+        entry: Dict[str, Any],
+        requested_index: int,
+    ) -> Tuple[int, int, int]:
+        """
+        Return the deterministic paint priority for ROI unification.
+
+        TotalSegmentator tasks are independent label spaces, so tiny voxel
+        overlaps can occur between broad ``total`` labels (for example skull)
+        and more specific head-cavity labels.  Painting broad labels first and
+        specific head labels later keeps "select all" usable while preserving a
+        single-label output volume.
+        """
+        task_priority = {
+            "body": 0,
+            "total": 10,
+            "head_glands_cavities": 20,
+            "synthetic": 30,
+        }.get(str(entry.get("task", "")), 10)
+        category_priority = {
+            "organs": 10,
+            "vessels": 20,
+            "muscles": 30,
+            "bones": 40,
+            "head": 50,
+        }.get(str(entry.get("ui_category", "")), 0)
+        return (task_priority, category_priority, requested_index)
 
     def _standardize_ct_to_nifti(self) -> None:
         """
@@ -334,14 +367,29 @@ class SegmentationStage:
                 f"Shape mismatch body vs head: {body_seg.shape} vs {head_seg.shape}"
             )
 
-        assigned_voxels = roi_unified > self.pytheratwin_name2id["remaining_body"]
-        for pytheratwin_roi in plan["pytheratwin_roi_subset"]:
+        paint_queue: List[Tuple[Tuple[int, int, int], str, int, Dict[str, Any]]] = []
+        for requested_index, pytheratwin_roi in enumerate(plan["pytheratwin_roi_subset"]):
             entry = self.pytheratwin_to_totseg.get(pytheratwin_roi)
             if not entry:
                 continue
             pytheratwin_label = self.pytheratwin_name2id.get(pytheratwin_roi)
             if pytheratwin_label is None:
                 continue
+            paint_queue.append(
+                (
+                    self._roi_paint_priority(entry, requested_index),
+                    pytheratwin_roi,
+                    pytheratwin_label,
+                    entry,
+                )
+            )
+
+        self.unification_overlap_counts = []
+        assigned_voxels = roi_unified > self.pytheratwin_name2id["remaining_body"]
+        for _, pytheratwin_roi, pytheratwin_label, entry in sorted(
+            paint_queue,
+            key=lambda item: item[0],
+        ):
             task = entry["task"]
             totseg_rois = entry["totseg_rois"]
 
@@ -357,10 +405,23 @@ class SegmentationStage:
 
             overlap = new_mask & assigned_voxels
             if overlap.any():
-                raise AssertionError(
-                    f"ROI '{pytheratwin_roi}' overlaps with previously assigned voxels in the unified label map. "
-                    "Check PyTheraTwin_to_totseg for duplicate totseg_rois entries across ROIs."
-                )
+                existing_labels, counts = np.unique(roi_unified[overlap], return_counts=True)
+                overwritten = {
+                    self.pytheratwin_id2name.get(int(label), str(int(label))): int(count)
+                    for label, count in zip(existing_labels, counts)
+                }
+                record = {
+                    "roi": pytheratwin_roi,
+                    "voxels": int(overlap.sum()),
+                    "overwritten_labels": overwritten,
+                }
+                self.unification_overlap_counts.append(record)
+                if self.debug:
+                    print(
+                        "[SegmentationStage] Resolved ROI overlap by priority: "
+                        f"{pytheratwin_roi} overwrote {overwritten} "
+                        f"({record['voxels']} voxels)."
+                    )
             roi_unified[new_mask] = pytheratwin_label
             assigned_voxels |= new_mask
 
@@ -407,6 +468,13 @@ class SegmentationStage:
             "stage_output_path": self.stage_output_path,                               
             "final_output_path": self.final_output_path,                               
             "plan": dict(plan),                                                        
+            "overlap_resolution": {
+                "policy": (
+                    "Paint broad TotalSegmentator total-task ROIs first, then paint "
+                    "head_glands_cavities ROIs over any shared voxels."
+                ),
+                "overlaps": list(self.unification_overlap_counts),
+            },
         }                                                                              
         with open(self.unification_metadata_path, "w", encoding="utf-8") as f:
             json.dump(unification_metadata, f, indent=4)

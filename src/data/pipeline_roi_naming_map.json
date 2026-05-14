@@ -53,6 +53,16 @@
 //   Internal labels:
 //     remaining_body -> Rest
 //     synthetic_lesion -> Tumor1
+// parent_group: when present, this ROI's totseg_rois are a proper subset of the named
+//   parent ROI. The parent is the user-selectable entry; this child entry is kept in
+//   PyTheraTwin_allowed_rois so a developer can re-enable it via pipeline_options.json.
+//   parent_group only applies at the PyTheraTwin ROI level — both parent and child must
+//   have their own entry in PyTheraTwin_to_totseg and their own ID in PyTheraTwin_Pipeline.
+//   Do not confuse with bilateral TotalSegmentator label merges (e.g. kidney combines
+//   kidney_left + kidney_right from the segmentor): those are totseg_rois implementation
+//   details, not separate PyTheraTwin ROIs, and have no parent_group entry.
+//   Likewise, the pbpk_voi field is independent of parent_group: set pbpk_voi to null
+//   on any ROI when the active PBPK model no longer provides a dedicated observable for it.
 // ui_category: grouping used in the web UI panel for each TotalSegmentator task.
 
 {
@@ -262,6 +272,10 @@
         "58": "bone",
         "59": "muscle"
     },
+    // All technically supported config ROI names. The default user-selectable
+    // subset shown in the web UI is curated in src/data/pipeline_options.json
+    // under "roi_subset" so developers can hide options without deleting these
+    // source label definitions.
     "PyTheraTwin_allowed_rois": [
         // -- total task: organs --
         "kidney", "liver", "prostate", "spleen", "heart", "lungs",
@@ -363,6 +377,7 @@
             "task": "total",
             "totseg_rois": ["stomach"],
             "pbpk_voi": null,
+            "parent_group": "gi_tract",
             "ui_category": "organs"
         },
         "pancreas": {
@@ -387,18 +402,21 @@
             "task": "total",
             "totseg_rois": ["small_bowel"],
             "pbpk_voi": null,
+            "parent_group": "gi_tract",
             "ui_category": "organs"
         },
         "duodenum": {
             "task": "total",
             "totseg_rois": ["duodenum"],
             "pbpk_voi": null,
+            "parent_group": "gi_tract",
             "ui_category": "organs"
         },
         "colon": {
             "task": "total",
             "totseg_rois": ["colon"],
             "pbpk_voi": null,
+            "parent_group": "gi_tract",
             "ui_category": "organs"
         },
         "urinary_bladder": {
@@ -455,12 +473,14 @@
                 "vertebrae_C3", "vertebrae_C2", "vertebrae_C1"
             ],
             "pbpk_voi": null,
+            "parent_group": "bone",
             "ui_category": "bones"
         },
         "skull": {
             "task": "total",
             "totseg_rois": ["skull"],
             "pbpk_voi": null,
+            "parent_group": "bone",
             "ui_category": "bones"
         },
         "ribs": {
@@ -475,6 +495,7 @@
                 "sternum", "costal_cartilages"
             ],
             "pbpk_voi": null,
+            "parent_group": "bone",
             "ui_category": "bones"
         },
         "spinal_cord": {
@@ -487,30 +508,35 @@
             "task": "total",
             "totseg_rois": ["humerus_left", "humerus_right"],
             "pbpk_voi": null,
+            "parent_group": "bone",
             "ui_category": "bones"
         },
         "scapula": {
             "task": "total",
             "totseg_rois": ["scapula_left", "scapula_right"],
             "pbpk_voi": null,
+            "parent_group": "bone",
             "ui_category": "bones"
         },
         "clavicula": {
             "task": "total",
             "totseg_rois": ["clavicula_left", "clavicula_right"],
             "pbpk_voi": null,
+            "parent_group": "bone",
             "ui_category": "bones"
         },
         "femur": {
             "task": "total",
             "totseg_rois": ["femur_left", "femur_right"],
             "pbpk_voi": null,
+            "parent_group": "bone",
             "ui_category": "bones"
         },
         "hip": {
             "task": "total",
             "totseg_rois": ["hip_left", "hip_right"],
             "pbpk_voi": null,
+            "parent_group": "bone",
             "ui_category": "bones"
         },
         // ── VESSELS ────────────────────────────────────────────────────────────────
@@ -595,30 +621,35 @@
             "task": "total",
             "totseg_rois": ["gluteus_maximus_left", "gluteus_maximus_right"],
             "pbpk_voi": null,
+            "parent_group": "muscle",
             "ui_category": "muscles"
         },
         "gluteus_medius": {
             "task": "total",
             "totseg_rois": ["gluteus_medius_left", "gluteus_medius_right"],
             "pbpk_voi": null,
+            "parent_group": "muscle",
             "ui_category": "muscles"
         },
         "gluteus_minimus": {
             "task": "total",
             "totseg_rois": ["gluteus_minimus_left", "gluteus_minimus_right"],
             "pbpk_voi": null,
+            "parent_group": "muscle",
             "ui_category": "muscles"
         },
         "autochthon": {
             "task": "total",
             "totseg_rois": ["autochthon_left", "autochthon_right"],
             "pbpk_voi": null,
+            "parent_group": "muscle",
             "ui_category": "muscles"
         },
         "iliopsoas": {
             "task": "total",
             "totseg_rois": ["iliopsoas_left", "iliopsoas_right"],
             "pbpk_voi": null,
+            "parent_group": "muscle",
             "ui_category": "muscles"
         },
         // ── HEAD GLANDS & CAVITIES ─────────────────────────────────────────────────

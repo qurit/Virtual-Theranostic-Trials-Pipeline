@@ -223,8 +223,8 @@ class PipelineReporter:
 
         add("  Phase 1  -  Digital Twin & Ground Truth")
 
+        roi_list = seg_cfg.get("roi_subset", [])
         if run_segmentation:
-            roi_list = seg_cfg.get("roi_subset", [])
             roi_str = ", ".join(roi_list) if roi_list else "-"
             add(f"    Segmentation : {roi_str}")
         else:

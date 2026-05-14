@@ -16,6 +16,34 @@
   // PHASE 1 — Digital Twin & Ground Truth
   // ==========================================================================
 
+  // ── phase_1.segmentation_stage ─────────────────────────────────────────────
+  // Developer-curated user-selectable PyTheraTwin ROIs.
+  //
+  // The full technical ROI definitions live in pipeline_roi_naming_map.json.
+  // This list is the user-facing subset: config validation and the web UI both
+  // derive available choices from it. Remove an entry here to hide/disable an
+  // ROI without touching the underlying label map.
+  //
+  // ROIs marked with parent_group in pipeline_roi_naming_map.json are child
+  // components of a grouped parent (e.g. "bone" covers spine, skull, ribs,
+  // humerus, scapula, clavicula, femur, hip; "muscle" covers the gluteal and
+  // iliopsoas groups; "gi_tract" covers stomach, small_bowel, duodenum, colon).
+  // Do not list a parent and any of its children simultaneously.
+  "roi_subset": [
+    "kidney", "liver", "prostate", "spleen", "heart", "salivary_glands",
+    "lungs", "brain", "adrenal_glands", "thyroid_gland", "gallbladder",
+    "gi_tract", "pancreas", "esophagus", "trachea", "urinary_bladder",
+    "kidney_cyst",
+    "bone", "spinal_cord",
+    "aorta", "pulmonary_vein", "brachiocephalic_vessels",
+    "carotid_arteries", "portal_vein", "iliac_arteries", "iliac_veins",
+    "atrial_appendage", "superior_vena_cava", "inferior_vena_cava",
+    "muscle",
+    "eyes", "eye_lenses", "optic_nerves",
+    "nasopharynx", "oropharynx", "hypopharynx", "nasal_cavity",
+    "auditory_canal", "soft_palate", "hard_palate"
+  ],
+
   // ── phase_1.pbpk_tac_stage ─────────────────────────────────────────────────
   // Pharmacokinetic model type (PyCNO).  Extend when new tumour-biology models
   // are added to the PyCNO library.

@@ -11,7 +11,8 @@
     "segmentation_stage": {
 
       // Organs to segment and carry into all downstream stages.
-      // Valid names: see "PyTheraTwin_allowed_rois" in src/data/pipeline_roi_naming_map.json.
+      // Valid names: see "roi_subset" in src/data/pipeline_options.json.
+      // Full technical ROI definitions live in src/data/pipeline_roi_naming_map.json.
       // Reserved labels (background, remaining_body, synthetic_lesion) must NOT appear here.
       // Every ROI used in simulation or lesion specs must be listed here.
       "roi_subset": ["kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"]

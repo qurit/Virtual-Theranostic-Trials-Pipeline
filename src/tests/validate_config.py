@@ -10,9 +10,10 @@ Checks performed
 ----------------
 - ``output_folder_title``      — non-empty string
 - ``label_map_path``           — loaded from ``pipeline_paths.json`` and must exist
-- ``roi_subset`` (seg.)        — non-empty list of recognised PyTheraTwin ROI names
-                                 (validated against ``PyTheraTwin_allowed_rois`` in
-                                 ``pipeline_roi_naming_map.json``)
+- ``roi_subset`` (seg.)        — non-empty list of recognised and enabled
+                                 PyTheraTwin ROI names (defined in
+                                 ``pipeline_roi_naming_map.json`` and curated by
+                                 ``pipeline_options.json``)
 - ``pbpk_tac_stage.isotope``   — string; must be in pipeline_options.json allowed list
 - PBPK VOIs                   — loaded from the configured ROI metadata map
 - Synthetic-lesion specs       — validated when ``phase_1.synthetic_lesions_stage.specs``
@@ -166,9 +167,13 @@ def validate_config(
     errors: List[str] = []
     _allowed = _load_allowed_options(repo_root)
 
-    # Load ROI map for validation (allowed ROI names + PBPK-compatible subset)
+    # Load ROI map for validation (supported ROI names + PBPK-compatible subset).
+    # pipeline_options.json may further narrow the user-selectable ROI list.
     _roi_map = _load_roi_map(repo_root, config)
     _pytheratwin_allowed_rois: Set[str] = set(_roi_map.get("PyTheraTwin_allowed_rois", [])) if _roi_map else set()
+    _pytheratwin_selectable_rois: Set[str] = {
+        roi for roi in _allowed.get("roi_subset", []) if isinstance(roi, str)
+    }
     _label_map_path = get_pipeline_input_paths(repo_root).get("label_map_path")
     try:
         _pbpk_compatible: Set[str] = load_pbpk_compatible_rois(_label_map_path)
@@ -185,6 +190,14 @@ def validate_config(
             "Could not read pipeline ROI metadata map. Check "
             "'input_paths.label_map_path' in src/data/pipeline_paths.json."
         )
+    elif _pytheratwin_selectable_rois:
+        invalid_selectable_rois = sorted(_pytheratwin_selectable_rois - _pytheratwin_allowed_rois)
+        if invalid_selectable_rois:
+            _err(
+                "src/data/pipeline_options.json roi_subset contains ROI(s) that are not "
+                "defined in pipeline_roi_naming_map.json PyTheraTwin_allowed_rois: "
+                f"{invalid_selectable_rois}"
+            )
 
     def _check_number(val: Any, field: str) -> None:
         """Append an error if *val* is not a genuine number (bools excluded)."""
@@ -490,6 +503,24 @@ def validate_config(
                     f"a recognised PyTheraTwin ROI name. See src/data/pipeline_roi_naming_map.json "
                     f"PyTheraTwin_allowed_rois for the full list."
                 )
+            elif _pytheratwin_selectable_rois and r not in _pytheratwin_selectable_rois:
+                parent = (
+                    _roi_map.get("PyTheraTwin_to_totseg", {}).get(r, {}).get("parent_group")
+                    if _roi_map else None
+                )
+                if parent:
+                    _err(
+                        f"'phase_1.segmentation_stage.roi_subset[{i}]' value {r!r} is a "
+                        f"component of '{parent}', which is the user-selectable grouped ROI. "
+                        f"Select '{parent}' to include all its structures as a unit, or add "
+                        f"{r!r} to src/data/pipeline_options.json roi_subset to enable it individually."
+                    )
+                else:
+                    _err(
+                        f"'phase_1.segmentation_stage.roi_subset[{i}]' value {r!r} is defined "
+                        "in the ROI map but is not enabled for user selection. Add it to "
+                        "src/data/pipeline_options.json roi_subset, or remove it from this config."
+                    )
         _check_no_overlapping_totseg_sources(roi_subset, "phase_1.segmentation_stage.roi_subset")
     # Guard downstream cross-checks if roi_subset is malformed
     if not isinstance(roi_subset, list):

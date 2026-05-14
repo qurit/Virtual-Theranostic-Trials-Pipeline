@@ -224,18 +224,53 @@ async def get_config_template() -> Dict:
     roi_pbpk_voi: Dict[str, Optional[str]] = {}
     roi_overlaps: Dict[str, List[str]] = {}
 
+    # Load pipeline options (dropdowns + curated ROI choices) — supports JSONC
+    # comments via json_minify.
+    pipeline_options: Dict = {}
+    try:
+        pipeline_options = json.loads(json_minify(PIPELINE_OPTIONS.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+
     try:
         label_map_path = Path(get_pipeline_input_paths(REPO_ROOT)["label_map_path"])
         roi_map = json.loads(json_minify(label_map_path.read_text(encoding="utf-8")))
+        pytheratwin_to_totseg = roi_map.get("PyTheraTwin_to_totseg", {})
 
-        # Flat list for backward-compat (all user-selectable ROIs)
-        roi_choices = [
-            name for name in roi_map.get("PyTheraTwin_Pipeline", {}).values()
-            if name not in _RESERVED
+        # pipeline_roi_naming_map.json defines every supported technical ROI.
+        # pipeline_options.json narrows that to the curated user-selectable set.
+        supported_rois = [
+            str(name) for name in roi_map.get("PyTheraTwin_allowed_rois", [])
+            if str(name) not in _RESERVED and str(name) in pytheratwin_to_totseg
         ]
+        if not supported_rois:
+            supported_rois = [
+                str(name) for name in roi_map.get("PyTheraTwin_Pipeline", {}).values()
+                if str(name) not in _RESERVED and str(name) in pytheratwin_to_totseg
+            ]
+        supported_set = set(supported_rois)
+
+        configured_rois = pipeline_options.get("roi_subset")
+        if isinstance(configured_rois, list) and configured_rois:
+            invalid_rois = [
+                roi for roi in configured_rois
+                if not isinstance(roi, str) or roi not in supported_set
+            ]
+            if invalid_rois:
+                raise ValueError(
+                    "pipeline_options.json roi_subset contains unknown ROI(s): "
+                    f"{invalid_rois}. Each entry must exist in PyTheraTwin_allowed_rois."
+                )
+            seen_rois = set()
+            roi_choices = []
+            for roi in configured_rois:
+                if roi not in seen_rois:
+                    roi_choices.append(roi)
+                    seen_rois.add(roi)
+        else:
+            roi_choices = supported_rois
 
         # Structured by TotalSegmentator task + ui_category for the task-based UI
-        pytheratwin_to_totseg = roi_map.get("PyTheraTwin_to_totseg", {})
         for roi_name, entry in pytheratwin_to_totseg.items():
             if roi_name in _RESERVED or roi_name not in roi_choices:
                 continue
@@ -250,7 +285,7 @@ async def get_config_template() -> Dict:
         # ROIs with a dedicated non-null PBPK VOI (simulation-eligible)
         pbpk_compatible_rois = [
             roi for roi, entry in pytheratwin_to_totseg.items()
-            if roi not in _RESERVED and entry.get("pbpk_voi") not in (None, "Rest")
+            if roi in roi_choices and entry.get("pbpk_voi") not in (None, "Rest")
         ]
 
         # ROI groups that share TotalSegmentator source labels are mutually exclusive
@@ -276,13 +311,6 @@ async def get_config_template() -> Dict:
             "Could not load ROI metadata from input_paths.label_map_path in "
             f"src/data/pipeline_paths.json: {e}",
         )
-
-    # Load pipeline options (dropdowns) — supports JSONC comments via json_minify
-    pipeline_options: Dict = {}
-    try:
-        pipeline_options = json.loads(json_minify(PIPELINE_OPTIONS.read_text(encoding="utf-8")))
-    except Exception:
-        pass
 
     # Add PascalCase / config-key aliases so the frontend can look up options
     # directly by the field name as it appears in config_template.json.

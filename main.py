@@ -152,7 +152,8 @@ class PyTheraTwinPipeline:
     def _save_config_copy(self, config_path: str) -> None:
         """Copy the config JSON into the output folder for provenance."""
         dst = os.path.join(self.output_folder_path, "config.json")
-        shutil.copy2(config_path, dst)
+        if os.path.abspath(config_path) != os.path.abspath(dst):
+            shutil.copy2(config_path, dst)
 
     def _save_ct_scan_copy(self) -> None: 
         """Copy the CT input into the output folder for provenance/debugging."""
@@ -360,6 +361,16 @@ class PyTheraTwinPipeline:
                 stage_cls=PbpkTacStage,
                 profiler=profiler,
             )
+
+        # ── Phase 1 → Phase 2 handoff ─────────────────────────────────────────
+        # If segmentation was skipped, resolve the Phase 1 outputs from disk so
+        # Phase 2 stages can find them (they were produced by a prior run).
+        if (self.run_spect or self.run_dosimetry) and not self.run_segmentation:
+            phase1_dir = context.subdir_paths["phase_1"]
+            if context.ct_nii_path is None:
+                context.ct_nii_path = os.path.join(phase1_dir, "ct.nii.gz")
+            if context.pytheratwin_roi_seg_path is None:
+                context.pytheratwin_roi_seg_path = os.path.join(phase1_dir, "digital_twin.nii.gz")
 
         # ── Phase 2: Simulations ───────────────────────────────────────────────
         if self.run_spect or self.run_dosimetry:
