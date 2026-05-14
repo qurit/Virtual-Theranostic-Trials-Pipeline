@@ -9,7 +9,8 @@
   <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone@7.27.1/babel.min.js"></script>
   <style>
-    body { background: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
+    body { background-color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
+    body::before { content: ''; position: fixed; inset: -6px; background-image: url('/static/backgrounds/background.png'); background-size: cover; background-position: center; filter: blur(2px); z-index: -1; }
     .terminal-font { font-family: 'JetBrains Mono','Fira Code','Cascadia Code','Consolas',monospace; }
     .spin { animation: spin 1s linear infinite; display: inline-block; }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -52,15 +53,23 @@ const STAGE_LABELS = {
   num_cpu:'CPU Cores',
   num_threads:'OpenGATE Threads',
 };
-const CLI_FLAGS = [
-  {key:'segmentation',      label:'Segmentation',        desc:'Run TotalSegmentator organ segmentation + ROI unification (Phase 1)'},
-  {key:'pbpk',              label:'PBPK',                desc:'Run PBPK pharmacokinetic TAC generation (Phase 1)'},
-  {key:'synthetic_lesions', label:'Synthetic Lesions',   desc:'Run synthetic lesion insertion (Phase 1 — requires specs in config)'},
-  {key:'spect',             label:'SPECT Simulation',    desc:'Run SIMIND Monte Carlo SPECT projection simulation (Phase 2)'},
-  {key:'dosimetry',         label:'Dosimetry',           desc:'Run OpenGATE Monte Carlo absorbed-dose simulation (Phase 2)'},
-  {key:'postprocess',       label:'Post-Processing',     desc:'Apply TAC weighting, Poisson noise, OSEM reconstruction (Phase 3)'},
-  {key:'logging_on',        label:'Logging',             desc:"Write a detailed pipeline log file to each patient's output directory"},
-  {key:'profile',           label:'Profiling',           desc:'Sample per-stage pipeline CPU, RAM, and system CPU and save profiling_CT_<index>.json in each patient output folder'},
+const FLAG_GROUPS = [
+  {phase:'Phase 1 — Digital Twin & Ground Truth',items:[
+    {key:'segmentation',      label:'Segmentation',      desc:'Run TotalSegmentator organ segmentation + ROI unification'},
+    {key:'pbpk',              label:'PBPK',              desc:'Run PBPK pharmacokinetic TAC generation'},
+    {key:'synthetic_lesions', label:'Synthetic Lesions', desc:'Run synthetic lesion insertion (requires specs in config)'},
+  ]},
+  {phase:'Phase 2 — Simulations',items:[
+    {key:'spect',     label:'SPECT Simulation', desc:'Run SIMIND Monte Carlo SPECT projection simulation'},
+    {key:'dosimetry', label:'Dosimetry',        desc:'Run OpenGATE Monte Carlo absorbed-dose simulation'},
+  ]},
+  {phase:'Phase 3 — Post-Processing',items:[
+    {key:'postprocess', label:'Post-Processing', desc:'Apply TAC weighting, Poisson noise, and OSEM reconstruction'},
+  ]},
+];
+const EXTRA_FLAGS = [
+  {key:'logging_on', label:'Logging',   desc:"Write a detailed pipeline log file to each patient's output directory"},
+  {key:'profile',    label:'Profiling', desc:'Sample per-stage CPU and RAM; save profiling_CT_<index>.json in each patient output folder'},
 ];
 const PROFILE_INTERVAL_OPTIONS = [0.1,0.2,0.5,1.0,2.0,3.0];
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
@@ -145,9 +154,9 @@ function StepBar({step}){
 function Page1Welcome({onNext}){
   return(
     <div className="max-w-3xl mx-auto px-6 py-12">
-      <div className="mb-8">
+      <div className="mb-8 bg-white/90 rounded-2xl px-6 py-5 shadow-sm inline-block">
         <h1 className="text-4xl font-bold text-slate-900 mb-1">PyTheraTwin</h1>
-        <p className="text-blue-600 font-semibold text-lg">BC Cancer Research Centre</p>
+        <p className="text-blue-600 font-semibold text-lg">BC Cancer Research Centre — QURIT Lab</p>
       </div>
       <div className="bg-blue-50 border border-blue-100 rounded-2xl p-6 mb-6">
         <h2 className="font-semibold text-blue-900 mb-3 text-lg">Pipeline Overview</h2>
@@ -233,11 +242,11 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,patie
   const busy=picking||scanning;
   return(
     <div className="max-w-4xl mx-auto px-6 py-8">
-      <div className="flex items-center gap-3 mb-6">
+      <div className="flex items-center gap-3 mb-6 bg-white/90 rounded-xl px-4 py-3 shadow-sm">
         <button onClick={onBack} className="text-slate-400 hover:text-slate-600 text-sm flex items-center gap-1">← Back</button>
         <h2 className="text-2xl font-bold text-slate-900">Select CT Input Folder</h2>
       </div>
-      <p className="text-slate-500 text-sm mb-6">Each top-level DICOM subfolder or <code className="bg-slate-100 px-1 rounded">.nii/.nii.gz</code> file is treated as one patient. Unsupported top-level entries are ignored.</p>
+      <p className="text-slate-600 text-sm mb-6 bg-white/90 rounded-xl px-4 py-2.5 inline-block shadow-sm">Each top-level DICOM subfolder or <code className="bg-slate-100 px-1 rounded">.nii/.nii.gz</code> file is treated as one patient. Unsupported top-level entries are ignored.</p>
       <div className="mb-6">
         <div className="flex items-center gap-4 mb-3">
           <button onClick={pickAndScan} disabled={busy}
@@ -247,7 +256,7 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,patie
         </div>
         <div className="flex items-center gap-3 mb-3">
           <div className="flex-1 border-t border-slate-200"/>
-          <span className="text-xs text-slate-400 uppercase tracking-wide px-2">or enter absolute path</span>
+          <span className="text-xs text-slate-500 uppercase tracking-wide px-3 py-1 bg-white/90 rounded-full shadow-sm">or enter absolute path</span>
           <div className="flex-1 border-t border-slate-200"/>
         </div>
         <div className="flex items-center gap-3 mb-3">
@@ -271,7 +280,7 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,patie
       {error&&<div className="bg-red-50 border border-red-200 rounded-xl p-3 mb-4 text-red-700 text-sm">{error}</div>}
       {patients.length>0&&(
         <>
-          <h3 className="text-base font-semibold text-slate-700 mb-3">Detected {patients.length} patient{patients.length!==1?'s':''}</h3>
+          <h3 className="text-base font-semibold text-slate-700 mb-3 bg-white/90 rounded-xl px-4 py-2 inline-block shadow-sm">Detected {patients.length} patient{patients.length!==1?'s':''}</h3>
           <div className="space-y-4 mb-8">
             {patients.map((p,i)=>{
               const preview=previews[p.name]||{};
@@ -1352,6 +1361,14 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
         }catch(_){}
       }));
       setCompletionStatus(statusMap);
+      // Restore run flags/mode/profiling from a previous web UI run if present
+      const savedWebFlags=Object.values(existingCfgs).map(c=>c?._web_ui_flags).find(Boolean);
+      if(savedWebFlags){
+        const flagKeys=['segmentation','pbpk','synthetic_lesions','spect','dosimetry','postprocess','logging_on','profile'];
+        setFlags(prev=>({...prev,...Object.fromEntries(flagKeys.filter(k=>k in savedWebFlags).map(k=>[k,!!savedWebFlags[k]]))}));
+        if(savedWebFlags.mode) setMode(savedWebFlags.mode);
+        if(typeof savedWebFlags.profile_interval_s==='number') setProfileIntervalS(savedWebFlags.profile_interval_s);
+      }
     }catch(e){setCreateError('Error: '+e.message);}
     setCreating(false);
   };
@@ -1500,7 +1517,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
 
   return(
     <div className="max-w-4xl mx-auto px-6 py-8">
-      <div className="flex items-center gap-3 mb-6">
+      <div className="flex items-center gap-3 mb-6 bg-white/90 rounded-xl px-4 py-3 shadow-sm">
         <button onClick={onBack} className="text-slate-400 hover:text-slate-600 text-sm flex items-center gap-1">← Back</button>
         <h2 className="text-2xl font-bold text-slate-900">Configure Pipeline</h2>
       </div>
@@ -1529,16 +1546,35 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
       <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-5 shadow-sm">
         <h3 className="font-semibold text-slate-800 mb-1">Pipeline Options</h3>
         <p className="text-xs text-slate-500 mb-4">Select which stages to run.</p>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-5">
-          {CLI_FLAGS.map(({key,label,desc})=>(
-            <label key={key} className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors select-none
-              ${flags[key]?'border-blue-400 bg-blue-50':'border-slate-200 hover:border-slate-300 bg-white'}`}>
-              <input type="checkbox" checked={!!flags[key]} onChange={e=>handleFlagChange(key,e.target.checked)}
-                className="mt-0.5 w-4 h-4 accent-blue-600 flex-shrink-0"/>
-              <div><p className="font-semibold text-slate-800 text-sm">{label}</p>
-                <p className="text-xs text-slate-500 mt-0.5 leading-snug">{desc}</p></div>
-            </label>
-          ))}
+        {FLAG_GROUPS.map(({phase,items})=>(
+          <div key={phase} className="mb-4">
+            <p className="text-[10px] uppercase tracking-widest text-slate-400 font-semibold mb-2">{phase}</p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              {items.map(({key,label,desc})=>(
+                <label key={key} className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors select-none
+                  ${flags[key]?'border-blue-400 bg-blue-50':'border-slate-200 hover:border-slate-300 bg-white'}`}>
+                  <input type="checkbox" checked={!!flags[key]} onChange={e=>handleFlagChange(key,e.target.checked)}
+                    className="mt-0.5 w-4 h-4 accent-blue-600 flex-shrink-0"/>
+                  <div><p className="font-semibold text-slate-800 text-sm">{label}</p>
+                    <p className="text-xs text-slate-500 mt-0.5 leading-snug">{desc}</p></div>
+                </label>
+              ))}
+            </div>
+          </div>
+        ))}
+        <div className="mb-4">
+          <p className="text-[10px] uppercase tracking-widest text-slate-400 font-semibold mb-2">Extras</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {EXTRA_FLAGS.map(({key,label,desc})=>(
+              <label key={key} className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors select-none
+                ${flags[key]?'border-blue-400 bg-blue-50':'border-slate-200 hover:border-slate-300 bg-white'}`}>
+                <input type="checkbox" checked={!!flags[key]} onChange={e=>handleFlagChange(key,e.target.checked)}
+                  className="mt-0.5 w-4 h-4 accent-blue-600 flex-shrink-0"/>
+                <div><p className="font-semibold text-slate-800 text-sm">{label}</p>
+                  <p className="text-xs text-slate-500 mt-0.5 leading-snug">{desc}</p></div>
+              </label>
+            ))}
+          </div>
         </div>
         {flags.profile&&(
           <div className="mb-5 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 flex items-center justify-between gap-4 flex-wrap">
@@ -1667,44 +1703,58 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
 }
 
 // ─── Config Summary Card (per patient) ───────────────────────────────────────
-function ConfigSummaryCard({patient,cfg,flags,projectDir}){
+function ConfigSummaryCard({patient,cfg,flags,projectDir,mode,profileIntervalS}){
   const ph1=cfg?.phase_1;const ph2=cfg?.phase_2;const ph3=cfg?.phase_3;
-  const tac=ph1?.pbpk_tac_stage;
+  const seg=ph1?.segmentation_stage;
   const synth=ph1?.synthetic_lesions_stage;
+  const tac=ph1?.pbpk_tac_stage;
   const simind=ph2?.simind_stage;
   const og=ph2?.opengate_stage;
   const pp=ph3?.spect_postprocess_stage;
+  const dp=ph3?.dosemap_postprocess_stage;
 
-  const kv=(label,val)=>{
-    if(val===undefined||val===null)return null;
-    const display=Array.isArray(val)?(val.length?val.join(', '):'—'):String(val);
+  const kv=(label,val,fmt)=>{
+    if(val===undefined||val===null) return null;
+    let display;
+    if(fmt) display=fmt(val);
+    else if(Array.isArray(val)) display=val.length?val.join(', '):'—';
+    else if(typeof val==='boolean') display=val?'Yes':'No';
+    else display=String(val);
     return(
       <div className="flex gap-2 text-xs py-0.5">
-        <span className="text-slate-400 w-36 shrink-0">{label}</span>
+        <span className="text-slate-400 w-44 shrink-0">{label}</span>
         <span className="text-slate-700 font-medium break-all">{display}</span>
       </div>
     );
   };
 
-  const Section=({title,children})=>(
+  const Section=({title,colorClass,children})=>(
     <div className="mb-3">
-      <p className="text-[10px] uppercase tracking-widest text-slate-400 font-semibold mb-1">{title}</p>
+      <p className={`text-[10px] uppercase tracking-widest font-semibold mb-1.5 ${colorClass||'text-slate-400'}`}>{title}</p>
       <div className="bg-slate-50 rounded-xl px-3 py-2 space-y-0.5">{children}</div>
     </div>
   );
 
   const Badge=({label,color})=>{
-    const c={blue:'bg-blue-100 text-blue-700',purple:'bg-purple-100 text-purple-700',
-              teal:'bg-teal-100 text-teal-700',orange:'bg-orange-100 text-orange-700'}[color]||'bg-slate-100 text-slate-600';
+    const c={
+      blue:'bg-blue-100 text-blue-700',teal:'bg-teal-100 text-teal-700',
+      purple:'bg-purple-100 text-purple-700',orange:'bg-orange-100 text-orange-700',
+      emerald:'bg-emerald-100 text-emerald-700',amber:'bg-amber-100 text-amber-700',
+      slate:'bg-slate-100 text-slate-600',
+    }[color]||'bg-slate-100 text-slate-600';
     return <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${c}`}>{label}</span>;
   };
 
+  const synthSpecs=synth?.specs&&typeof synth.specs==='object'?Object.entries(synth.specs):[];
+
   return(
     <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
+      {/* Header */}
       <div className="flex items-start justify-between gap-3 mb-3">
         <span className="font-semibold text-slate-800 text-base">{patient.name}</span>
         {projectDir&&<span className="text-[10px] terminal-font text-slate-400 truncate max-w-xs">{projectDir}</span>}
       </div>
+      {/* Active stage badges + run mode */}
       <div className="flex flex-wrap gap-1.5 mb-4">
         {flags.segmentation&&<Badge label="Segmentation" color="teal"/>}
         {flags.pbpk&&<Badge label="PBPK" color="teal"/>}
@@ -1712,43 +1762,92 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir}){
         {flags.spect&&<Badge label="SPECT Simulation" color="blue"/>}
         {flags.dosimetry&&<Badge label="Dosimetry" color="purple"/>}
         {flags.postprocess&&<Badge label="Post-Processing" color="teal"/>}
+        <Badge label={mode||'PRODUCTION'} color={mode==='DEBUG'?'amber':'emerald'}/>
+        {flags.profile&&<Badge label={`Profiling ${profileIntervalS}s`} color="slate"/>}
+        {flags.logging_on&&<Badge label="Logging" color="slate"/>}
       </div>
 
+      {/* ── Phase 1 ─────────────────────────────────────────────────────────── */}
+      {seg&&(
+        <Section title="Phase 1 — Segmentation" colorClass="text-teal-700">
+          {kv('ROI subset', seg.roi_subset)}
+        </Section>
+      )}
+      {synth&&(synthSpecs.length>0||flags.synthetic_lesions)&&(
+        <Section title="Phase 1 — Synthetic Lesions" colorClass="text-orange-600">
+          {kv('Seed', synth.default_seed, v=>v===0?'Non-reproducible (0)':String(v))}
+          {kv('Shrink factor', synth.auto_shrink_factor)}
+          {kv('Start radius fraction', synth.auto_start_frac)}
+          {kv('Max shrink iterations', synth.auto_max_shrink_iters)}
+          {kv('Max placement attempts', synth.max_lesion_placement_attempts)}
+          {synthSpecs.length>0&&(
+            <div className="mt-1 space-y-1">
+              {synthSpecs.map(([roi,spec])=>(
+                <div key={roi} className="text-[10px] bg-white rounded-lg px-2 py-1 border border-slate-200">
+                  <span className="font-semibold text-slate-600">{roi}:</span>{' '}
+                  {spec.n_lesions} lesion{spec.n_lesions!==1?'s':''},{' '}
+                  mode={spec.prob}{spec.prob==='gaussian'&&spec.sigma_mm?` σ=${spec.sigma_mm}mm`:''},{' '}
+                  margin={spec.margin_mm}mm
+                  {spec.radii_mm?`, radii=[${spec.radii_mm.join(',')}]mm`:''}
+                </div>
+              ))}
+            </div>
+          )}
+        </Section>
+      )}
       {tac&&(
-        <Section title="PBPK TAC (Phase 1)">
-          {kv('Model type', tac.ModelType||tac.model_type)}
-          {kv('Isotope', tac.Isotope||tac.isotope)}
-          {kv('ROI subset', tac.roi_subset)}
+        <Section title="Phase 1 — PBPK Pharmacokinetics" colorClass="text-teal-700">
+          {kv('Model type', tac.model_type||tac.ModelType)}
+          {kv('Isotope', tac.isotope||tac.Isotope)}
+          {kv('Randomize kidney / SG', tac.Randomization_Kidney_SG_Para)}
         </Section>
       )}
-      {synth?.specs&&Object.keys(synth.specs).length>0&&(
-        <Section title="Synthetic Lesions (Phase 1)">
-          {kv('Organ specs', Object.keys(synth.specs).join(', '))}
-        </Section>
-      )}
+
+      {/* ── Phase 2 ─────────────────────────────────────────────────────────── */}
       {flags.spect&&simind&&(
-        <Section title="SIMIND Simulation (Phase 2)">
-          {kv('Collimator', simind.Collimator||simind.collimator)}
-          {kv('Projections', simind.NumProjections||simind.num_projections)}
+        <Section title="Phase 2 — SIMIND Simulation" colorClass="text-blue-700">
           {kv('ROI subset', simind.roi_subset)}
+          {kv('Collimator', simind.Collimator||simind.collimator)}
+          {kv('Isotope', simind.isotope||simind.Isotope)}
+          {kv('Projections', simind.NumProjections||simind.num_projections)}
+          {kv('Photon histories', simind.NumPhotons||simind.num_photons)}
+          {kv('Energy window', simind.EnergyWindowWidth||simind.energy_window_width, v=>`${v}%`)}
+          {kv('Detector distance', simind.DetectorDistance??simind.detector_distance, v=>v<0?'Auto-contour to patient':`${v} cm`)}
+          {kv('Voxel spacing', simind.xyz_spacing_mm, v=>v===null?'Native CT resolution':`${v.join(' × ')} mm`)}
+          {kv('CPU cores', simind.num_cpu, v=>v===0?'All available':String(v))}
         </Section>
       )}
       {flags.dosimetry&&og&&(
-        <Section title="OpenGATE Dosimetry (Phase 2)">
+        <Section title="Phase 2 — OpenGATE Dosimetry" colorClass="text-purple-700">
           {kv('ROI subset', og.roi_subset)}
-          {kv('Threads', og.gate?.num_threads)}
+          {kv('Isotope', og.source?.isotope)}
           {kv('Histories / batch', og.gate?.total_histories_per_batch)}
-          {kv('Target uncertainty', og.gate?.target_uncertainty_percent!==undefined?`${og.gate.target_uncertainty_percent}%`:undefined)}
+          {kv('Threads', og.gate?.num_threads, v=>v===0?'All available':String(v))}
+          {kv('Target uncertainty', og.gate?.target_uncertainty_percent!=null?`${og.gate.target_uncertainty_percent}%`:null)}
+          {kv('Variance reduction', og.variance_reduction)}
+          {kv('Voxel spacing', og.xyz_spacing_mm, v=>v===null?'Native CT resolution':`${v.join(' × ')} mm`)}
+          {kv('Save per-ROI dose maps', og.save_per_roi_dose_maps)}
+          {kv('Save summed dose map', og.save_summed_dose_map)}
+          {kv('Density tolerance', og.physics?.density_tolerance_gcm3, v=>`${v} g/cm³`)}
         </Section>
       )}
-      {flags.postprocess&&pp&&(
-        <Section title="Post-Processing (Phase 3)">
+
+      {/* ── Phase 3 ─────────────────────────────────────────────────────────── */}
+      {flags.postprocess&&flags.spect&&pp&&(
+        <Section title="Phase 3 — SPECT Post-Processing" colorClass="text-teal-700">
           {kv('Algorithm', pp.ReconstructionAlgorithm||pp.reconstruction_algorithm)}
           {kv('Subsets', pp.Subsets||pp.num_subsets)}
           {kv('Iterations', pp.Iterations||pp.num_iterations)}
-          {kv('Apply TAC', pp.apply_tac?'Yes':'No')}
-          {kv('Apply Noise', pp.apply_poisson_noise?'Yes':'No')}
-          {kv('Apply Reconstruction', pp.apply_reconstruction?'Yes':'No')}
+          {kv('Apply TAC', pp.apply_tac)}
+          {kv('Apply Poisson noise', pp.apply_poisson_noise)}
+          {kv('Apply reconstruction', pp.apply_reconstruction)}
+          {Array.isArray(pp.FrameStartTimes)&&kv('Frame start times', pp.FrameStartTimes, v=>`[${v.join(', ')}] min p.i.`)}
+          {Array.isArray(pp.FrameDurations)&&kv('Frame durations', pp.FrameDurations, v=>`[${v.join(', ')}] s`)}
+        </Section>
+      )}
+      {flags.postprocess&&flags.dosimetry&&dp&&(
+        <Section title="Phase 3 — Dosimetry Post-Processing" colorClass="text-purple-700">
+          {kv('Apply TAC scaling', dp.apply_tac)}
         </Section>
       )}
     </div>
@@ -1901,22 +2000,24 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
   // ── Launched screen ────────────────────────────────────────────────────────
   if(status==='launched'){
     return(
-      <div className="max-w-lg mx-auto px-6 py-24 text-center">
-        <h2 className="text-2xl font-bold text-slate-900 mb-3">Pipeline Started</h2>
-        <p className="text-slate-500 mb-8 leading-relaxed">
-          The pipeline is now running in the terminal where you launched{' '}
-          <code className="bg-slate-100 px-1.5 py-0.5 rounded text-sm font-mono">python run_server.py</code>.
-          Monitor progress there.
-        </p>
-        <div className="bg-slate-100 border border-slate-200 rounded-2xl px-6 py-5 mb-8 text-left">
-          <p className="text-slate-700 font-semibold mb-2 text-sm">Output directories</p>
-          {patients.map(p=>(
-            <div key={p.name} className="text-xs terminal-font text-slate-500 break-all mb-1">
-              <span className="font-semibold text-slate-600">{p.name}:</span> {projectDirs[p.name]||'—'}
-            </div>
-          ))}
+      <div className="max-w-lg mx-auto px-6 py-16 text-center">
+        <div className="bg-white/95 border border-slate-200 rounded-2xl shadow-sm px-8 py-10">
+          <h2 className="text-2xl font-bold text-slate-900 mb-3">Pipeline Started</h2>
+          <p className="text-slate-500 mb-8 leading-relaxed">
+            The pipeline is now running in the terminal where you launched{' '}
+            <code className="bg-slate-100 px-1.5 py-0.5 rounded text-sm font-mono">python run_server.py</code>.
+            Monitor progress there.
+          </p>
+          <div className="bg-slate-100 border border-slate-200 rounded-2xl px-6 py-5 mb-8 text-left">
+            <p className="text-slate-700 font-semibold mb-2 text-sm">Output directories</p>
+            {patients.map(p=>(
+              <div key={p.name} className="text-xs terminal-font text-slate-500 break-all mb-1">
+                <span className="font-semibold text-slate-600">{p.name}:</span> {projectDirs[p.name]||'—'}
+              </div>
+            ))}
+          </div>
+          <p className="text-slate-500 text-sm">You can close this tab — the pipeline will continue running.</p>
         </div>
-        <p className="text-slate-500 text-sm">You can close this tab — the pipeline will continue running.</p>
       </div>
     );
   }
@@ -1924,7 +2025,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
   // ── Main review + run screen ───────────────────────────────────────────────
   return(
     <div className="max-w-4xl mx-auto px-6 py-8">
-      <div className="flex items-center gap-3 mb-6">
+      <div className="flex items-center gap-3 mb-6 bg-white/90 rounded-xl px-4 py-3 shadow-sm">
         <button onClick={onBack}
           className="text-slate-400 hover:text-slate-600 text-sm flex items-center gap-1">
           ← Back
@@ -1966,11 +2067,11 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
       )}
 
       {/* Per-patient config summary */}
-      <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-widest mb-3">Configuration Summary</h3>
+      <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-widest mb-3 bg-white/90 rounded-xl px-4 py-2 inline-block shadow-sm">Configuration Summary</h3>
       <div className="space-y-4 mb-8">
         {patients.map(p=>(
           <ConfigSummaryCard key={p.name} patient={p} cfg={patientConfigs?.[p.name]}
-            flags={flags} projectDir={projectDirs[p.name]}/>
+            flags={flags} projectDir={projectDirs[p.name]} mode={mode} profileIntervalS={profileIntervalS}/>
         ))}
       </div>
 
@@ -1986,7 +2087,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
         className="bg-emerald-600 hover:bg-emerald-700 text-white px-10 py-3.5 rounded-xl font-semibold text-base transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm">
         {status==='starting'?<><span className="spin">⟳</span>&nbsp;Starting…</>:'▶  Run Pipeline'}
       </button>
-      <p className="text-xs text-slate-400 mt-2">
+      <p className="text-xs text-slate-500 mt-2 bg-white/90 rounded-lg px-3 py-1.5 inline-block shadow-sm">
         The pipeline will run in your terminal. You can close this tab once started.
       </p>
     </div>
@@ -2012,7 +2113,7 @@ function App(){
   },[]);
 
   return(
-    <div className="min-h-screen bg-slate-50">
+    <div className="min-h-screen">
       <StepBar step={step}/>
       <div className="pb-16">
         {step===1&&<Page1Welcome onNext={()=>setStep(2)}/>}

@@ -1411,6 +1411,14 @@ async def start_run(req: RunRequest) -> Dict:
         raise HTTPException(400, "No patients provided.")
 
     # Save patient configs sent by the UI (in case /api/save-patient-config wasn't called).
+    web_ui_flags: Dict[str, Any] = {
+        **{k: bool(req.flags.get(k, False)) for k in (
+            "segmentation", "pbpk", "synthetic_lesions",
+            "spect", "dosimetry", "postprocess", "logging_on", "profile",
+        )},
+        "profile_interval_s": float(req.profile_interval_s),
+        "mode": req.mode,
+    }
     if req.patient_configs:
         for patient in req.patients:
             nm = patient["name"]
@@ -1418,6 +1426,7 @@ async def start_run(req: RunRequest) -> Dict:
             out_dir = Path(req.project_dirs.get(nm, ""))
             if cfg and out_dir.is_dir():
                 full_cfg = inject_pipeline_paths(cfg, repo_root=REPO_ROOT, include_input_paths=False)
+                full_cfg["_web_ui_flags"] = web_ui_flags
                 (out_dir / "config.json").write_text(json.dumps(full_cfg, indent=2))
 
     conflicts_by_patient = _validate_reruns_for_request(
