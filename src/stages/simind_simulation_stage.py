@@ -457,8 +457,9 @@ class SimindSimulationStage:
         self.num_projections: int = self.stage_cfg["NumProjections"]
         self.detector_distance: float = self.stage_cfg["DetectorDistance"]
         self.output_img_size: int = self.stage_cfg["OutputImgSize"]
-        self.output_pixel_width: float = self.stage_cfg["OutputPixelWidth"]
-        self.output_slice_width: float = self.stage_cfg["OutputSliceWidth"]
+        # Config values are in mm; SIMIND and geometry helpers expect cm.
+        self.output_pixel_width: float = self.stage_cfg["OutputPixelWidth"] / 10.0
+        self.output_slice_width: float = self.stage_cfg["OutputSliceWidth"] / 10.0
         self.num_photons: float = self.stage_cfg["NumPhotons"]
         self.simind_dir: str = self.stage_cfg["SIMINDDirectory"]
         self.energy_window_width: float = self.stage_cfg["EnergyWindowWidth"]
@@ -656,8 +657,8 @@ class SimindSimulationStage:
             "detector_width": self.detector_width,
             "detector_length": self.detector_length,
             "output_img_size": self.output_img_size,
-            "output_pixel_width": self.output_pixel_width,
-            "output_slice_width": self.output_slice_width,
+            "output_pixel_width_mm": self.stage_cfg["OutputPixelWidth"],
+            "output_slice_width_mm": self.stage_cfg["OutputSliceWidth"],
             "energy_window_width": self.energy_window_width,
             "num_cpu": self.num_cpu,
             "simind_roi_subset": list(self.simind_roi_subset),                         

@@ -629,6 +629,20 @@ def validate_config(
             if v is not None:
                 _check_number(v, f"phase_2.simind_stage.{nf}")
 
+        for _pw_field in ("OutputPixelWidth", "OutputSliceWidth"):
+            _pw_val = simind.get(_pw_field)
+            if _is_finite_number(_pw_val):
+                if float(_pw_val) <= 0:
+                    _err(
+                        f"'phase_2.simind_stage.{_pw_field}' must be > 0 mm, "
+                        f"got {_pw_val}"
+                    )
+                elif float(_pw_val) > 50:
+                    _err(
+                        f"'phase_2.simind_stage.{_pw_field}' is {_pw_val}, which exceeds 50 mm. "
+                        "This field is in mm — did you accidentally enter a value in cm?"
+                    )
+
         simind_num_cpu = simind.get("num_cpu")
         if (
             isinstance(simind_num_cpu, (int, float))

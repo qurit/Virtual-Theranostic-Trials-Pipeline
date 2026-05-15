@@ -124,8 +124,9 @@ class SpectPostprocessStage:
         self.simind_cfg: Dict[str, Any] = context.config["phase_2"]["simind_stage"]    
         self.simind_num_projections: int = int(self.simind_cfg["NumProjections"])
         self.simind_output_img_size: int = int(self.simind_cfg["OutputImgSize"])
-        self.simind_output_pixel_width_cm: float = float(self.simind_cfg["OutputPixelWidth"])
-        self.simind_output_slice_width_cm: float = float(self.simind_cfg["OutputSliceWidth"])
+        # Config values are in mm; convert to cm for internal geometry calculations.
+        self.simind_output_pixel_width_cm: float = float(self.simind_cfg["OutputPixelWidth"]) / 10.0
+        self.simind_output_slice_width_cm: float = float(self.simind_cfg["OutputSliceWidth"]) / 10.0
         self.simind_prefix: str = str(self.simind_cfg["file_prefix"])
         self.detector_distance: float = float(self.simind_cfg["DetectorDistance"])      
 

@@ -127,11 +127,11 @@
       // Output projection image size in pixels per side (square).
       "OutputImgSize": 128,
 
-      // Output pixel pitch in cm. (e.g. 0.5 cm = 5 mm pixels)
-      "OutputPixelWidth": 0.5,
+      // Output pixel pitch in mm (e.g. 4.8 = 4.8 mm pixels). Must be > 0 and <= 50.
+      "OutputPixelWidth": 4.8,
 
-      // Output slice thickness in cm.
-      "OutputSliceWidth": 0.5,
+      // Output slice thickness in mm. Must be > 0 and <= 50.
+      "OutputSliceWidth": 4.8,
 
       // CPU cores for parallel simulation. 0 = use all available.
       "num_cpu": 0
