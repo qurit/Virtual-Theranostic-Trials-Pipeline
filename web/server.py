@@ -196,6 +196,7 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "sigma_mm": "Standard deviation in mm for Gaussian lesion placement — controls spread from organ centroid",
     "margin_mm": "Minimum gap in mm between the lesion surface and the organ boundary (and other lesions)",
     "seed": "Random seed for this organ's lesion placement. 0 = non-reproducible",
+    "pbpk_label": "PBPK time-activity curve class for this lesion: 'Tumor1', 'Tumor2', or 'TumorRest'. Each class maps to a distinct observable in the PyCNO PSMA model, letting different lesions use different pharmacokinetics. Multiple lesions can share the same class (e.g. two TumorRest lesions of different sizes). Default: 'TumorRest'.",
 }
 
 # ── Config template ────────────────────────────────────────────────────────────
@@ -217,7 +218,7 @@ async def get_config_template() -> Dict:
     # SIMINDDirectory, etc.) — these come from pipeline_paths.json, not from the user.
     data = strip_developer_fields(data)
 
-    _RESERVED = {"background", "remaining_body", "synthetic_lesion"}
+    _RESERVED = {"background", "remaining_body", "synthetic_lesion_tumor1", "synthetic_lesion_tumor2", "synthetic_lesion_tumorrest"}
     roi_choices: List[str] = []
     roi_task_groups: Dict[str, Dict[str, List[str]]] = {}
     pbpk_compatible_rois: List[str] = []
@@ -850,7 +851,7 @@ def _validate_patient_rerun(
                 stage_metadata_path(output_dir, "segmentation_stage")
             ),
         }
-        if "synthetic_lesion" in simind_snapshot["resolved_roi_subset"]:
+        if any(lbl in simind_snapshot["resolved_roi_subset"] for lbl in ("synthetic_lesion_tumor1", "synthetic_lesion_tumor2", "synthetic_lesion_tumorrest")):
             simind_deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
                 stage_metadata_path(output_dir, "synthetic_lesions_stage")
             )
@@ -886,7 +887,7 @@ def _validate_patient_rerun(
                 stage_metadata_path(output_dir, "segmentation_stage")
             ),
         }
-        if "synthetic_lesion" in og_snapshot["resolved_roi_subset"]:
+        if any(lbl in og_snapshot["resolved_roi_subset"] for lbl in ("synthetic_lesion_tumor1", "synthetic_lesion_tumor2", "synthetic_lesion_tumorrest")):
             og_deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
                 stage_metadata_path(output_dir, "synthetic_lesions_stage")
             )

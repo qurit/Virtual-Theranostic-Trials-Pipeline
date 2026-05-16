@@ -67,6 +67,7 @@ from src.utils.simind_projection_utils import (
     write_activity_map_nifti,
     write_projection_nifti,
 )
+from src.utils.body_mask_utils import body_mask_from_seg_arr
 from src.utils.tac_utils import get_pbpk_voi_name_for_roi
 
 from pytomography.algorithms import OSEM
@@ -241,6 +242,17 @@ class SpectPostprocessStage:
             abs(float(actual) - float(expected)) < 1e-6
             for actual, expected in zip(spacing, self.recon_spacing_mm)
         )
+
+    def _apply_body_mask(self, recon_img: sitk.Image) -> sitk.Image:
+        """Zero out reconstructed voxels outside the SIMIND simulation body outline."""
+        seg_arr = getattr(self.context, "roi_body_seg_arr", None)
+        recon_arr = sitk.GetArrayFromImage(recon_img)
+        mask = body_mask_from_seg_arr(seg_arr, recon_arr.shape, debug=self.debug, stage_tag="SpectPostprocessStage")
+        if mask is None:
+            return recon_img
+        out = sitk.GetImageFromArray(recon_arr * mask)
+        out.CopyInformation(recon_img)
+        return out
 
     def _get_recon_img(
         self,
@@ -581,7 +593,9 @@ class SpectPostprocessStage:
                     additive_term=scatter_estimate_tew,
                 )
 
-                recon_img = self._get_recon_img(likelihood, sensitivity, self.frame_durations_s[time_index]) 
+                recon_img = self._get_recon_img(likelihood, sensitivity, self.frame_durations_s[time_index])
+                # Zero out voxels outside the patient body outline.
+                recon_img = self._apply_body_mask(recon_img)
                 sitk.WriteImage(recon_img, recon_output_path, imageIO="NiftiImageIO")
                 recon_paths[frame_label] = recon_output_path
 

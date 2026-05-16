@@ -23,13 +23,7 @@ from src.io.rerun_guard import ensure_ct_matches_saved_copy, ensure_metadata_dir
 from src.io.runtime_config import load_and_validate_runtime_config, load_runtime_config
 from src.tests.validate_ct import CTInputType, discover_ct_inputs, validate_ct_input_path
 
-from src.stages.segmentation_stage import SegmentationStage
-from src.stages.synthetic_lesions_stage import SyntheticLesionsStage
-from src.stages.pbpk_tac_stage import PbpkTacStage
-from src.stages.simind_simulation_stage import SimindSimulationStage
-from src.stages.spect_postprocess_stage import SpectPostprocessStage
-from src.stages.opengate_simulation_stage import OpenGateSimulationStage
-from src.stages.dosemap_postprocess_stage import DosemapPostprocessStage
+
 class PyTheraTwinPipeline:
     """
     Orchestrates the full PyTheraTwin pipeline for a single CT input.
@@ -336,6 +330,8 @@ class PyTheraTwinPipeline:
             logger.info("Phase 1 skipped: no Phase 1 flags set")
 
         if self.run_segmentation:
+            from src.stages.segmentation_stage import SegmentationStage
+
             context = self._run_stage(
                 context,
                 stage_label="Segmentation + ROI Unification",
@@ -345,6 +341,8 @@ class PyTheraTwinPipeline:
             )
 
         if self.run_synthetic_lesions:
+            from src.stages.synthetic_lesions_stage import SyntheticLesionsStage
+
             context = self._run_stage(
                 context,
                 stage_label="Synthetic Lesions Generation",
@@ -354,6 +352,8 @@ class PyTheraTwinPipeline:
             )
 
         if self.run_pbpk:
+            from src.stages.pbpk_tac_stage import PbpkTacStage
+
             context = self._run_stage(
                 context,
                 stage_label="PBPK TAC Generation",
@@ -380,6 +380,8 @@ class PyTheraTwinPipeline:
             logger.info("Phase 2 skipped: no --spect or --dosimetry flags")
 
         if self.run_spect:
+            from src.stages.simind_simulation_stage import SimindSimulationStage
+
             context = self._run_stage(
                 context,
                 stage_label="SIMIND Simulation",
@@ -389,6 +391,8 @@ class PyTheraTwinPipeline:
             )
 
         if self.run_dosimetry:
+            from src.stages.opengate_simulation_stage import OpenGateSimulationStage
+
             context = self._run_stage(
                 context,
                 stage_label="OpenGATE Simulation",
@@ -408,6 +412,8 @@ class PyTheraTwinPipeline:
             logger.info("Phase 3 skipped: no --postprocess flag")
 
         if self.run_postprocess and self.run_spect:
+            from src.stages.spect_postprocess_stage import SpectPostprocessStage
+
             context = self._run_stage(
                 context,
                 stage_label="SPECT Post-Processing",
@@ -417,6 +423,8 @@ class PyTheraTwinPipeline:
             )
 
         if self.run_postprocess and self.run_dosimetry:
+            from src.stages.dosemap_postprocess_stage import DosemapPostprocessStage
+
             context = self._run_stage(
                 context,
                 stage_label="Dosimetry Post-Processing",
@@ -606,5 +614,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

@@ -72,6 +72,7 @@ from src.io.rerun_guard import (
     stage_metadata_path,
     write_json,
 )
+from src.utils.body_mask_utils import body_mask_from_roi_mask_paths
 from src.utils.nifti_utils import save_nii_sitk
 from src.utils.tac_utils import compute_roi_cumulated_activity, get_pbpk_voi_name_for_roi
 
@@ -157,6 +158,14 @@ class DosemapPostprocessStage:
             and np.allclose(a.GetOrigin(), b.GetOrigin(), atol=atol)
             and np.allclose(a.GetDirection(), b.GetDirection(), atol=atol)
         )
+
+    def _apply_body_mask(self, dose_arr: np.ndarray) -> np.ndarray:
+        """Zero out dose voxels outside the OpenGATE simulation body outline."""
+        mask_paths = getattr(self.context, "dosimetry_mask_paths", None)
+        mask = body_mask_from_roi_mask_paths(mask_paths, dose_arr.shape, debug=self.debug, stage_tag="DosemapPostprocessStage")
+        if mask is None:
+            return dose_arr
+        return dose_arr * mask
 
     def _load_metadata_extra(self) -> Dict[str, Any]:
         """Load previously saved metadata extras when this stage is skipped."""
@@ -393,6 +402,9 @@ class DosemapPostprocessStage:
                 f"TAC integrated from 0 to {integration_end_min:.0f} min "
                 f"({integration_end_min / 60.0 / 24.0:.1f} days)"
             )
+
+        # Apply body-outline mask: zero out voxels outside the patient boundary.
+        total_dose = self._apply_body_mask(total_dose)
 
         save_nii_sitk(dose_ref_img, total_dose.astype(np.float32), output_path)
 

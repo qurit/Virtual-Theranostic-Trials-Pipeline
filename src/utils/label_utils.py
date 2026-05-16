@@ -16,7 +16,15 @@ import numpy as np
 from json_minify import json_minify
 
 
-RESERVED_ROIS = frozenset({"background", "remaining_body", "synthetic_lesion"})
+RESERVED_ROIS = frozenset({"background", "remaining_body", "synthetic_lesion_tumor1", "synthetic_lesion_tumor2", "synthetic_lesion_tumorrest"})
+# All label names used for synthetic lesions (one per PBPK tumor class).
+SYNTHETIC_LESION_LABELS = ("synthetic_lesion_tumor1", "synthetic_lesion_tumor2", "synthetic_lesion_tumorrest")
+# Mapping from user-facing pbpk_label string → canonical ROI label name.
+TUMOR_CLASS_TO_LABEL: dict = {
+    "Tumor1":    "synthetic_lesion_tumor1",
+    "Tumor2":    "synthetic_lesion_tumor2",
+    "TumorRest": "synthetic_lesion_tumorrest",
+}
 
 
 @lru_cache(maxsize=1)

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from src.utils.label_utils import SYNTHETIC_LESION_LABELS, TUMOR_CLASS_TO_LABEL
+
 
 
 def _normalize_roi_list(value: Any) -> List[str]:
@@ -39,6 +41,24 @@ def synthetic_lesion_host_rois(config: Dict[str, Any]) -> List[str]:
     return [str(roi).strip() for roi in specs if str(roi).strip()]
 
 
+def _active_lesion_labels_from_specs(config: Dict[str, Any]) -> List[str]:
+    """Return the unique synthetic lesion label names referenced by the lesion specs."""
+    specs = (
+        config.get("phase_1", {})
+        .get("synthetic_lesions_stage", {})
+        .get("specs") or {}
+    )
+    seen: List[str] = []
+    for spec in specs.values():
+        if not isinstance(spec, dict):
+            continue
+        tc = str(spec.get("pbpk_label", "TumorRest"))
+        lbl = TUMOR_CLASS_TO_LABEL.get(tc, TUMOR_CLASS_TO_LABEL["TumorRest"])
+        if lbl not in seen:
+            seen.append(lbl)
+    return seen
+
+
 def downstream_roi_subset(config: Dict[str, Any], *, synthetic_enabled: bool) -> List[str]:
     """Return the effective downstream ROI subset used by later stages."""
     rois = _normalize_roi_list(
@@ -46,8 +66,10 @@ def downstream_roi_subset(config: Dict[str, Any], *, synthetic_enabled: bool) ->
     )
     if "remaining_body" not in rois:
         rois.append("remaining_body")
-    if synthetic_enabled and "synthetic_lesion" not in rois:
-        rois.append("synthetic_lesion")
+    if synthetic_enabled:
+        for lbl in _active_lesion_labels_from_specs(config):
+            if lbl not in rois:
+                rois.append(lbl)
     return rois
 
 
@@ -58,20 +80,21 @@ def resolved_simulation_roi_subset(
     synthetic_enabled: bool,
 ) -> List[str]:
     """
-    Return the effective SIMIND/OpenGATE ROI subset, including internal lesion source.
+    Return the effective SIMIND/OpenGATE ROI subset, including synthetic lesion sources.
 
-    The user config only stores anatomical host ROIs. If any synthetic-lesion host
-    ROI is selected for a given simulation stage, the synthetic_lesion source is
-    added internally for that stage.
+    When synthetic lesions are enabled, the active lesion labels are always appended
+    to the simulation ROI subset automatically — regardless of which host ROIs the
+    user listed.
     """
     stage_cfg = dict(config.get("phase_2", {}).get(stage_key, {}))
     roi_subset = stage_cfg.get("roi_subset")
     if roi_subset is None:
         roi_subset = downstream_roi_subset(config, synthetic_enabled=synthetic_enabled)
     rois = _normalize_roi_list(roi_subset)
-    lesion_hosts = set(synthetic_lesion_host_rois(config))
-    if lesion_hosts and any(roi in lesion_hosts for roi in rois) and "synthetic_lesion" not in rois:
-        rois.append("synthetic_lesion")
+    if synthetic_enabled:
+        for lbl in _active_lesion_labels_from_specs(config):
+            if lbl not in rois:
+                rois.append(lbl)
     return rois
 
 

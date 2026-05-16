@@ -23,10 +23,20 @@
 </head>
 <body>
 <div id="root">
-  <div style="padding:24px;color:#334155;font-family:system-ui,-apple-system,sans-serif;">
+  <div id="loading-msg" style="padding:24px;color:#334155;font-family:system-ui,-apple-system,sans-serif;">
     Loading web UI…
   </div>
 </div>
+<script>
+window.onerror = function(msg, src, line, col, err) {
+  var el = document.getElementById('loading-msg');
+  if (el) {
+    el.style.color = '#b91c1c';
+    el.innerHTML = '<b>JavaScript error (check browser console):</b><br>' +
+      (msg||'Unknown error') + '<br>at ' + (src||'?') + ':' + (line||'?');
+  }
+};
+</script>
 <script type="text/babel">
 const { useState, useEffect, useRef, useCallback } = React;
 
@@ -73,7 +83,7 @@ const EXTRA_FLAGS = [
 ];
 const PROFILE_INTERVAL_OPTIONS = [0.1,0.2,0.5,1.0,2.0,3.0];
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
-const RESERVED_ROIS = new Set(['background','remaining_body','synthetic_lesion']);
+const RESERVED_ROIS = new Set(['background','remaining_body','synthetic_lesion_tumor1','synthetic_lesion_tumor2','synthetic_lesion_tumorrest']);
 // Maps each stage key to the flag that gates it (stage hidden + cleared when flag is OFF)
 const STAGE_FLAG_MAP = {
   segmentation_stage:        'segmentation',
@@ -565,10 +575,18 @@ function RadiiInputs({nLesions,radii,onUpdateRadii}){
   );
 }
 
+const TUMOR_CLASSES=['Tumor1','Tumor2','TumorRest'];
+const TUMOR_CLASS_COLORS={
+  Tumor1:'bg-purple-100 text-purple-700 border-purple-300',
+  Tumor2:'bg-blue-100 text-blue-700 border-blue-300',
+  TumorRest:'bg-teal-100 text-teal-700 border-teal-300',
+};
+
 function SpecRoiCard({roi,spec,onUpdateSpec,onRemove}){
   const [open,setOpen]=useState(true);
   const [numErrs,setNumErrs]=useState({});
   const prob=spec.prob||'uniform';
+  const tumorClass=spec.pbpk_label||'TumorRest';
   const hasManualRadii=Array.isArray(spec.radii_mm);
   const nLesions=Math.max(1,Number(spec.n_lesions||1));
   const [nLesionsInput,setNLesionsInput]=useState(String(nLesions));
@@ -681,6 +699,21 @@ function SpecRoiCard({roi,spec,onUpdateSpec,onRemove}){
         <div className="px-3 py-2">
           {numField('n_lesions','n_lesions',1,true)}
           <div className="flex items-center justify-between py-1.5 border-b border-slate-50 gap-2">
+            <span className="text-xs font-medium text-slate-600">pbpk_label</span>
+            <div className="flex gap-1">
+              {TUMOR_CLASSES.map(tc=>(
+                <button key={tc} onClick={()=>setField('pbpk_label',tc)}
+                  className={`px-2 py-0.5 text-[10px] font-semibold rounded border transition-colors ${
+                    tumorClass===tc
+                      ?TUMOR_CLASS_COLORS[tc]+' ring-1 ring-offset-0 ring-current'
+                      :'bg-white text-slate-500 border-slate-200 hover:border-slate-400'
+                  }`}>
+                  {tc}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-center justify-between py-1.5 border-b border-slate-50 gap-2">
             <span className="text-xs font-medium text-slate-600">prob</span>
             <select value={prob} onChange={e=>setField('prob',e.target.value)}
               className="px-2 py-0.5 text-xs border border-slate-200 rounded focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white">
@@ -732,10 +765,11 @@ function SpecsEditor({value,onChange,roiChoices,pbpkCompatibleRois,desc}){
   const isDisabled=value===null;
   const specs=value||{};
   const usedRois=Object.keys(specs);
-  // Only ROIs with dedicated PBPK VOIs can have synthetic lesions
-  const pbpkSet=pbpkCompatibleRois instanceof Set?pbpkCompatibleRois:new Set(pbpkCompatibleRois||[]);
-  const available=(roiChoices||[]).filter(r=>r!=='remaining_body'&&!usedRois.includes(r)&&pbpkSet.has(r));
-  const handleAdd=()=>{if(!addRoi)return;onChange({...specs,[addRoi]:{n_lesions:1,prob:'uniform',margin_mm:1.0,seed:0}});setAddRoi('');};
+  // Any Phase 1 ROI (not just PBPK-compatible) can host a synthetic lesion.
+  // The lesion uses its own PBPK TAC via pbpk_label, not the host organ's TAC.
+  const reserved=new Set(['remaining_body','background','synthetic_lesion_tumor1','synthetic_lesion_tumor2','synthetic_lesion_tumorrest']);
+  const available=(roiChoices||[]).filter(r=>!reserved.has(r)&&!usedRois.includes(r));
+  const handleAdd=()=>{if(!addRoi)return;onChange({...specs,[addRoi]:{n_lesions:1,prob:'uniform',margin_mm:1.0,seed:0,pbpk_label:'TumorRest'}});setAddRoi('');};
   const handleUpdateSpec=(roi,newSpec)=>onChange({...specs,[roi]:newSpec});
   const handleRemove=(roi)=>{const u={...specs};delete u[roi];onChange(Object.keys(u).length?u:null);};
   return(
@@ -775,9 +809,9 @@ function SpecsEditor({value,onChange,roiChoices,pbpkCompatibleRois,desc}){
             </div>
           ):(
             <p className="text-xs text-slate-400 italic mt-2">
-              {pbpkSet.size===0||(roiChoices||[]).filter(r=>r!=='remaining_body'&&pbpkSet.has(r)).length===0
-                ?'Select Phase 1 ROIs with dedicated PBPK VOIs first to unlock lesion placement.'
-                :'All PBPK-compatible ROIs are already configured.'}
+              {(roiChoices||[]).filter(r=>!reserved.has(r)).length===0
+                ?'Select Phase 1 ROIs first to unlock lesion placement.'
+                :'All available ROIs are already configured.'}
             </p>
           )}
         </>
@@ -1145,10 +1179,7 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
       // Simulation stages: pill selector filtered to PBPK-compatible ROIs from Phase 1 selection
       const pbpkSet=pbpkCompatibleRois instanceof Set?pbpkCompatibleRois:new Set(pbpkCompatibleRois||[]);
       const choices=(roiChoices||[]).filter(r=>r!=='remaining_body'&&pbpkSet.has(r));
-      const lesionHosts=lesionSpecs&&typeof lesionSpecs==='object'?Object.keys(lesionSpecs):[];
-      const pickedLesionHosts=lesionHosts.filter(r=>value.includes(r));
-      const missingLesionHosts=lesionHosts.filter(r=>!value.includes(r));
-      const partialLesionPick=pickedLesionHosts.length>0&&missingLesionHosts.length>0;
+      const hasLesionSpecs=lesionSpecs&&typeof lesionSpecs==='object'&&Object.keys(lesionSpecs).length>0;
       return(
         <div className="py-2 border-b border-slate-100 last:border-0">
           <div className="flex items-center gap-1.5 mb-2">
@@ -1165,18 +1196,12 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
                   onChange={e=>call(e.target.checked?[...value,roi]:value.filter(r=>r!==roi))} className="hidden"/>
                 {roi}
                 <span title="Has dedicated PBPK VOI — simulation eligible" className="text-[9px] bg-teal-100 text-teal-700 rounded px-1 font-bold leading-tight">PBPK</span>
-                {lesionHosts.includes(roi)&&<span title="Synthetic lesions configured in this ROI" className="text-[9px] bg-purple-200 text-purple-700 rounded px-1 font-bold leading-tight">lesion</span>}
               </label>
             ))}
           </div>
-          {pickedLesionHosts.length>0&&missingLesionHosts.length===0&&(
+          {hasLesionSpecs&&(
             <p className="text-[11px] text-purple-700 bg-purple-50 rounded px-2 py-1 mt-2">
-              synthetic_lesion / Tumor1 source will be added automatically.
-            </p>
-          )}
-          {partialLesionPick&&(
-            <p className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1 mt-2">
-              Synthetic lesion ROIs are all-or-none here. Missing: {missingLesionHosts.join(', ')}.
+              Synthetic lesion sources (Tumor1/Tumor2/TumorRest) are always included in simulation automatically — no need to select lesion host organs here.
             </p>
           )}
         </div>
@@ -1490,24 +1515,19 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
       const lesionRois=specs&&typeof specs==='object'?Object.keys(specs):[];
       lesionRois.forEach(roi=>{
         if(!p1Set.has(roi)) page3Issues.push(`[${p.name}] Synthetic lesion spec for ${roi} is not in Phase 1 roi_subset`);
-        if(!pbpkCompatibleRois.has(roi)) page3Issues.push(`[${p.name}] Synthetic lesion spec for ${roi} needs a dedicated non-Rest PBPK VOI`);
+        // No PBPK-compat check: lesion TAC comes from pbpk_label, not the host ROI.
       });
       const checkSimStage=(enabled,label,roiSubset)=>{
         if(!enabled) return;
         const rois=Array.isArray(roiSubset)?roiSubset:[];
         if(rois.length===0){page3Issues.push(`[${p.name}] ${label} needs at least one PBPK-compatible ROI`);return;}
-        const reserved=rois.filter(r=>RESERVED_ROIS.has(r));
-        if(reserved.length) page3Issues.push(`[${p.name}] ${label} contains internal ROI(s): ${reserved.join(', ')}`);
+        const reservedInRois=rois.filter(r=>RESERVED_ROIS.has(r));
+        if(reservedInRois.length) page3Issues.push(`[${p.name}] ${label} contains internal ROI(s): ${reservedInRois.join(', ')}`);
         const missingP1=rois.filter(r=>!p1Set.has(r)&&!RESERVED_ROIS.has(r));
         if(missingP1.length) page3Issues.push(`[${p.name}] ${label} ROI(s) not selected in Phase 1: ${missingP1.join(', ')}`);
-        const notPbpk=rois.filter(r=>!pbpkCompatibleRois.has(r));
+        const notPbpk=rois.filter(r=>!pbpkCompatibleRois.has(r)&&!RESERVED_ROIS.has(r));
         if(notPbpk.length) page3Issues.push(`[${p.name}] ${label} ROI(s) without dedicated non-Rest PBPK VOI: ${notPbpk.join(', ')}`);
-        if(lesionRois.length){
-          const picked=lesionRois.filter(r=>rois.includes(r));
-          const missing=lesionRois.filter(r=>!rois.includes(r));
-          if(picked.length>0&&missing.length>0)
-            page3Issues.push(`[${p.name}] ${label} synthetic-lesion ROIs are all-or-none. Missing: ${missing.join(', ')}`);
-        }
+        // Synthetic-lesion labels are added automatically; no all-or-none check on host ROIs.
       };
       checkSimStage(flags.spect,'SIMIND',cfg?.phase_2?.simind_stage?.roi_subset);
       checkSimStage(flags.dosimetry,'OpenGATE',cfg?.phase_2?.opengate_stage?.roi_subset);
@@ -1896,11 +1916,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
           if(missingP1.length)
             issues.push(`[${p.name}] ${stageName} ROI(s) not selected in Phase 1: ${missingP1.join(', ')}`);
         }
-        if(lesionRois.length===0) return;
-        const picked=lesionRois.filter(r=>roi.includes(r));
-        const missing=lesionRois.filter(r=>!roi.includes(r));
-        if(picked.length>0&&missing.length>0)
-          issues.push(`[${p.name}] ${stageName} includes some synthetic-lesion ROIs (${picked.join(', ')}) but not all — missing: ${missing.join(', ')}. Include all or none to avoid corrupting remaining_body.`);
+        // Synthetic-lesion labels are added automatically; no all-or-none check on host ROIs.
       };
       // SPECT: simind must have at least one ROI selected
       if(flags.spect){

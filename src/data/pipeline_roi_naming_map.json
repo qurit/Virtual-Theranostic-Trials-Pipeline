@@ -51,8 +51,10 @@
 // pbpk_voi: PyCNO PSMA model observable name. null = no dedicated VOI (falls back to Rest TAC).
 //   User ROIs with a non-null, non-Rest pbpk_voi are "simulation-eligible".
 //   Internal labels:
-//     remaining_body -> Rest
-//     synthetic_lesion -> Tumor1
+//     remaining_body        -> Rest
+//     synthetic_lesion_tumor1   -> Tumor1
+//     synthetic_lesion_tumor2   -> Tumor2
+//     synthetic_lesion_tumorrest -> TumorRest
 // parent_group: when present, this ROI's totseg_rois are a proper subset of the named
 //   parent ROI. The parent is the user-selectable entry; this child entry is kept in
 //   PyTheraTwin_allowed_rois so a developer can re-enable it via pipeline_options.json.
@@ -219,7 +221,6 @@
         "5":  "spleen",
         "6":  "heart",
         "7":  "salivary_glands",
-        "8":  "synthetic_lesion",
         "9":  "lungs",
         "10": "adrenal_glands",
         "11": "thyroid_gland",
@@ -270,7 +271,10 @@
         "56": "hard_palate",
         "57": "gi_tract",
         "58": "bone",
-        "59": "muscle"
+        "59": "muscle",
+        "8":  "synthetic_lesion_tumor1",
+        "60": "synthetic_lesion_tumor2",
+        "61": "synthetic_lesion_tumorrest"
     },
     // All technically supported config ROI names. The default user-selectable
     // subset shown in the web UI is curated in src/data/pipeline_options.json
@@ -723,10 +727,22 @@
             "ui_category": "head"
         },
         // ── RESERVED (not user-selectable) ─────────────────────────────────────────
-        "synthetic_lesion": {
+        "synthetic_lesion_tumor1": {
             "task": "synthetic",
             "totseg_rois": [],
             "pbpk_voi": "Tumor1",
+            "ui_category": null
+        },
+        "synthetic_lesion_tumor2": {
+            "task": "synthetic",
+            "totseg_rois": [],
+            "pbpk_voi": "Tumor2",
+            "ui_category": null
+        },
+        "synthetic_lesion_tumorrest": {
+            "task": "synthetic",
+            "totseg_rois": [],
+            "pbpk_voi": "TumorRest",
             "ui_category": null
         },
         "remaining_body": {

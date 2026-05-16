@@ -5,7 +5,8 @@ Goal
 ----
 Generate synthetic spherical lesions inside user-specified organ ROIs from the
 unified label map, then write them back into that segmentation as the
-``synthetic_lesion`` label.
+``synthetic_lesion_tumor1``, ``synthetic_lesion_tumor2``, or ``synthetic_lesion_tumorrest`` label,
+depending on the ``pbpk_label`` field per spec.
 
 Key behavior
 ------------
@@ -39,7 +40,8 @@ Primary side effect
 -------------------
 Overwrites `context.pytheratwin_roi_seg_path` on disk so that:
 - organ voxels remain their organ label
-- lesion voxels become label = PyTheraTwin_Pipeline["synthetic_lesion"] (e.g. 8)
+- lesion voxels become the PBPK-class label ID
+  (e.g. synthetic_lesion_tumor1=8, synthetic_lesion_tumor2=60, synthetic_lesion_tumorrest=61)
 
 Expected Context interface
 --------------------------
@@ -74,7 +76,7 @@ from src.io.rerun_guard import (
     write_json,
 )
 from src.utils.nifti_utils import xyz_to_zyx, zyx_to_xyz, get_spacing_zyx_mm, save_nifti_nib
-from src.utils.label_utils import load_pytheratwin_label_map
+from src.utils.label_utils import load_pytheratwin_label_map, TUMOR_CLASS_TO_LABEL, SYNTHETIC_LESION_LABELS
 from src.utils.lesion_utils import (
     auto_place_lesions,
     build_lesion_labelmap_zyx,
@@ -86,8 +88,8 @@ from src.utils.lesion_utils import (
 class SyntheticLesionsStage:
     """
     Generate synthetic spherical lesions inside organ ROIs of a unified PyTheraTwin segmentation,
-    then overwrite `context.pytheratwin_roi_seg_path` by painting lesion voxels as the
-    `synthetic_lesion` label.
+    then overwrite `context.pytheratwin_roi_seg_path` by painting lesion voxels with the
+    appropriate PBPK-class label (synthetic_lesion_tumor1/tumor2/tumorrest).
 
     Notes on conventions
     --------------------
@@ -163,12 +165,19 @@ class SyntheticLesionsStage:
         # Load label map from pipeline_paths.json
         _label_map_path = get_label_map_path()
         self.pytheratwin_name2id = load_pytheratwin_label_map(_label_map_path)
-        if "synthetic_lesion" not in self.pytheratwin_name2id:
-            raise ValueError(
-                "The label map is missing 'synthetic_lesion' in PyTheraTwin_Pipeline. "
-                "Add it (e.g. \"8\": \"synthetic_lesion\")."
-            )
-        self.synthetic_lesion_id: int = int(self.pytheratwin_name2id["synthetic_lesion"])
+        # Map pbpk_label string → label ID for all three PBPK tumor classes.
+        self._tumor_class_label_ids: Dict[str, int] = {}
+        for tc, roi_name in TUMOR_CLASS_TO_LABEL.items():
+            if roi_name in self.pytheratwin_name2id:
+                self._tumor_class_label_ids[tc] = int(self.pytheratwin_name2id[roi_name])
+            else:
+                raise ValueError(
+                    f"Label map is missing '{roi_name}' (pbpk_label='{tc}'). "
+                    "Ensure synthetic_lesion_tumor1, synthetic_lesion_tumor2, "
+                    "and synthetic_lesion_tumorrest are defined in PyTheraTwin_Pipeline."
+                )
+        # Default label ID used as a fallback (TumorRest).
+        self.synthetic_lesion_id: int = int(self._tumor_class_label_ids["TumorRest"])
 
     def _rerun_config_snapshot(self) -> Dict[str, Any]:
         """Return the config subset that must match for cached lesion outputs to remain valid."""
@@ -198,11 +207,28 @@ class SyntheticLesionsStage:
     # -------------------------------------------------------------------------
 
     def _ensure_synthetic_lesion_in_roi_subset(self) -> None:
-        """Ensure downstream ROI subset includes 'synthetic_lesion'."""
+        """Ensure downstream ROI subset includes all active synthetic lesion labels."""
         self.roi_subset = [str(r).strip() for r in self.roi_subset if str(r).strip()]
-        if "synthetic_lesion" not in self.roi_subset:
-            self.roi_subset.append("synthetic_lesion")
-        self.context.downstream_roi_subset = list(self.roi_subset)  
+        # Determine which tumor classes are active from specs.
+        active_labels = self._active_synthetic_lesion_labels()
+        for lbl in active_labels:
+            if lbl not in self.roi_subset:
+                self.roi_subset.append(lbl)
+        self.context.downstream_roi_subset = list(self.roi_subset)
+
+    def _active_synthetic_lesion_labels(self) -> List[str]:
+        """Return the set of synthetic lesion ROI label names actually used by specs."""
+        if not self.specs:
+            return []
+        seen: List[str] = []
+        for spec in self.specs.values():
+            if not isinstance(spec, dict):
+                continue
+            tc = str(spec.get("pbpk_label", "TumorRest"))
+            lbl = TUMOR_CLASS_TO_LABEL.get(tc, TUMOR_CLASS_TO_LABEL["TumorRest"])
+            if lbl not in seen:
+                seen.append(lbl)
+        return seen
 
     def _load_unified_seg(self) -> Tuple[nib.Nifti1Image, np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -251,6 +277,7 @@ class SyntheticLesionsStage:
             "file_prefix": self.prefix,
             "pytheratwin_roi_seg_path": self.pytheratwin_roi_seg_path,
             "synthetic_lesion_id": int(self.synthetic_lesion_id),
+            "pbpk_label_ids": {k: int(v) for k, v in self._tumor_class_label_ids.items()},
             "default_seed": int(self.default_seed),
             "auto_shrink_factor": float(self.auto_shrink_factor),
             "auto_max_shrink_iters": int(self.auto_max_shrink_iters),
@@ -277,11 +304,11 @@ class SyntheticLesionsStage:
     # -------------------------------------------------------------------------
 
     def _validate_roi_name(self, roi_name: str) -> None:
-        """Validate ROI exists in label map and is not synthetic_lesion itself."""
+        """Validate ROI exists in label map and is not a synthetic lesion label itself."""
         if roi_name not in self.pytheratwin_name2id:
             raise ValueError(f"ROI '{roi_name}' not found in PyTheraTwin_Pipeline label map.")
-        if roi_name == "synthetic_lesion":
-            raise ValueError("Do not specify lesions inside ROI='synthetic_lesion'.")
+        if roi_name in SYNTHETIC_LESION_LABELS:
+            raise ValueError(f"Do not specify lesions inside ROI='{roi_name}' (synthetic lesion label).")
 
     def _parse_roi_spec(self, roi_name: str, spec: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -344,6 +371,15 @@ class SyntheticLesionsStage:
                 raise ValueError(f"[{roi_name}] user_centers_zyx length must match n_lesions ({n_lesions}).")
             user_centers_zyx = [tuple(map(int, c)) for c in user_centers_raw]
 
+        # pbpk_label determines which PBPK VOI and which label ID the lesion voxels receive.
+        raw_tc = spec.get("pbpk_label", "TumorRest")
+        if raw_tc not in TUMOR_CLASS_TO_LABEL:
+            raise ValueError(
+                f"[{roi_name}] pbpk_label must be one of {sorted(TUMOR_CLASS_TO_LABEL)}, "
+                f"got {raw_tc!r}."
+            )
+        pbpk_label: str = raw_tc
+
         return {
             "n_lesions": n_lesions,
             "prob": prob,
@@ -353,6 +389,7 @@ class SyntheticLesionsStage:
             "auto_radii": bool(auto_radii),
             "radii_mm": radii_mm,
             "user_centers_zyx": user_centers_zyx,
+            "pbpk_label": pbpk_label,
         }
 
     def _auto_place_roi_lesions(
@@ -419,7 +456,7 @@ class SyntheticLesionsStage:
         seg_nii: nib.Nifti1Image,
         spacing_zyx_mm: np.ndarray,
         global_next_id: int,
-        global_lesion_binary_zyx: np.ndarray,
+        global_lesion_binary_by_class: Dict[str, np.ndarray],
         global_lesion_labels_zyx: np.ndarray,
     ) -> Tuple[Optional[Dict[str, Any]], int]:
         """
@@ -485,8 +522,10 @@ class SyntheticLesionsStage:
         roi_lesion_binary_zyx = (roi_lesion_labels_zyx > 0).astype(np.uint8)
         roi_organ_minus_lesions_zyx = (organ_mask_zyx & (roi_lesion_binary_zyx == 0)).astype(np.uint8)
 
-        # Update global lesion binary
-        global_lesion_binary_zyx |= roi_lesion_binary_zyx # lesion voxels are 1, so bitwise OR accumulates them across ROIs
+        # Update per-class binary accumulator (accumulate into the correct PBPK class bucket).
+        pbpk_label_val = str(parsed.get("pbpk_label", "TumorRest"))
+        lesion_label_name = TUMOR_CLASS_TO_LABEL.get(pbpk_label_val, TUMOR_CLASS_TO_LABEL["TumorRest"])
+        global_lesion_binary_by_class[lesion_label_name] |= roi_lesion_binary_zyx
 
         # Update global lesion labels by offsetting per-ROI local IDs
         roi_max = int(roi_lesion_labels_zyx.max())
@@ -512,7 +551,9 @@ class SyntheticLesionsStage:
         meta = {
             "roi": roi_name,
             "roi_id": roi_id,
-            "synthetic_lesion_id": int(self.synthetic_lesion_id),
+            "pbpk_label": pbpk_label_val,
+            "lesion_label_name": lesion_label_name,
+            "synthetic_lesion_id": int(self._tumor_class_label_ids.get(pbpk_label_val, self.synthetic_lesion_id)),
             "prob": prob,
             "sigma_mm": float(sigma_mm) if sigma_mm is not None else None,
             "margin_mm": float(margin_mm),  # mm
@@ -531,11 +572,15 @@ class SyntheticLesionsStage:
     def _save_global_outputs(
         self,
         seg_nii: nib.Nifti1Image,
-        global_lesion_binary_zyx: np.ndarray,
+        global_lesion_binary_by_class: Dict[str, np.ndarray],
         global_lesion_labels_zyx: np.ndarray,
     ) -> Tuple[str, str]:
         """Save global lesion binary + label volumes to output_dir; returns (binary_path, labels_path)."""
-        save_nifti_nib(self.global_bin_path, zyx_to_xyz(global_lesion_binary_zyx), seg_nii, dtype=np.uint8)
+        # Combined binary (any lesion, any class).
+        combined_binary = np.zeros(global_lesion_labels_zyx.shape, dtype=np.uint8)
+        for bin_arr in global_lesion_binary_by_class.values():
+            combined_binary |= bin_arr
+        save_nifti_nib(self.global_bin_path, zyx_to_xyz(combined_binary), seg_nii, dtype=np.uint8)
         save_nifti_nib(self.global_lbl_path, zyx_to_xyz(global_lesion_labels_zyx), seg_nii, dtype=np.uint16)
         return self.global_bin_path, self.global_lbl_path
 
@@ -543,14 +588,17 @@ class SyntheticLesionsStage:
         self,
         seg_nii: nib.Nifti1Image,
         seg_zyx: np.ndarray,
-        global_lesion_binary_zyx: np.ndarray,
+        global_lesion_binary_by_class: Dict[str, np.ndarray],
     ) -> None:
         """
-        Overwrite `context.pytheratwin_roi_seg_path` so that lesion voxels become synthetic_lesion_id.
+        Overwrite `context.pytheratwin_roi_seg_path` so that lesion voxels receive their
+        per-tumor-class label ID (synthetic_lesion_tumor1=8, synthetic_lesion_tumor2=60, synthetic_lesion_tumorrest=61).
         Saved as uint8 to avoid label truncation.
         """
         seg_zyx_mod = seg_zyx.copy()
-        seg_zyx_mod[global_lesion_binary_zyx > 0] = int(self.synthetic_lesion_id)
+        for label_name, bin_arr in global_lesion_binary_by_class.items():
+            label_id = int(self.pytheratwin_name2id.get(label_name, self.synthetic_lesion_id))
+            seg_zyx_mod[bin_arr > 0] = label_id
 
         seg_xyz_mod = zyx_to_xyz(seg_zyx_mod).astype(np.uint8, copy=False)
         save_nifti_nib(self.pytheratwin_roi_seg_path, seg_xyz_mod, seg_nii, dtype=np.uint8)
@@ -616,9 +664,12 @@ class SyntheticLesionsStage:
         seg_nii, seg_xyz, seg_zyx, spacing_zyx_mm = self._load_unified_seg()
         backup_path = self._write_backup_seg(seg_nii, seg_xyz)
 
-        # Global accumulators (zyx)
-        global_lesion_binary_zyx = np.zeros(seg_zyx.shape, dtype=np.uint8)
-        global_lesion_labels_zyx = np.zeros(seg_zyx.shape, dtype=np.uint16)  
+        # Global accumulators (zyx): one binary mask per active tumor-class label.
+        active_labels = self._active_synthetic_lesion_labels()
+        global_lesion_binary_by_class: Dict[str, np.ndarray] = {
+            lbl: np.zeros(seg_zyx.shape, dtype=np.uint8) for lbl in active_labels
+        }
+        global_lesion_labels_zyx = np.zeros(seg_zyx.shape, dtype=np.uint16)
         global_next_id = 1
 
         results: Dict[str, Any] = {}
@@ -633,7 +684,7 @@ class SyntheticLesionsStage:
                     seg_nii=seg_nii,
                     spacing_zyx_mm=spacing_zyx_mm,
                     global_next_id=global_next_id,
-                    global_lesion_binary_zyx=global_lesion_binary_zyx,
+                    global_lesion_binary_by_class=global_lesion_binary_by_class,
                     global_lesion_labels_zyx=global_lesion_labels_zyx,
                 )
                 if meta is not None:
@@ -646,7 +697,8 @@ class SyntheticLesionsStage:
                     f"after fixing the config. Original error: {e}"
                 ) from e
 
-        if not results or int(global_lesion_binary_zyx.sum()) == 0:
+        total_lesion_voxels = sum(int(b.sum()) for b in global_lesion_binary_by_class.values())
+        if not results or total_lesion_voxels == 0:
             self._cleanup_failed_run()
             raise RuntimeError(
                 "Synthetic lesion generation did not create any lesion voxels. "
@@ -657,15 +709,15 @@ class SyntheticLesionsStage:
         # Save global masks
         global_bin_path, global_lbl_path = self._save_global_outputs(
             seg_nii=seg_nii,
-            global_lesion_binary_zyx=global_lesion_binary_zyx,
+            global_lesion_binary_by_class=global_lesion_binary_by_class,
             global_lesion_labels_zyx=global_lesion_labels_zyx,
         )
 
-        # Overwrite unified seg on disk with synthetic lesion label
+        # Overwrite unified seg on disk with per-class synthetic lesion labels
         self._overwrite_unified_seg_with_lesions(
             seg_nii=seg_nii,
             seg_zyx=seg_zyx,
-            global_lesion_binary_zyx=global_lesion_binary_zyx,
+            global_lesion_binary_by_class=global_lesion_binary_by_class,
         )
 
         self._save_stage_metadata(results, backup_path, global_bin_path, global_lbl_path)

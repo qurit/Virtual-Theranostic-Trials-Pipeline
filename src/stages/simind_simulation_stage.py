@@ -68,7 +68,7 @@ from src.io.rerun_guard import (
     stage_metadata_path,
     write_json,
 )
-from src.utils.label_utils import load_pytheratwin_label_map, build_class_map, build_label_masks, filter_roi_seg_to_subset, load_isotope_config
+from src.utils.label_utils import load_pytheratwin_label_map, build_class_map, build_label_masks, filter_roi_seg_to_subset, load_isotope_config, SYNTHETIC_LESION_LABELS, TUMOR_CLASS_TO_LABEL
 from src.utils.resize_utils import resolve_simulation_grid
 from src.utils.simind_runtime_utils import (
     aggregate_core_projection_totals,
@@ -483,33 +483,33 @@ class SimindSimulationStage:
             .get("synthetic_lesions_stage", {})
             .get("specs")
         )
-        lesion_hosts = [str(r).strip() for r in lesion_specs] if isinstance(lesion_specs, dict) else []
-        picked_lesion_hosts = [r for r in lesion_hosts if r in self.simind_roi_subset]
-        missing_lesion_hosts = [r for r in lesion_hosts if r not in self.simind_roi_subset]
-        if using_config_roi_subset and "synthetic_lesion" in self.simind_roi_subset:
-            raise ValueError(
-                "SIMIND roi_subset contains internal ROI 'synthetic_lesion'. "
-                "Select lesion host ROIs instead; "
-                "the synthetic_lesion source is added automatically."
-            )
-        if picked_lesion_hosts and missing_lesion_hosts:
-            raise ValueError(
-                "SIMIND roi_subset selects some synthetic-lesion host ROIs "
-                f"({picked_lesion_hosts}) but not all ({missing_lesion_hosts}). "
-                "Include all lesion host ROIs or none."
-            )
-        if picked_lesion_hosts and "synthetic_lesion" not in self.simind_roi_subset:
-            self.simind_roi_subset.append("synthetic_lesion")
+        _syn_labels = set(SYNTHETIC_LESION_LABELS)
+        # Prevent users from manually listing synthetic lesion labels in roi_subset.
+        if using_config_roi_subset:
+            manual_syn = [r for r in self.simind_roi_subset if r in _syn_labels]
+            if manual_syn:
+                raise ValueError(
+                    f"SIMIND roi_subset contains internal synthetic-lesion label(s) {manual_syn}. "
+                    "These are added automatically when specs are present; do not list them manually."
+                )
+        # When any lesion specs exist, always include the active synthetic lesion labels
+        # in the simulation — regardless of which host ROIs are in the SIMIND roi_subset.
+        # This ensures lesions are always simulated even for non-PBPK host organs (spine, etc.).
+        if isinstance(lesion_specs, dict) and lesion_specs:
+            active_lesion_labels = self._active_lesion_labels_from_specs(lesion_specs)
+            for lbl in active_lesion_labels:
+                if lbl not in self.simind_roi_subset:
+                    self.simind_roi_subset.append(lbl)
 
         # Validate SIMIND ROI subset against phase_1 segmented ROIs
         phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])
-        _internal = {"remaining_body", "synthetic_lesion"}
+        _internal = {"remaining_body"} | _syn_labels
         invalid_rois = [r for r in self.simind_roi_subset if r not in phase1_rois and r not in _internal]
         if invalid_rois:
             raise ValueError(
                 f"SIMIND roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. "
                 f"Available: {sorted(phase1_rois)}"
-            )                                                                          
+            )
 
         # Load PyTheraTwin label map
         self.ts_map_path: str = get_label_map_path()
@@ -534,6 +534,19 @@ class SimindSimulationStage:
         if not os.path.exists(self.simind_exe):
             raise FileNotFoundError(f"SIMIND executable not found: {self.simind_exe}")
 
+    @staticmethod
+    def _active_lesion_labels_from_specs(specs: Dict[str, Any]) -> List[str]:
+        """Return the unique synthetic-lesion label names used by the given specs dict."""
+        seen: List[str] = []
+        for spec in specs.values():
+            if not isinstance(spec, dict):
+                continue
+            tc = str(spec.get("pbpk_label", "TumorRest"))
+            lbl = TUMOR_CLASS_TO_LABEL.get(tc, TUMOR_CLASS_TO_LABEL["TumorRest"])
+            if lbl not in seen:
+                seen.append(lbl)
+        return seen
+
     def _rerun_config_snapshot(self) -> Dict[str, Any]:
         """Return the SIMIND settings that must match for cached outputs to remain valid."""
         return build_simind_rerun_snapshot(
@@ -551,7 +564,7 @@ class SimindSimulationStage:
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
             ),
         }
-        if "synthetic_lesion" in self.simind_roi_subset:
+        if any(lbl in self.simind_roi_subset for lbl in SYNTHETIC_LESION_LABELS):
             deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "synthetic_lesions_stage")
             )

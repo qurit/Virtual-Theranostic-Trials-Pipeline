@@ -13,7 +13,7 @@
       // Organs to segment and carry into all downstream stages.
       // Valid names: see "roi_subset" in src/data/pipeline_options.json.
       // Full technical ROI definitions live in src/data/pipeline_roi_naming_map.json.
-      // Reserved labels (background, remaining_body, synthetic_lesion) must NOT appear here.
+      // Reserved labels (background, remaining_body, synthetic_lesion_tumor1/2/rest) must NOT appear here.
       // Every ROI used in simulation or lesion specs must be listed here.
       "roi_subset": ["kidney", "liver", "prostate", "spleen", "heart", "salivary_glands"]
     },
@@ -37,8 +37,10 @@
       "max_lesion_placement_attempts": 4000,
 
       // Per-organ lesion specs. Set to null to skip lesion insertion.
-      // Each key must appear in segmentation_stage.roi_subset and must have a
-      // dedicated non-Rest PBPK VOI in pipeline_roi_naming_map.json.
+      // Any ROI in segmentation_stage.roi_subset can host synthetic lesions — it does not
+      // need a dedicated PBPK VOI. The lesion uses its own PBPK TAC via "pbpk_label".
+      // Lesion sources are always included in simulation automatically, regardless of which
+      // ROIs appear in phase_2 roi_subset.
       //
       // Placement modes (prob):
       //   "uniform"      — random placement anywhere inside the organ
@@ -49,13 +51,25 @@
       //           Omit for auto-radius (derived from organ volume and n_lesions).
       //
       // Common fields: n_lesions, margin_mm (mm clearance), seed (0 = non-reproducible).
+      //
+      // "pbpk_label": which PBPK tumor TAC to use — one of "Tumor1", "Tumor2", "TumorRest".
+      //   Each maps to a distinct PyCNO PSMA observable. Multiple lesion specs can share
+      //   the same pbpk_label (they share the same TAC but can have different sizes/positions).
+      //   Default: "TumorRest".
+      //   Example (patient 11: liver→Tumor1 6 mm, spine×2→Tumor2 and TumorRest):
+      //   "specs": {
+      //     "liver":  {"n_lesions":1,"prob":"user_defined","radii_mm":[6.0],"user_centers_zyx":[[z,y,x]],"pbpk_label":"Tumor1"},
+      //     "spine_1":{"n_lesions":1,"prob":"user_defined","radii_mm":[10.0],"user_centers_zyx":[[z,y,x]],"pbpk_label":"Tumor2"},
+      //     "spine_2":{"n_lesions":1,"prob":"user_defined","radii_mm":[11.0],"user_centers_zyx":[[z,y,x]],"pbpk_label":"TumorRest"}
+      //   }
       "specs": {
         "liver": {
           "n_lesions": 5,
           "prob": "gaussian",
           "sigma_mm": 60.0,
           "margin_mm": 1.0,
-          "seed": 0
+          "seed": 0,
+          "pbpk_label": "TumorRest"
         }
       }
     },
@@ -85,8 +99,8 @@
 
       // ROIs to simulate. Must be a subset of segmentation_stage.roi_subset and
       // have a dedicated non-Rest PBPK VOI in pipeline_roi_naming_map.json.
-      // If any selected ROI has synthetic lesions, all lesion-host ROIs must be
-      // selected; the internal synthetic_lesion/Tumor1 source is added automatically.
+      // Synthetic lesion sources (Tumor1/Tumor2/TumorRest) are always added automatically
+      // when specs are present — you do not need to list lesion host organs here.
       "roi_subset": ["liver", "kidney", "salivary_glands"],
 
       // Target voxel spacing in mm as [sxy, sxy, sz], or null to use native CT spacing.

@@ -81,7 +81,7 @@ from src.io.rerun_guard import (
     write_json,
 )
 from src.utils.nifti_utils import save_nii_sitk
-from src.utils.label_utils import load_pytheratwin_label_map, filter_roi_seg_to_subset, load_isotope_config
+from src.utils.label_utils import load_pytheratwin_label_map, filter_roi_seg_to_subset, load_isotope_config, SYNTHETIC_LESION_LABELS, TUMOR_CLASS_TO_LABEL
 from src.utils.opengate_utils import (
     cleanup_mhd,
     find_hu_tables,
@@ -249,33 +249,35 @@ class OpenGateSimulationStage:
             .get("synthetic_lesions_stage", {})
             .get("specs")
         )
-        lesion_hosts = [str(r).strip() for r in lesion_specs] if isinstance(lesion_specs, dict) else []
-        picked_lesion_hosts = [r for r in lesion_hosts if r in opengate_roi_subset]
-        missing_lesion_hosts = [r for r in lesion_hosts if r not in opengate_roi_subset]
-        if using_config_roi_subset and "synthetic_lesion" in opengate_roi_subset:
-            raise ValueError(
-                "OpenGATE roi_subset contains internal ROI 'synthetic_lesion'. "
-                "Select lesion host ROIs instead; "
-                "the synthetic_lesion source is added automatically."
-            )
-        if picked_lesion_hosts and missing_lesion_hosts:
-            raise ValueError(
-                "OpenGATE roi_subset selects some synthetic-lesion host ROIs "
-                f"({picked_lesion_hosts}) but not all ({missing_lesion_hosts}). "
-                "Include all lesion host ROIs or none."
-            )
-        if picked_lesion_hosts and "synthetic_lesion" not in opengate_roi_subset:
-            opengate_roi_subset.append("synthetic_lesion")
+        _syn_labels = set(SYNTHETIC_LESION_LABELS)
+        # Prevent users from manually listing synthetic lesion labels in roi_subset.
+        if using_config_roi_subset:
+            manual_syn = [r for r in opengate_roi_subset if r in _syn_labels]
+            if manual_syn:
+                raise ValueError(
+                    f"OpenGATE roi_subset contains internal synthetic-lesion label(s) {manual_syn}. "
+                    "These are added automatically when specs are present; do not list them manually."
+                )
+        # When any lesion specs exist, always include the active synthetic lesion labels
+        # in the simulation — regardless of which host ROIs are in the OpenGATE roi_subset.
+        if isinstance(lesion_specs, dict) and lesion_specs:
+            for spec in lesion_specs.values():
+                if not isinstance(spec, dict):
+                    continue
+                tc = str(spec.get("pbpk_label", "TumorRest"))
+                lbl = TUMOR_CLASS_TO_LABEL.get(tc, TUMOR_CLASS_TO_LABEL["TumorRest"])
+                if lbl not in opengate_roi_subset:
+                    opengate_roi_subset.append(lbl)
 
         # Validate OpenGATE ROI subset against phase_1 segmented ROIs
         phase1_rois = set(getattr(context, "downstream_roi_subset", []) or [])
-        _internal = {"remaining_body", "synthetic_lesion"}
+        _internal = {"remaining_body"} | _syn_labels
         invalid_rois = [r for r in opengate_roi_subset if r not in phase1_rois and r not in _internal]
         if invalid_rois:
             raise ValueError(
                 f"OpenGATE roi_subset contains ROIs not segmented in Phase 1: {invalid_rois}. "
                 f"Available: {sorted(phase1_rois)}"
-            )                                                                          
+            )
 
         roi_list: List[str] = []
         if "remaining_body" in self.pytheratwin_name2id:
@@ -308,7 +310,7 @@ class OpenGateSimulationStage:
                 stage_metadata_path(self.context.output_folder_path, "segmentation_stage")
             ),
         }
-        if "synthetic_lesion" in self.requested_roi_subset:
+        if any(lbl in self.requested_roi_subset for lbl in SYNTHETIC_LESION_LABELS):
             deps["synthetic_lesions_stage_metadata"] = fingerprint_optional_file(
                 stage_metadata_path(self.context.output_folder_path, "synthetic_lesions_stage")
             )

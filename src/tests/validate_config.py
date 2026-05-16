@@ -67,7 +67,7 @@ from typing import Any, Dict, List, Optional, Set
 from json_minify import json_minify
 
 from src.io.config_paths import get_pipeline_input_paths
-from src.utils.label_utils import RESERVED_ROIS, load_pbpk_compatible_rois, load_pipeline_roi_map
+from src.utils.label_utils import RESERVED_ROIS, SYNTHETIC_LESION_LABELS, TUMOR_CLASS_TO_LABEL, load_pbpk_compatible_rois, load_pipeline_roi_map
 
 
 def _load_roi_map(repo_root: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -279,9 +279,10 @@ def validate_config(
                     "must be a non-empty string"
                 )
                 continue
-            if roi_name == "synthetic_lesion":
+            if roi_name in SYNTHETIC_LESION_LABELS:
                 _err(
-                    "'phase_1.synthetic_lesions_stage.specs.synthetic_lesion' is not allowed"
+                    f"'{prefix}' uses a reserved synthetic lesion label as a host ROI key — "
+                    "use an actual organ ROI name (e.g. 'liver', 'spine')."
                 )
             if roi_name not in allowed_roi_names:
                 _err(
@@ -376,6 +377,13 @@ def validate_config(
                     f"'{prefix}.user_centers_zyx' is only used when prob='user_defined'"
                 )
 
+            pbpk_label = spec.get("pbpk_label", "TumorRest")
+            if not isinstance(pbpk_label, str) or pbpk_label not in TUMOR_CLASS_TO_LABEL:
+                _err(
+                    f"'{prefix}.pbpk_label' must be one of "
+                    f"{sorted(TUMOR_CLASS_TO_LABEL)}, got {pbpk_label!r}"
+                )
+
     def _check_no_overlapping_totseg_sources(rois: List[str], field: str) -> None:
         """Reject ROI selections that would paint the same TotalSegmentator label twice."""
         if not _roi_map:
@@ -418,7 +426,7 @@ def validate_config(
         if manual_internal:
             _err(
                 f"'{stage_field}' contains internal/reserved ROI(s) {manual_internal}. "
-                "'remaining_body' and 'synthetic_lesion' are added internally when needed; "
+                "'remaining_body' and synthetic lesion labels are added internally; "
                 "do not list them in config."
             )
 
@@ -439,17 +447,9 @@ def validate_config(
                     "'bone', 'gi_tract', or 'muscle' where applicable, or remove "
                     "the ROI from simulation."
                 )
-        if lesion_rois:
-            picked_lesion = [r for r in stage_rois if r in lesion_rois]
-            missing_lesion = [r for r in lesion_rois if r not in stage_rois]
-            if picked_lesion and missing_lesion:
-                _err(
-                    f"'{stage_field}' includes ROIs with synthetic lesions "
-                    f"({picked_lesion}) but is missing other ROIs that also "
-                    f"have synthetic lesions ({missing_lesion}). Either include all "
-                    "synthetic-lesion host ROIs or none. The synthetic_lesion source "
-                    "is then added internally."
-                )
+        # No all-or-none check for lesion host ROIs: synthetic lesion labels are always
+        # added automatically to the simulation roi_subset when specs are present,
+        # regardless of which host organ ROIs the user selects here.
 
     # ── Top-level ──────────────────────────────────────────────────────────────
 
@@ -560,15 +560,6 @@ def validate_config(
                 _check_number(v, f"phase_1.synthetic_lesions_stage.{num_field}")
         _check_synthetic_lesion_specs(sl.get("specs"), roi_subset)
         lesion_rois = [r for r in sl["specs"] if isinstance(r, str)]
-        if _pbpk_compatible:
-            not_pbpk = [r for r in lesion_rois if r not in _pbpk_compatible]
-            if not_pbpk:
-                _err(
-                    f"'phase_1.synthetic_lesions_stage.specs' defines lesions for ROIs "
-                    f"without a dedicated PBPK VOI: {not_pbpk}. Synthetic lesions require "
-                    f"a distinct TAC so their signal can be separated in simulation. "
-                    f"Remove these ROIs from specs or add a PBPK VOI mapping."
-                )
 
     # ── Phase 2 ────────────────────────────────────────────────────────────────
 
