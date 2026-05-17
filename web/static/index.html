@@ -38,7 +38,7 @@ window.onerror = function(msg, src, line, col, err) {
 };
 </script>
 <script type="text/babel">
-const { useState, useEffect, useRef, useCallback } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 // ─── constants ────────────────────────────────────────────────────────────────
 const DEVELOPER_FIELDS = new Set([
@@ -83,6 +83,7 @@ const EXTRA_FLAGS = [
 ];
 const PROFILE_INTERVAL_OPTIONS = [0.1,0.2,0.5,1.0,2.0,3.0];
 const PROB_OPTIONS = ['uniform','gaussian','user_defined'];
+const DEFAULT_FLAGS = {segmentation:false,pbpk:false,synthetic_lesions:false,spect:false,dosimetry:false,postprocess:false,logging_on:false,profile:false};
 const RESERVED_ROIS = new Set(['background','remaining_body','synthetic_lesion_tumor1','synthetic_lesion_tumor2','synthetic_lesion_tumorrest']);
 // Maps each stage key to the flag that gates it (stage hidden + cleared when flag is OFF)
 const STAGE_FLAG_MAP = {
@@ -93,6 +94,16 @@ const STAGE_FLAG_MAP = {
   opengate_stage:            'dosimetry',
   spect_postprocess_stage:   'postprocess',
   dosemap_postprocess_stage: 'postprocess',
+};
+// All flags that must be ON for a stage to be active (compound dependencies)
+const STAGE_ALL_FLAGS = {
+  segmentation_stage:        ['segmentation'],
+  synthetic_lesions_stage:   ['synthetic_lesions'],
+  pbpk_tac_stage:            ['pbpk'],
+  simind_stage:              ['spect'],
+  opengate_stage:            ['dosimetry'],
+  spect_postprocess_stage:   ['postprocess','spect'],
+  dosemap_postprocess_stage: ['postprocess','dosimetry'],
 };
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -214,7 +225,11 @@ function Page2CTInput({patients,setPatients,patientShapes,setPatientShapes,patie
       const sres=await apiFetch('/api/scan-directory',{method:'POST',body:JSON.stringify({path})});
       if(!sres.ok){const err=await sres.json();setError(err.detail||'Scan failed');setScanning(false);return;}
       const sdata=await sres.json();
-      setPatients(sdata.patients);
+      const sortedPats=[...(sdata.patients||[])].sort((a,b)=>{
+        const n=s=>parseInt((s.name||'').match(/\d+/)?.[0]??'0',10);
+        return n(a)-n(b);
+      });
+      setPatients(sortedPats);
       sdata.patients.forEach(p=>loadPreview(p));
     }catch(e){setError('Error: '+e.message);}
     setScanning(false);
@@ -499,6 +514,72 @@ function NullField({call}){
           onBlur={e=>{const r=e.target.value;const n=parseFloat(r);call(isNaN(n)?(r||null):n);}}
           className="w-32 px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"/>
       )}
+    </div>
+  );
+}
+
+// ─── PatientFlagPanel ────────────────────────────────────────────────────────
+function PatientFlagPanel({flags,onFlagChange,isFirst,mode,setMode,profileIntervalS,setProfileIntervalS}){
+  const phaseGroups=FLAG_GROUPS.map(g=>({...g}));
+  return(
+    <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 mb-3">
+      <p className="text-[10px] uppercase tracking-widest text-slate-500 font-semibold mb-2 flex items-center gap-2">
+        Stages to run for this patient
+        {isFirst&&<span className="text-[9px] text-blue-500 normal-case font-normal border border-blue-200 bg-blue-50 px-1.5 py-0.5 rounded">Patient 1 — sets the reference for sync</span>}
+      </p>
+      <div className="space-y-2">
+        {phaseGroups.map(({phase,items})=>(
+          <div key={phase}>
+            <p className="text-[9px] uppercase tracking-widest text-slate-400 font-semibold mb-1">{phase}</p>
+            <div className="flex flex-wrap gap-1.5">
+              {items.map(({key,label,desc})=>(
+                <label key={key} title={desc} className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border cursor-pointer select-none text-xs transition-colors
+                  ${flags?.[key]?'border-blue-400 bg-blue-50 text-blue-700':'border-slate-200 hover:border-slate-300 bg-white text-slate-600'}`}>
+                  <input type="checkbox" checked={!!flags?.[key]} onChange={e=>onFlagChange(key,e.target.checked)} className="w-3 h-3 accent-blue-600 flex-shrink-0"/>
+                  <span className="font-medium">{label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        ))}
+        {/* Extras: logging + profiling + run mode */}
+        <div>
+          <p className="text-[9px] uppercase tracking-widest text-slate-400 font-semibold mb-1">Run settings</p>
+          <div className="flex flex-wrap items-center gap-2">
+            {EXTRA_FLAGS.map(({key,label,desc})=>(
+              <label key={key} title={desc} className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border cursor-pointer select-none text-xs transition-colors
+                ${flags?.[key]?'border-slate-500 bg-slate-100 text-slate-700':'border-slate-200 hover:border-slate-300 bg-white text-slate-600'}`}>
+                <input type="checkbox" checked={!!flags?.[key]} onChange={e=>onFlagChange(key,e.target.checked)} className="w-3 h-3 accent-blue-600 flex-shrink-0"/>
+                <span className="font-medium">{label}</span>
+              </label>
+            ))}
+            {flags?.profile&&(
+              <select value={String(profileIntervalS)} onChange={e=>setProfileIntervalS&&setProfileIntervalS(parseFloat(e.target.value))}
+                className="px-2 py-1 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400 bg-white"
+                title="Profiler sampling interval">
+                {PROFILE_INTERVAL_OPTIONS.map(opt=><option key={opt} value={opt}>{opt} s</option>)}
+              </select>
+            )}
+            {/* Run Mode */}
+            <div className="flex items-center gap-1.5 ml-1 flex-wrap">
+              <span className="text-[10px] text-slate-500 font-medium">Mode:</span>
+              {['PRODUCTION','DEBUG'].map(m=>(
+                <button key={m} onClick={()=>setMode&&setMode(m)}
+                  title={m==='PRODUCTION'?'Cleans up temp/work files after each stage — use for real runs':'Keeps all intermediate files on disk — use for troubleshooting'}
+                  className={`px-2.5 py-1 rounded-lg text-[10px] font-semibold border transition-colors
+                    ${mode===m?(m==='PRODUCTION'?'bg-emerald-600 text-white border-emerald-600':'bg-amber-500 text-white border-amber-500'):'bg-white text-slate-500 border-slate-200 hover:border-slate-300'}`}>
+                  {m}
+                </button>
+              ))}
+              {mode&&(
+                <span className="text-[10px] text-slate-400 italic">
+                  {mode==='PRODUCTION'?'Temp files cleaned after each stage':'All intermediate files kept on disk'}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -999,7 +1080,6 @@ function NumProjectionsField({value,onChange,desc,opts}){
 // ─── P1SegRoiSelector ─────────────────────────────────────────────────────────
 // Task-based ROI selector for the Phase 1 segmentation stage.
 function P1SegRoiSelector({value,call,roiTaskGroups,pbpkCompatibleRois,lesionSpecs,roiOverlaps}){
-  const TASK_LABELS={total:'Total Segmentation',head_glands_cavities:'Head Glands & Cavities'};
   const CAT_ORDER=['organs','bones','vessels','muscles','head'];
   const CAT_LABELS={organs:'Organs',bones:'Bones',vessels:'Vessels',muscles:'Muscles',head:'Glands & Cavities'};
   const pbpkSet=pbpkCompatibleRois instanceof Set?pbpkCompatibleRois:new Set(pbpkCompatibleRois||[]);
@@ -1007,46 +1087,49 @@ function P1SegRoiSelector({value,call,roiTaskGroups,pbpkCompatibleRois,lesionSpe
   const selectedSet=new Set(value||[]);
   const conflictsFor=roi=>(roiOverlaps?.[roi]||[]).filter(r=>selectedSet.has(r));
 
-  const taskRois=taskKey=>Object.values(roiTaskGroups?.[taskKey]||{}).flat();
+  // Merge all task groups into a single flat category map
+  const allCats={};
+  Object.values(roiTaskGroups||{}).forEach(taskCats=>{
+    Object.entries(taskCats).forEach(([cat,rois])=>{
+      if(!allCats[cat]) allCats[cat]=[];
+      rois.forEach(r=>{ if(!allCats[cat].includes(r)) allCats[cat].push(r); });
+    });
+  });
+  const allRois=CAT_ORDER.flatMap(c=>allCats[c]||[]);
 
-  const [totalOpen,setTotalOpen]=useState(false);
-  const [headOpen,setHeadOpen]=useState(false);
-  useEffect(()=>{
-    if((value||[]).some(r=>taskRois('total').includes(r))) setTotalOpen(true);
-    if((value||[]).some(r=>taskRois('head_glands_cavities').includes(r))) setHeadOpen(true);
-  },[]); // eslint-disable-line
-
-  const handleTask=(taskKey,checked,setOpen)=>{
-    setOpen(checked);
-    if(!checked){const s=new Set(taskRois(taskKey));call((value||[]).filter(r=>!s.has(r)));}
-  };
   const toggleRoi=(roi,sel)=>{
     if(!sel){call((value||[]).filter(r=>r!==roi));return;}
     const conflicts=new Set(roiOverlaps?.[roi]||[]);
     call([...new Set([...(value||[]).filter(r=>!conflicts.has(r)),roi])]);
   };
-  const selectAll=taskKey=>{
+  const allSel=allRois.length>0&&allRois.every(r=>(value||[]).includes(r));
+  const selectAll=()=>{
     const next=new Set(value||[]);
-    taskRois(taskKey).forEach(roi=>{
+    allRois.forEach(roi=>{
       const conflicts=roiOverlaps?.[roi]||[];
       if(!conflicts.some(r=>next.has(r))) next.add(roi);
     });
     call([...next]);
   };
-  const deselectAll=taskKey=>{const s=new Set(taskRois(taskKey));call((value||[]).filter(r=>!s.has(r)));};
+  const deselectAll=()=>call([]);
 
-  const renderPanel=(taskKey)=>{
-    const cats=roiTaskGroups?.[taskKey]||{};
-    const ordered=CAT_ORDER.filter(c=>cats[c]&&cats[c].length>0);
-    const allTask=taskRois(taskKey);
-    const allSel=allTask.length>0&&allTask.every(r=>(value||[]).includes(r));
-    return(
-      <div className="px-3 pb-3 pt-1 ml-1 border-t border-blue-100 bg-blue-50/30">
-        {ordered.map(cat=>(
+  const selectedWithLesions=(value||[]).filter(r=>roisWithLesions.has(r));
+  return(
+    <div className="py-2 border-b border-slate-100 last:border-0">
+      <div className="flex items-center gap-1.5 mb-2">
+        <span className="text-sm font-medium text-slate-700">roi_subset</span>
+        <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded font-mono">{(value||[]).length} selected</span>
+        <button onClick={()=>allSel?deselectAll():selectAll()}
+          className="ml-auto text-[10px] text-blue-600 hover:text-blue-800 border border-blue-200 hover:border-blue-400 px-2 py-0.5 rounded-lg font-medium">
+          {allSel?'Deselect all':'Select all'}
+        </button>
+      </div>
+      <div className="border border-slate-200 rounded-lg overflow-hidden bg-blue-50/20 px-3 pb-3 pt-1">
+        {CAT_ORDER.filter(cat=>(allCats[cat]||[]).length>0).map(cat=>(
           <div key={cat} className="mt-2">
             <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">{CAT_LABELS[cat]||cat}</p>
             <div className="flex flex-wrap gap-1">
-              {cats[cat].map(roi=>{
+              {allCats[cat].map(roi=>{
                 const sel=(value||[]).includes(roi);
                 const hasPbpk=pbpkSet.has(roi);
                 const hasLesion=roisWithLesions.has(roi);
@@ -1066,47 +1149,10 @@ function P1SegRoiSelector({value,call,roiTaskGroups,pbpkCompatibleRois,lesionSpe
             </div>
           </div>
         ))}
-        <button onClick={()=>allSel?deselectAll(taskKey):selectAll(taskKey)}
-          className="mt-2 text-[10px] text-blue-600 hover:text-blue-800 border border-blue-200 hover:border-blue-400 px-2 py-0.5 rounded-lg font-medium">
-          {allSel?'Deselect all':'Select all'}
-        </button>
-      </div>
-    );
-  };
-
-  const tasks=[
-    {key:'total',open:totalOpen,setOpen:setTotalOpen},
-    {key:'head_glands_cavities',open:headOpen,setOpen:setHeadOpen},
-  ];
-  const selectedWithLesions=(value||[]).filter(r=>roisWithLesions.has(r));
-  return(
-    <div className="py-2 border-b border-slate-100 last:border-0">
-      <div className="flex items-center gap-1.5 mb-2">
-        <span className="text-sm font-medium text-slate-700">roi_subset</span>
-        <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded font-mono">{(value||[]).length} selected</span>
-      </div>
-      <div className="space-y-1.5">
-        {tasks.map(({key,open,setOpen})=>{
-          const n=taskRois(key).length;
-          if(!n) return null;
-          const selCount=(value||[]).filter(r=>taskRois(key).includes(r)).length;
-          return(
-            <div key={key} className="border border-slate-200 rounded-lg overflow-hidden">
-              <label className={`flex items-center gap-2.5 px-3 py-2 cursor-pointer select-none transition-colors ${open?'bg-blue-50':'hover:bg-slate-50'}`}>
-                <input type="checkbox" checked={open} onChange={e=>handleTask(key,e.target.checked,setOpen)} className="w-3.5 h-3.5 accent-blue-600 flex-shrink-0"/>
-                <div className="flex-1 min-w-0">
-                  <span className="text-sm font-medium text-slate-700">{TASK_LABELS[key]||key}</span>
-                  {selCount>0&&<span className="ml-2 text-[10px] text-blue-600 font-semibold">{selCount}/{n}</span>}
-                </div>
-              </label>
-              {open&&renderPanel(key)}
-            </div>
-          );
-        })}
       </div>
       {selectedWithLesions.length>0&&(
         <p className="text-[11px] text-purple-700 bg-purple-50 rounded px-2 py-1 mt-2">
-          ⚠ Synthetic lesions configured for: {selectedWithLesions.join(', ')}
+          Synthetic lesions configured for: {selectedWithLesions.join(', ')}
         </p>
       )}
     </div>
@@ -1219,7 +1265,8 @@ function FieldRenderer({fieldKey,value,path,patientName,onChange,descriptions,pi
 }
 
 // ─── StageSection ─────────────────────────────────────────────────────────────
-function StageSection({stageKey,stageData,basePath,patientName,onChange,descriptions,pipelineOptions,roiChoices,roiTaskGroups,pbpkCompatibleRois,roiOverlaps,patientShape,nativeSpacing,systemCpuCount,lesionSpecs}){
+function StageSection({stageKey,stageData,basePath,patientName,onChange,descriptions,pipelineOptions,roiChoices,roiTaskGroups,pbpkCompatibleRois,roiOverlaps,patientShape,nativeSpacing,systemCpuCount,lesionSpecs,
+  isFirst,isSynced,canSync,onSyncToggle,isDisabled}){
   const [open,setOpen]=useState(false);
   const isSpectPost=stageKey==='spect_postprocess_stage';
   const isSynLesion=stageKey==='synthetic_lesions_stage';
@@ -1232,15 +1279,41 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
   if(isOpengate&&entries.some(([k])=>k==='xyz_spacing_mm')){
     entries=[...entries.filter(([k])=>k==='xyz_spacing_mm'),...entries.filter(([k])=>k!=='xyz_spacing_mm')];
   }
+  const showSyncBox=!isFirst&&canSync;
+  // When disabled (flag off): stage header stays visible for sync button, but content cannot be expanded
+  const canOpen=!isDisabled;
   return(
-    <div className="border border-slate-100 rounded-lg overflow-hidden">
-      <button onClick={()=>setOpen(o=>!o)}
-        className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-slate-50 transition-colors text-left">
-        <span className="text-sm font-medium text-slate-600">{STAGE_LABELS[stageKey]||stageKey}</span>
-        <span className="text-slate-300 text-xs">{open?'▲':'▼'}</span>
-      </button>
-      {open&&(
-        <div className="px-4 pb-3">
+    <div className={`border rounded-lg overflow-hidden transition-colors ${isSynced?'border-indigo-200 bg-indigo-50/30':'border-slate-100'}`}>
+      <div className="flex items-center">
+        <button onClick={canOpen?()=>setOpen(o=>!o):undefined}
+          className={`flex-1 flex items-center justify-between px-4 py-2.5 transition-colors text-left ${canOpen?'hover:bg-slate-50 cursor-pointer':'cursor-default'}`}>
+          <span className="flex items-center gap-2">
+            <span className={`text-sm font-medium ${isDisabled?'text-slate-400':'text-slate-600'}`}>{STAGE_LABELS[stageKey]||stageKey}</span>
+            {isDisabled&&<span className="text-[9px] font-semibold bg-slate-100 text-slate-400 px-1.5 py-0.5 rounded">Flag off — toggle to configure</span>}
+          </span>
+          {canOpen&&<span className="text-slate-300 text-xs">{open?'▲':'▼'}</span>}
+        </button>
+        {showSyncBox&&(
+          <label className="flex items-center gap-1.5 px-3 py-2 cursor-pointer select-none shrink-0"
+            title={isSynced?'Synced from Patient 1 — uncheck to edit independently':'Copy Patient 1 config for this stage'}>
+            <input type="checkbox" checked={!!isSynced}
+              onChange={e=>onSyncToggle&&onSyncToggle(e.target.checked)}
+              className="w-3.5 h-3.5 accent-indigo-500"/>
+            <span className={`text-xs font-medium whitespace-nowrap ${isSynced?'text-indigo-600':'text-slate-400'}`}>
+              {isSynced?'Synced ✓':'Match PT-1'}
+            </span>
+          </label>
+        )}
+      </div>
+      {open&&canOpen&&(
+        <div className={`px-4 pb-3 relative ${isSynced?'pointer-events-none':''}`}>
+          {isSynced&&(
+            <div className="absolute inset-0 bg-indigo-50/60 z-10 flex items-start justify-center pt-4 rounded-b-lg">
+              <span className="text-xs text-indigo-500 font-medium bg-indigo-100 px-2 py-0.5 rounded-full">
+                Synced from Patient 1 — uncheck to edit
+              </span>
+            </div>
+          )}
           {entries.map(([k,v])=>{
             const fPath=[...basePath,k];
             if(typeof v==='object'&&v!==null&&!Array.isArray(v)){
@@ -1284,17 +1357,13 @@ function StageSection({stageKey,stageData,basePath,patientName,onChange,descript
 }
 
 // ─── PhaseSection ─────────────────────────────────────────────────────────────
-function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,roiTaskGroups,pbpkCompatibleRois,roiOverlaps,phase1RoiSubset,patientShape,nativeSpacing,flags,systemCpuCount,lesionSpecs}){
+function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipelineOptions,roiChoices,roiTaskGroups,pbpkCompatibleRois,roiOverlaps,phase1RoiSubset,patientShape,nativeSpacing,flags,systemCpuCount,lesionSpecs,
+  isFirst,syncedStages,p1StageValid,onSyncToggle}){
   const [open,setOpen]=useState(false);
-  const stages=Object.entries(phaseData).filter(([k,v])=>{
-    if(k==='sub_dir_name'||typeof v!=='object'||v===null) return false;
-    // Hide stages whose controlling flag is OFF
-    const flagKey=STAGE_FLAG_MAP[k];
-    if(flagKey&&!flags?.[flagKey]) return false;
-    // dosemap_postprocess_stage additionally requires dosimetry to be on
-    if(k==='dosemap_postprocess_stage'&&!flags?.dosimetry) return false;
-    return true;
-  });
+  // Always show all stages — flags control what RUNS, not what's visible.
+  const stages=Object.entries(phaseData).filter(([k,v])=>
+    k!=='sub_dir_name'&&typeof v==='object'&&v!==null
+  );
   // Constrain to phase_1 selection for all non-segmentation stages
   const constrained=(Array.isArray(phase1RoiSubset)&&phase1RoiSubset.length>0)
     ?roiChoices.filter(r=>phase1RoiSubset.includes(r))
@@ -1312,11 +1381,15 @@ function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipe
             <StageSection key={sk} stageKey={sk} stageData={sd}
               basePath={[phaseKey,sk]} patientName={patientName} onChange={onChange}
               descriptions={descriptions} pipelineOptions={pipelineOptions}
-              // segmentation_stage sees full choices + task groups; everything else is constrained
               roiChoices={sk==='segmentation_stage'?roiChoices:constrained}
               roiTaskGroups={roiTaskGroups} pbpkCompatibleRois={pbpkCompatibleRois} roiOverlaps={roiOverlaps}
               patientShape={patientShape} nativeSpacing={nativeSpacing} systemCpuCount={systemCpuCount}
-              lesionSpecs={lesionSpecs}/>
+              lesionSpecs={lesionSpecs}
+              isFirst={isFirst}
+              isSynced={!isFirst&&(syncedStages instanceof Set?syncedStages.has(sk):false)}
+              canSync={!isFirst&&(typeof p1StageValid==='function'?p1StageValid(sk):false)}
+              onSyncToggle={v=>onSyncToggle&&onSyncToggle(phaseKey,sk,v)}
+              isDisabled={!!(STAGE_ALL_FLAGS[sk]?.some(f=>!flags?.[f]))}/>
           ))}
         </div>
       )}
@@ -1326,18 +1399,18 @@ function PhaseSection({phaseKey,phaseData,patientName,onChange,descriptions,pipe
 
 // ─── Page 3 ───────────────────────────────────────────────────────────────────
 function Page3Configure({patients,projectName,setProjectName,projectDirs,setProjectDirs,
-                         patientConfigs,setPatientConfigs,flags,setFlags,mode,setMode,
-                         patientShapes,patientSpacings,systemCpuCount,
+                         patientConfigs,setPatientConfigs,
+                         patientFlags,setPatientFlags,syncedStages,setSyncedStages,
+                         mode,setMode,patientShapes,patientSpacings,systemCpuCount,
                          profileIntervalS,setProfileIntervalS,onNext,onBack}){
   const [dirsCreated,setDirsCreated]=useState(Object.keys(projectDirs).length>0);
   const [creating,setCreating]=useState(false);
   const [createError,setCreateError]=useState('');
   const [configMeta,setConfigMeta]=useState(null);
-  const [applyToAll,setApplyToAll]=useState(false);
   const [openCards,setOpenCards]=useState({});
-  const [existedDirs,setExistedDirs]=useState({});        // {patient_name: bool}
-  const [completionStatus,setCompletionStatus]=useState({}); // {patient_name: {phase1_segmentation:bool,...}}
-  const [phaseWarnings,setPhaseWarnings]=useState({});    // {patient_name: Set<string>}
+  const [existedDirs,setExistedDirs]=useState({});
+  const [completionStatus,setCompletionStatus]=useState({});
+  const [phaseWarnings,setPhaseWarnings]=useState({});
   const saveTimers=useRef({});
 
   useEffect(()=>{
@@ -1386,13 +1459,26 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
         }catch(_){}
       }));
       setCompletionStatus(statusMap);
-      // Restore run flags/mode/profiling from a previous web UI run if present
-      const savedWebFlags=Object.values(existingCfgs).map(c=>c?._web_ui_flags).find(Boolean);
-      if(savedWebFlags){
-        const flagKeys=['segmentation','pbpk','synthetic_lesions','spect','dosimetry','postprocess','logging_on','profile'];
-        setFlags(prev=>({...prev,...Object.fromEntries(flagKeys.filter(k=>k in savedWebFlags).map(k=>[k,!!savedWebFlags[k]]))}));
-        if(savedWebFlags.mode) setMode(savedWebFlags.mode);
-        if(typeof savedWebFlags.profile_interval_s==='number') setProfileIntervalS(savedWebFlags.profile_interval_s);
+      // Restore per-patient flags from prior _web_ui_flags; new patients get DEFAULT_FLAGS
+      const flagKeys=['segmentation','pbpk','synthetic_lesions','spect','dosimetry','postprocess','logging_on','profile'];
+      setPatientFlags(prev=>{
+        const u={...prev};
+        patients.forEach(p=>{
+          const nm=p.name;
+          const savedWF=existingCfgs[nm]?._web_ui_flags;
+          if(savedWF){
+            u[nm]={...DEFAULT_FLAGS,...Object.fromEntries(flagKeys.filter(k=>k in savedWF).map(k=>[k,!!savedWF[k]]))};
+          } else if(!u[nm]){
+            u[nm]={...DEFAULT_FLAGS};
+          }
+        });
+        return u;
+      });
+      // Restore global mode/profiling from first available prior config
+      const anyWebFlags=Object.values(existingCfgs).map(c=>c?._web_ui_flags).find(Boolean);
+      if(anyWebFlags){
+        if(anyWebFlags.mode) setMode(anyWebFlags.mode);
+        if(typeof anyWebFlags.profile_interval_s==='number') setProfileIntervalS(anyWebFlags.profile_interval_s);
       }
     }catch(e){setCreateError('Error: '+e.message);}
     setCreating(false);
@@ -1431,7 +1517,6 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
       const isP1Roi=path[0]==='phase_1'&&path[path.length-1]==='roi_subset';
       if(isP1Roi){
         const p1Set=new Set(value);
-        // Simulation ROIs must be in Phase 1 selection AND have a dedicated PBPK VOI
         const pbpkSet=new Set(configMeta?.pbpk_compatible_rois||[]);
         const trimRoi=(cfg,ph,st)=>{
           const cur=cfg?.[ph]?.[st]?.roi_subset;
@@ -1441,66 +1526,132 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
         };
         updated[patientName]=trimRoi(updated[patientName],'phase_2','simind_stage');
         updated[patientName]=trimRoi(updated[patientName],'phase_2','opengate_stage');
-        // Lesion specs: only ROIs still in Phase 1 selection AND PBPK-compatible
         const specs=updated[patientName]?.phase_1?.synthetic_lesions_stage?.specs;
         if(specs&&typeof specs==='object'){
-          const newSpecs={};Object.keys(specs).forEach(k=>{if(p1Set.has(k)&&pbpkSet.has(k))newSpecs[k]=specs[k];});
+          const newSpecs={};Object.keys(specs).forEach(k=>{if(p1Set.has(k))newSpecs[k]=specs[k];});
           updated[patientName]=deepSet(updated[patientName],['phase_1','synthetic_lesions_stage','specs'],Object.keys(newSpecs).length?newSpecs:null);
         }
       }
-      const toSync=applyToAll?patients.filter(p=>p.name!==patientName):[];
-      toSync.forEach(p=>{
-        updated[p.name]=deepSet(updated[p.name]||tmpl,path,value);
-        if(isP1Roi){
-          const p1Set=new Set(value);
-          const pbpkSet=new Set(configMeta?.pbpk_compatible_rois||[]);
-          const trimRoi=(cfg,ph,st)=>{
-            const cur=cfg?.[ph]?.[st]?.roi_subset;
-            return Array.isArray(cur)
-              ?deepSet(cfg,[ph,st,'roi_subset'],cur.filter(r=>p1Set.has(r)&&pbpkSet.has(r)))
-              :cfg;
-          };
-          updated[p.name]=trimRoi(updated[p.name],'phase_2','simind_stage');
-          updated[p.name]=trimRoi(updated[p.name],'phase_2','opengate_stage');
-          const specs=updated[p.name]?.phase_1?.synthetic_lesions_stage?.specs;
-          if(specs&&typeof specs==='object'){
-            const ns={};Object.keys(specs).forEach(k=>{if(p1Set.has(k)&&pbpkSet.has(k))ns[k]=specs[k];});
-            updated[p.name]=deepSet(updated[p.name],['phase_1','synthetic_lesions_stage','specs'],Object.keys(ns).length?ns:null);
+      // Propagate Patient 1 changes to any synced patients
+      const patient1Name=patients[0]?.name;
+      if(patientName===patient1Name&&path.length>=2){
+        const [phaseKey,stageKey]=path;
+        Object.entries(syncedStages).forEach(([nm,stagesSet])=>{
+          if(stagesSet.has&&stagesSet.has(stageKey)&&nm!==patientName){
+            const p1StageData=updated[patientName]?.[phaseKey]?.[stageKey];
+            if(p1StageData!==undefined)
+              updated[nm]=deepSet(updated[nm]||{},  [phaseKey,stageKey],JSON.parse(JSON.stringify(p1StageData)));
           }
-        }
-      });
+        });
+      }
       const saveOne=async(nm)=>{const dir=projectDirs[nm];if(!dir)return;try{await apiFetch('/api/save-patient-config',{method:'POST',body:JSON.stringify({output_dir:dir,config:updated[nm]})});}catch(e){console.error('Auto-save failed:',e);}};
       clearTimeout(saveTimers.current[patientName]);
-      saveTimers.current[patientName]=setTimeout(()=>{saveOne(patientName);toSync.forEach(p=>saveOne(p.name));},500);
+      saveTimers.current[patientName]=setTimeout(()=>{
+        saveOne(patientName);
+        if(patientName===patient1Name){
+          Object.keys(syncedStages).forEach(nm=>{if(nm!==patientName)saveOne(nm);});
+        }
+      },500);
       return updated;
     });
-  },[patients,projectDirs,applyToAll,configMeta,completionStatus]);
+  },[patients,projectDirs,configMeta,completionStatus,syncedStages]);
 
-  const handleFlagChange=(key,checked)=>{
-    setFlags(prev=>({...prev,[key]:checked}));
+  const handlePatientFlagChange=useCallback((patientName,key,checked)=>{
+    setPatientFlags(prev=>({...prev,[patientName]:{...(prev[patientName]||DEFAULT_FLAGS),[key]:checked}}));
     if(!checked){
-      // Clear stage-specific data when the controlling flag is turned OFF
+      // All stages that require this flag (may be part of compound requirement)
+      const controlled=Object.entries(STAGE_ALL_FLAGS).filter(([,reqs])=>reqs.includes(key)).map(([s])=>s);
+      // Auto-deselect any synced stages for those gated stages
+      setSyncedStages(prev=>{
+        if(!prev[patientName]) return prev;
+        const s=new Set(prev[patientName]);
+        if(!controlled.some(sk=>s.has(sk))) return prev;
+        controlled.forEach(sk=>s.delete(sk));
+        return {...prev,[patientName]:s};
+      });
+      // Reset those stages to template defaults so re-enabling shows fresh defaults
       setPatientConfigs(prev=>{
         const updated={...prev};
-        Object.keys(updated).forEach(nm=>{
-          if(key==='spect'&&updated[nm]?.phase_2?.simind_stage)
-            updated[nm]=deepSet(updated[nm],['phase_2','simind_stage','roi_subset'],[]);
-          if(key==='dosimetry'&&updated[nm]?.phase_2?.opengate_stage)
-            updated[nm]=deepSet(updated[nm],['phase_2','opengate_stage','roi_subset'],[]);
+        const tmpl=configMeta?.template||{};
+        controlled.forEach(stageKey=>{
+          for(const ph of ['phase_1','phase_2','phase_3']){
+            if(tmpl[ph]?.[stageKey]!==undefined){
+              updated[patientName]=deepSet(updated[patientName]||{},[ph,stageKey],JSON.parse(JSON.stringify(tmpl[ph][stageKey])));
+              break;
+            }
+          }
         });
         return updated;
       });
     }
-  };
+  },[configMeta]);
+
+  const handleSyncToggle=useCallback((patientName,phaseKey,stageKey,newSynced)=>{
+    setSyncedStages(prev=>{
+      const u={};
+      Object.keys(prev).forEach(nm=>{u[nm]=new Set(prev[nm]);});
+      if(!u[patientName]) u[patientName]=new Set();
+      if(newSynced){
+        u[patientName].add(stageKey);
+        const p1Name=patients[0]?.name;
+        if(p1Name&&p1Name!==patientName){
+          // Sync ALL required flags for this stage from Patient 1 so the stage becomes visible
+          const reqFlags=STAGE_ALL_FLAGS[stageKey]||[];
+          if(reqFlags.length){
+            setPatientFlags(prev=>{
+              const p1f=prev[p1Name]||DEFAULT_FLAGS;
+              const pf={...(prev[patientName]||DEFAULT_FLAGS)};
+              reqFlags.forEach(f=>{pf[f]=p1f[f]??false;});
+              return {...prev,[patientName]:pf};
+            });
+          }
+          setPatientConfigs(prev2=>{
+            const p1StageData=prev2[p1Name]?.[phaseKey]?.[stageKey];
+            if(p1StageData===undefined) return prev2;
+            const updated={...prev2,[patientName]:deepSet(prev2[patientName]||{},[phaseKey,stageKey],JSON.parse(JSON.stringify(p1StageData)))};
+            // Save the synced patient's config immediately
+            const dir=projectDirs[patientName];
+            if(dir){
+              clearTimeout(saveTimers.current[patientName]);
+              saveTimers.current[patientName]=setTimeout(async()=>{
+                try{await apiFetch('/api/save-patient-config',{method:'POST',body:JSON.stringify({output_dir:dir,config:updated[patientName]})});}
+                catch(e){console.error('Sync save failed:',e);}
+              },500);
+            }
+            return updated;
+          });
+        }
+      } else {
+        u[patientName].delete(stageKey);
+      }
+      return u;
+    });
+  },[patients,projectDirs,setPatientFlags]);
 
   const roiChoices=(configMeta?.roi_choices||[]).filter(r=>r!=='remaining_body');
   const roiTaskGroups=configMeta?.roi_task_groups||{};
   const pbpkCompatibleRois=new Set(configMeta?.pbpk_compatible_rois||[]);
   const roiOverlaps=configMeta?.roi_overlaps||{};
+
+  // Patient 1 reference data for sync validation
+  const patient1Name=patients[0]?.name;
+  const patient1Config=patient1Name?patientConfigs[patient1Name]:null;
+  const patient1Flags=patient1Name?(patientFlags[patient1Name]||DEFAULT_FLAGS):DEFAULT_FLAGS;
+
+  // Returns true if Patient 1 has config data for the stage (flags irrelevant — sync copies params, not run flags)
+  const p1StageValid=(stageKey)=>{
+    if(!patient1Config) return false;
+    for(const ph of ['phase_1','phase_2','phase_3']){
+      if(patient1Config[ph]?.[stageKey]!==undefined) return true;
+    }
+    return false;
+  };
+
   const page3Issues=[];
   if(dirsCreated&&configMeta){
     patients.forEach(p=>{
       const cfg=patientConfigs[p.name]||configMeta.template||{};
+      const pFlags=patientFlags[p.name]||DEFAULT_FLAGS;
       const p1=cfg?.phase_1?.segmentation_stage?.roi_subset;
       const p1List=Array.isArray(p1)?p1:[];
       const p1Set=new Set(p1List);
@@ -1511,11 +1662,20 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
             page3Issues.push(`[${p.name}] Phase 1 selects overlapping ROIs: ${roi} and ${other}`);
         });
       });
+      // height_m / weight_kg: if provided, must be a positive number
+      ['height_m','weight_kg'].forEach(hwKey=>{
+        const hwVal=cfg?.phase_1?.pbpk_tac_stage?.[hwKey];
+        if(hwVal!=null&&hwVal!==''){
+          const n=Number(hwVal);
+          if(isNaN(n)||n<0) page3Issues.push(`[${p.name}] PBPK ${hwKey} must be a positive number or left blank (blank = DICOM / model default)`);
+        }
+      });
       const specs=cfg?.phase_1?.synthetic_lesions_stage?.specs;
       const lesionRois=specs&&typeof specs==='object'?Object.keys(specs):[];
+      if(pFlags.synthetic_lesions&&lesionRois.length===0)
+        page3Issues.push(`[${p.name}] Synthetic lesions is ON but no lesion specs are configured — open the Synthetic Lesion Generation panel and add at least one organ spec`);
       lesionRois.forEach(roi=>{
         if(!p1Set.has(roi)) page3Issues.push(`[${p.name}] Synthetic lesion spec for ${roi} is not in Phase 1 roi_subset`);
-        // No PBPK-compat check: lesion TAC comes from pbpk_label, not the host ROI.
       });
       const checkSimStage=(enabled,label,roiSubset)=>{
         if(!enabled) return;
@@ -1527,10 +1687,9 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
         if(missingP1.length) page3Issues.push(`[${p.name}] ${label} ROI(s) not selected in Phase 1: ${missingP1.join(', ')}`);
         const notPbpk=rois.filter(r=>!pbpkCompatibleRois.has(r)&&!RESERVED_ROIS.has(r));
         if(notPbpk.length) page3Issues.push(`[${p.name}] ${label} ROI(s) without dedicated non-Rest PBPK VOI: ${notPbpk.join(', ')}`);
-        // Synthetic-lesion labels are added automatically; no all-or-none check on host ROIs.
       };
-      checkSimStage(flags.spect,'SIMIND',cfg?.phase_2?.simind_stage?.roi_subset);
-      checkSimStage(flags.dosimetry,'OpenGATE',cfg?.phase_2?.opengate_stage?.roi_subset);
+      checkSimStage(pFlags.spect,'SIMIND',cfg?.phase_2?.simind_stage?.roi_subset);
+      checkSimStage(pFlags.dosimetry,'OpenGATE',cfg?.phase_2?.opengate_stage?.roi_subset);
     });
   }
   const canContinue=dirsCreated&&page3Issues.length===0;
@@ -1562,78 +1721,14 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
         {dirsCreated&&<div className="mt-3 space-y-0.5">{patients.map((p,i)=><p key={p.name} className="text-xs terminal-font text-slate-400">✓ {projectDirs[p.name]||`${projectName}/CT_${i+1}`}</p>)}</div>}
       </div>
 
-      {/* Pipeline Options */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-5 shadow-sm">
-        <h3 className="font-semibold text-slate-800 mb-1">Pipeline Options</h3>
-        <p className="text-xs text-slate-500 mb-4">Select which stages to run.</p>
-        {FLAG_GROUPS.map(({phase,items})=>(
-          <div key={phase} className="mb-4">
-            <p className="text-[10px] uppercase tracking-widest text-slate-400 font-semibold mb-2">{phase}</p>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-              {items.map(({key,label,desc})=>(
-                <label key={key} className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors select-none
-                  ${flags[key]?'border-blue-400 bg-blue-50':'border-slate-200 hover:border-slate-300 bg-white'}`}>
-                  <input type="checkbox" checked={!!flags[key]} onChange={e=>handleFlagChange(key,e.target.checked)}
-                    className="mt-0.5 w-4 h-4 accent-blue-600 flex-shrink-0"/>
-                  <div><p className="font-semibold text-slate-800 text-sm">{label}</p>
-                    <p className="text-xs text-slate-500 mt-0.5 leading-snug">{desc}</p></div>
-                </label>
-              ))}
-            </div>
-          </div>
-        ))}
-        <div className="mb-4">
-          <p className="text-[10px] uppercase tracking-widest text-slate-400 font-semibold mb-2">Extras</p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {EXTRA_FLAGS.map(({key,label,desc})=>(
-              <label key={key} className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors select-none
-                ${flags[key]?'border-blue-400 bg-blue-50':'border-slate-200 hover:border-slate-300 bg-white'}`}>
-                <input type="checkbox" checked={!!flags[key]} onChange={e=>handleFlagChange(key,e.target.checked)}
-                  className="mt-0.5 w-4 h-4 accent-blue-600 flex-shrink-0"/>
-                <div><p className="font-semibold text-slate-800 text-sm">{label}</p>
-                  <p className="text-xs text-slate-500 mt-0.5 leading-snug">{desc}</p></div>
-              </label>
-            ))}
-          </div>
-        </div>
-        {flags.profile&&(
-          <div className="mb-5 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 flex items-center justify-between gap-4 flex-wrap">
-            <div>
-              <p className="text-sm font-semibold text-slate-800">Profiler Sampling Interval</p>
-              <p className="text-xs text-slate-500 mt-0.5">Choose how often CPU and RAM are sampled. Shorter intervals capture brief spikes better but add a little more overhead. Allowed range: 0.1 s to 3.0 s.</p>
-            </div>
-            <select value={String(profileIntervalS)} onChange={e=>setProfileIntervalS(parseFloat(e.target.value))}
-              className="px-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white">
-              {PROFILE_INTERVAL_OPTIONS.map(opt=><option key={opt} value={opt}>{opt} s</option>)}
-            </select>
-          </div>
-        )}
-        <div className="border-t border-slate-100 pt-4 flex items-center gap-4 flex-wrap">
-          <span className="text-sm font-semibold text-slate-700 flex-shrink-0">Run Mode</span>
-          <div className="flex gap-2">
-            {['PRODUCTION','DEBUG'].map(m=>(
-              <button key={m} onClick={()=>setMode(m)}
-                className={`px-5 py-1.5 rounded-lg text-sm font-semibold border transition-colors
-                  ${mode===m?(m==='PRODUCTION'?'bg-emerald-600 text-white border-emerald-600':'bg-amber-500 text-white border-amber-500'):'bg-white text-slate-600 border-slate-300 hover:border-slate-400'}`}>
-                {m}
-              </button>
-            ))}
-          </div>
-          <span className="text-xs text-slate-400">{mode==='DEBUG'?'Reduced iterations — faster testing':'Full production-quality simulation'}</span>
-        </div>
-      </div>
-
       {/* Per-patient config */}
       {dirsCreated&&configMeta&&(
         <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
-          <div className="flex items-center justify-between mb-1">
-            <h3 className="font-semibold text-slate-800">Per-Patient Configuration</h3>
-            <label className="flex items-center gap-2 cursor-pointer select-none">
-              <input type="checkbox" checked={applyToAll} onChange={e=>setApplyToAll(e.target.checked)} className="w-4 h-4 accent-blue-600"/>
-              <span className="text-slate-600 text-sm">Sync all patients</span>
-            </label>
-          </div>
-          <p className="text-xs text-slate-400 mb-4">Changes auto-save to each config.json. Phase 2 ROI pickers and lesion specs are constrained to Phase 1 selection.</p>
+          <h3 className="font-semibold text-slate-800 mb-1">Per-Patient Configuration</h3>
+          <p className="text-xs text-slate-400 mb-4">
+            Configure each patient independently. Stage flags (which stages to run) are set per patient below.
+            For patients 2+, use <span className="font-semibold text-blue-600">Match PT-1</span> next to any stage to copy Patient 1's settings — the stage becomes read-only while matched.
+          </p>
           {Object.values(existedDirs).some(Boolean)&&(
             <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5 mb-4 text-xs text-amber-800">
               <span className="flex-shrink-0 mt-0.5">⚠</span>
@@ -1643,59 +1738,65 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
           <div className="space-y-2">
             {patients.map((p,i)=>{
               const cfg=patientConfigs[p.name]||configMeta.template;
+              const pFlags=patientFlags[p.name]||DEFAULT_FLAGS;
               const cardOpen=!!openCards[p.name];
               const shape=patientShapes[p.name]||null;
               const nativeSpacing=patientSpacings[p.name]||null;
-              // Phase 1 segmentation roi_subset is the source of truth for all ROI constraints
               const p1RoiSubset=cfg?.phase_1?.segmentation_stage?.roi_subset??null;
               const hasPrior=!!existedDirs[p.name];
+              const isFirst=i===0;
+              const pSynced=syncedStages[p.name]||new Set();
               return(
                 <div key={p.name} className="border border-slate-200 rounded-xl overflow-hidden">
                   <button onClick={()=>setOpenCards(prev=>({...prev,[p.name]:!prev[p.name]}))}
                     className="w-full flex items-center justify-between px-4 py-3 bg-slate-50 hover:bg-slate-100 transition-colors text-left">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-semibold text-slate-700 text-sm">CT_{i+1} — {p.name}</span>
-                      {hasPrior&&<span className="text-[10px] font-semibold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">prior outputs</span>}
+                      {isFirst&&<span className="text-[9px] font-semibold bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">Reference (Patient 1)</span>}
+                      {hasPrior&&<span className="text-[9px] font-semibold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">prior outputs</span>}
+                      {pSynced.size>0&&<span className="text-[9px] font-semibold bg-teal-100 text-teal-700 px-2 py-0.5 rounded-full">{pSynced.size} stage{pSynced.size!==1?'s':''} matched to PT-1</span>}
                     </div>
                     <span className="text-slate-400 text-xs">{cardOpen?'▲':'▼'}</span>
                   </button>
                   {cardOpen&&(
                     <div className="p-4 space-y-3">
-                      {/* Auto-fill banner */}
-                      {hasPrior&&existedDirs[p.name]&&Object.keys(completionStatus[p.name]||{}).some(k=>completionStatus[p.name][k])&&(
+                      {hasPrior&&Object.keys(completionStatus[p.name]||{}).some(k=>completionStatus[p.name][k])&&(
                         <div className="flex items-start gap-2 bg-blue-50 border border-blue-200 rounded-xl px-3 py-2 text-xs text-blue-800">
                           <span className="flex-shrink-0 mt-0.5">ℹ</span>
-                          <span>Config auto-filled from the previous run. The Run page will compare these settings and the selected CT against the saved stage metadata before allowing a rerun.</span>
+                          <span>Config auto-filled from the previous run. The Run page will compare settings and CT against saved metadata before allowing a rerun.</span>
                         </div>
                       )}
-                      {/* Config-change warnings for completed phases */}
                       {phaseWarnings[p.name]&&phaseWarnings[p.name].size>0&&(
                         <div className="flex items-start gap-2 bg-orange-50 border border-orange-300 rounded-xl px-3 py-2 text-xs text-orange-900">
                           <span className="flex-shrink-0 mt-0.5">⚠</span>
                           <div className="flex-1">
                             <span className="font-semibold">Changed params for already-completed stages: </span>
                             <span>{[...phaseWarnings[p.name]].join(', ')}</span>
-                            <span>. The Run page will block any unsafe rerun until the conflicting old outputs are deleted.</span>
+                            <span>. The Run page will block any unsafe rerun until conflicting old outputs are deleted.</span>
                           </div>
                           <button className="flex-shrink-0 text-orange-500 hover:text-orange-700 font-bold leading-none"
                             onClick={()=>setPhaseWarnings(w=>{const nw={...w};delete nw[p.name];return nw;})}>✕</button>
                         </div>
                       )}
+                      {/* Per-patient flag panel */}
+                      <PatientFlagPanel flags={pFlags} isFirst={isFirst}
+                        onFlagChange={(key,checked)=>handlePatientFlagChange(p.name,key,checked)}
+                        mode={mode} setMode={setMode}
+                        profileIntervalS={profileIntervalS} setProfileIntervalS={setProfileIntervalS}/>
                       {['phase_1','phase_2','phase_3'].map(pk=>cfg[pk]?(
                         <PhaseSection key={pk} phaseKey={pk} phaseData={cfg[pk]}
                           patientName={p.name} onChange={handleConfigChange}
                           descriptions={configMeta.field_descriptions||{}}
                           pipelineOptions={configMeta.pipeline_options||{}}
-                          roiChoices={roiChoices}
-                          roiTaskGroups={roiTaskGroups}
-                          pbpkCompatibleRois={pbpkCompatibleRois}
-                          roiOverlaps={roiOverlaps}
-                          phase1RoiSubset={p1RoiSubset}
-                          patientShape={shape}
-                          nativeSpacing={nativeSpacing}
-                          flags={flags}
+                          roiChoices={roiChoices} roiTaskGroups={roiTaskGroups}
+                          pbpkCompatibleRois={pbpkCompatibleRois} roiOverlaps={roiOverlaps}
+                          phase1RoiSubset={p1RoiSubset} patientShape={shape}
+                          nativeSpacing={nativeSpacing} flags={pFlags}
                           systemCpuCount={systemCpuCount}
-                          lesionSpecs={cfg?.phase_1?.synthetic_lesions_stage?.specs||null}/>
+                          lesionSpecs={cfg?.phase_1?.synthetic_lesions_stage?.specs||null}
+                          isFirst={isFirst} syncedStages={pSynced}
+                          p1StageValid={p1StageValid}
+                          onSyncToggle={(phaseKey,stageKey,v)=>handleSyncToggle(p.name,phaseKey,stageKey,v)}/>
                       ):null)}
                     </div>
                   )}
@@ -1723,7 +1824,7 @@ function Page3Configure({patients,projectName,setProjectName,projectDirs,setProj
 }
 
 // ─── Config Summary Card (per patient) ───────────────────────────────────────
-function ConfigSummaryCard({patient,cfg,flags,projectDir,mode,profileIntervalS}){
+function ConfigSummaryCard({patient,cfg,flags,projectDir,mode,profileIntervalS,isFirst,syncedCount,skipped,onToggleSkip}){
   const ph1=cfg?.phase_1;const ph2=cfg?.phase_2;const ph3=cfg?.phase_3;
   const seg=ph1?.segmentation_stage;
   const synth=ph1?.synthetic_lesions_stage;
@@ -1768,11 +1869,21 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir,mode,profileIntervalS})
   const synthSpecs=synth?.specs&&typeof synth.specs==='object'?Object.entries(synth.specs):[];
 
   return(
-    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
+    <div className={`bg-white border rounded-2xl p-5 shadow-sm ${skipped?'opacity-50 border-slate-200':'border-slate-200'}`}>
       {/* Header */}
       <div className="flex items-start justify-between gap-3 mb-3">
-        <span className="font-semibold text-slate-800 text-base">{patient.name}</span>
-        {projectDir&&<span className="text-[10px] terminal-font text-slate-400 truncate max-w-xs">{projectDir}</span>}
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className={`font-semibold text-base ${skipped?'line-through text-slate-400':'text-slate-800'}`}>{patient.name}</span>
+          {isFirst&&<span className="text-[9px] font-semibold bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">Reference (Patient 1)</span>}
+          {!isFirst&&syncedCount>0&&<span className="text-[9px] font-semibold bg-teal-100 text-teal-700 px-2 py-0.5 rounded-full">{syncedCount} stage{syncedCount!==1?'s':''} matched PT-1</span>}
+          {skipped&&<span className="text-[9px] font-semibold bg-slate-200 text-slate-500 px-2 py-0.5 rounded-full">Skipped</span>}
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          {projectDir&&<span className="text-[10px] terminal-font text-slate-400 truncate max-w-xs">{projectDir}</span>}
+          <button onClick={onToggleSkip} className={`text-[10px] font-semibold px-2.5 py-1 rounded-lg border transition-colors ${skipped?'bg-slate-100 text-slate-600 border-slate-300 hover:bg-slate-200':'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'}`}>
+            {skipped?'Include':'Skip'}
+          </button>
+        </div>
       </div>
       {/* Active stage badges + run mode */}
       <div className="flex flex-wrap gap-1.5 mb-4">
@@ -1793,7 +1904,7 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir,mode,profileIntervalS})
           {kv('ROI subset', seg.roi_subset)}
         </Section>
       )}
-      {synth&&(synthSpecs.length>0||flags.synthetic_lesions)&&(
+      {synth&&flags.synthetic_lesions&&(
         <Section title="Phase 1 — Synthetic Lesions" colorClass="text-orange-600">
           {kv('Seed', synth.default_seed, v=>v===0?'Non-reproducible (0)':String(v))}
           {kv('Shrink factor', synth.auto_shrink_factor)}
@@ -1820,6 +1931,8 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir,mode,profileIntervalS})
           {kv('Model type', tac.model_type||tac.ModelType)}
           {kv('Isotope', tac.isotope||tac.Isotope)}
           {kv('Randomize kidney / SG', tac.Randomization_Kidney_SG_Para)}
+          {kv('Height', tac.height_m, v=>(v&&Number(v)>0)?`${v} m`:'From DICOM / model default')}
+          {kv('Weight', tac.weight_kg, v=>(v&&Number(v)>0)?`${v} kg`:'From DICOM / model default')}
         </Section>
       )}
 
@@ -1875,25 +1988,28 @@ function ConfigSummaryCard({patient,cfg,flags,projectDir,mode,profileIntervalS})
 }
 
 // ─── Page 4 ───────────────────────────────────────────────────────────────────
-function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,patientSpacings,profileIntervalS,onBack}){
+function Page4Run({patients,projectName,projectDirs,patientFlags,mode,patientConfigs,patientSpacings,profileIntervalS,onBack}){
   const [status,setStatus]=useState('idle'); // idle | starting | launched | error
   const [errorMsg,setErrorMsg]=useState('');
   const [validation,setValidation]=useState(null);
   const [rerunValidation,setRerunValidation]=useState({checking:true,ok:true,conflictsByPatient:{}});
+  const [skippedPatients,setSkippedPatients]=useState(new Set());
+  const toggleSkip=useCallback(name=>setSkippedPatients(prev=>{const next=new Set(prev);next.has(name)?next.delete(name):next.add(name);return next;}),[]);
+  const activePatients=useMemo(()=>patients.filter(p=>!skippedPatients.has(p.name)),[patients,skippedPatients]);
 
-  // Pre-run validation
+  // Pre-run validation — per-patient flags
   useEffect(()=>{
     const issues=[];
     if(!projectName.trim()) issues.push('Project name is empty');
-    if(!patients.length)    issues.push('No patients selected');
-    if(flags.profile&&!validateProfileInterval(profileIntervalS))
-      issues.push('Profiler sampling interval must be between 0.1 s and 3.0 s');
-    patients.forEach(p=>{
+    if(!activePatients.length) issues.push('All patients are skipped — include at least one');
+    activePatients.forEach(p=>{
+      const flags=patientFlags?.[p.name]||DEFAULT_FLAGS;
       if(!projectDirs[p.name]) issues.push(`Missing output directory for "${p.name}"`);
+      if(flags.profile&&!validateProfileInterval(profileIntervalS))
+        issues.push(`[${p.name}] Profiler sampling interval must be between 0.1 s and 3.0 s`);
       const cfg=patientConfigs?.[p.name];
       const nativeSpacing=patientSpacings?.[p.name]||null;
       if(!cfg) return;
-      // FrameStartTimes / FrameDurations
       const fst=cfg?.phase_3?.spect_postprocess_stage?.FrameStartTimes;
       const fd =cfg?.phase_3?.spect_postprocess_stage?.FrameDurations;
       if(Array.isArray(fst)&&Array.isArray(fd)){
@@ -1901,9 +2017,6 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
         fst.forEach((v,i)=>{if(typeof v!=='number'||isNaN(v)) issues.push(`[${p.name}] FrameStartTimes[${i}] must be a number`);});
         fd.forEach((v,i)=>{ if(typeof v!=='number'||isNaN(v)) issues.push(`[${p.name}] FrameDurations[${i}] must be a number`);});
       }
-      // Collect ROIs that have synthetic lesions
-      const specs=cfg?.phase_1?.synthetic_lesions_stage?.specs;
-      const lesionRois=specs&&typeof specs==='object'?Object.keys(specs):[];
       const p1Rois=cfg?.phase_1?.segmentation_stage?.roi_subset;
       const p1Set=new Set(Array.isArray(p1Rois)?p1Rois:[]);
       const checkSimulationSubset=(roi,stageName)=>{
@@ -1916,9 +2029,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
           if(missingP1.length)
             issues.push(`[${p.name}] ${stageName} ROI(s) not selected in Phase 1: ${missingP1.join(', ')}`);
         }
-        // Synthetic-lesion labels are added automatically; no all-or-none check on host ROIs.
       };
-      // SPECT: simind must have at least one ROI selected
       if(flags.spect){
         const roi=cfg?.phase_2?.simind_stage?.roi_subset;
         if(!Array.isArray(roi)||roi.length===0)
@@ -1927,13 +2038,11 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
         validateXyzSpacingRule(cfg?.phase_2?.simind_stage?.xyz_spacing_mm,nativeSpacing)
           .forEach(msg=>issues.push(`[${p.name}] SIMIND xyz_spacing_mm ${msg}`));
       }
-      // Post-processing + SPECT: at least one option enabled
       if(flags.postprocess&&flags.spect){
         const pp=cfg?.phase_3?.spect_postprocess_stage;
         if(pp&&!pp.apply_tac&&!pp.apply_poisson_noise&&!pp.apply_reconstruction)
           issues.push(`[${p.name}] Post-Processing + SPECT: enable at least one of Apply TAC, Apply Noise, or Apply Reconstruction`);
       }
-      // Dosimetry: at least one ROI in opengate
       if(flags.dosimetry){
         const roi=cfg?.phase_2?.opengate_stage?.roi_subset;
         const gate=cfg?.phase_2?.opengate_stage?.gate||{};
@@ -1957,11 +2066,11 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
       }
     });
     setValidation({ok:!issues.length,issues});
-  },[patientConfigs,flags,patients,patientSpacings,profileIntervalS,projectName,projectDirs]);
+  },[patientConfigs,patientFlags,activePatients,patientSpacings,profileIntervalS,projectName,projectDirs]);
 
   useEffect(()=>{
     let cancelled=false;
-    const readyForCheck=patients.length>0&&patients.every(p=>projectDirs[p.name]);
+    const readyForCheck=activePatients.length>0&&activePatients.every(p=>projectDirs[p.name]);
     if(!readyForCheck){
       setRerunValidation({checking:false,ok:true,conflictsByPatient:{}});
       return;
@@ -1969,7 +2078,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
     setRerunValidation(prev=>({...prev,checking:true}));
     apiFetch('/api/validate-rerun',{
       method:'POST',
-      body:JSON.stringify({patients,project_dirs:projectDirs,flags,patient_configs:patientConfigs}),
+      body:JSON.stringify({patients:activePatients,project_dirs:projectDirs,patient_flags:patientFlags,patient_configs:patientConfigs}),
     })
       .then(async res=>{
         if(!res.ok){
@@ -1995,12 +2104,12 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
         });
       });
     return()=>{cancelled=true;};
-  },[patients,projectDirs,flags,patientConfigs]);
+  },[activePatients,projectDirs,patientFlags,patientConfigs]);
 
   const startRun=async()=>{
     setStatus('starting');setErrorMsg('');
     try{
-      const res=await apiFetch('/api/run',{method:'POST',body:JSON.stringify({project_name:projectName,patients,project_dirs:projectDirs,flags,patient_configs:patientConfigs,mode,profile_interval_s:profileIntervalS})});
+      const res=await apiFetch('/api/run',{method:'POST',body:JSON.stringify({project_name:projectName,patients:activePatients,project_dirs:projectDirs,patient_flags:patientFlags,patient_configs:patientConfigs,mode,profile_interval_s:profileIntervalS})});
       if(!res.ok){const err=await res.json();setErrorMsg(err.detail||'Unknown server error');setStatus('error');return;}
       setStatus('launched');
     }catch(e){setErrorMsg(e.message);setStatus('error');}
@@ -2010,7 +2119,7 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
     (conflicts||[]).map(conflict=>`[${patientName}] ${conflict.message}`)
   );
   const combinedIssues=[...(validation?.issues||[]),...rerunIssues];
-  const allChecksPassed=(validation?.ok??false)&&!rerunValidation.checking&&rerunValidation.ok&&combinedIssues.length===0;
+  const allChecksPassed=(validation?.ok??false)&&!rerunValidation.checking&&rerunValidation.ok&&combinedIssues.length===0&&activePatients.length>0;
   const canRun=allChecksPassed&&status==='idle';
 
   // ── Launched screen ────────────────────────────────────────────────────────
@@ -2071,10 +2180,8 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
             </div>
           ):allChecksPassed?(
             <div className="text-sm text-emerald-700 space-y-0.5">
-              <p>· {patients.length} patient{patients.length!==1?'s':''} queued</p>
+              <p>· {activePatients.length} patient{activePatients.length!==1?'s':''} queued{skippedPatients.size>0?` (${skippedPatients.size} skipped)`:''}</p>
               <p>· Mode: <span className="font-semibold">{mode}</span></p>
-              <p>· Logging: <span className="font-semibold">{flags.logging_on?'On':'Off'}</span></p>
-              <p>· Profiling: <span className="font-semibold">{flags.profile?`On (${profileIntervalS} s)`:'Off'}</span></p>
             </div>
           ):(
             <ul className="space-y-1">{combinedIssues.map((iss,i)=><li key={i} className="text-sm text-red-700 whitespace-pre-line">· {iss}</li>)}</ul>
@@ -2085,9 +2192,14 @@ function Page4Run({patients,projectName,projectDirs,flags,mode,patientConfigs,pa
       {/* Per-patient config summary */}
       <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-widest mb-3 bg-white/90 rounded-xl px-4 py-2 inline-block shadow-sm">Configuration Summary</h3>
       <div className="space-y-4 mb-8">
-        {patients.map(p=>(
+        {patients.map((p,i)=>(
           <ConfigSummaryCard key={p.name} patient={p} cfg={patientConfigs?.[p.name]}
-            flags={flags} projectDir={projectDirs[p.name]} mode={mode} profileIntervalS={profileIntervalS}/>
+            flags={patientFlags?.[p.name]||DEFAULT_FLAGS}
+            projectDir={projectDirs[p.name]} mode={mode} profileIntervalS={profileIntervalS}
+            isFirst={i===0}
+            syncedCount={0}
+            skipped={skippedPatients.has(p.name)}
+            onToggleSkip={()=>toggleSkip(p.name)}/>
         ))}
       </div>
 
@@ -2119,8 +2231,9 @@ function App(){
   const [projectName,setProjectName]=useState('');
   const [projectDirs,setProjectDirs]=useState({});
   const [patientConfigs,setPatientConfigs]=useState({});
+  const [patientFlags,setPatientFlags]=useState({});   // {patientName: {segmentation,...}}
+  const [syncedStages,setSyncedStages]=useState({});   // {patientName: Set<stageKey>}
   const [mode,setMode]=useState('PRODUCTION');
-  const [flags,setFlags]=useState({segmentation:false,pbpk:false,synthetic_lesions:false,spect:true,dosimetry:true,postprocess:true,logging_on:true,profile:false});
   const [profileIntervalS,setProfileIntervalS]=useState(2.0);
   const [systemCpuCount,setSystemCpuCount]=useState(null);
 
@@ -2141,12 +2254,14 @@ function App(){
           projectName={projectName} setProjectName={setProjectName}
           projectDirs={projectDirs} setProjectDirs={setProjectDirs}
           patientConfigs={patientConfigs} setPatientConfigs={setPatientConfigs}
-          flags={flags} setFlags={setFlags} mode={mode} setMode={setMode}
+          patientFlags={patientFlags} setPatientFlags={setPatientFlags}
+          syncedStages={syncedStages} setSyncedStages={setSyncedStages}
+          mode={mode} setMode={setMode}
           profileIntervalS={profileIntervalS} setProfileIntervalS={setProfileIntervalS}
           patientShapes={patientShapes} patientSpacings={patientSpacings} systemCpuCount={systemCpuCount}
           onNext={()=>setStep(4)} onBack={()=>setStep(2)}/>}
         {step===4&&<Page4Run patients={patients} projectName={projectName}
-          projectDirs={projectDirs} flags={flags} mode={mode}
+          projectDirs={projectDirs} patientFlags={patientFlags} mode={mode}
           patientConfigs={patientConfigs} patientSpacings={patientSpacings} profileIntervalS={profileIntervalS}
           onBack={()=>setStep(3)}/>}
       </div>

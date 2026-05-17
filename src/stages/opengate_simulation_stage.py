@@ -1033,7 +1033,20 @@ class OpenGateSimulationStage:
         if dose_ref_img is None:
             raise RuntimeError("OpenGATE simulation reference grid was not initialized.")
 
-        mask_paths, roi_counts, roi_names = self._build_source_masks(sim_ct, sim_seg)
+        src_mask_paths, roi_counts, roi_names = self._build_source_masks(sim_ct, sim_seg)
+
+        # Save body masks in the original (un-centered) coordinate system so that
+        # DosemapPostprocessStage can load them correctly and they survive PRODUCTION
+        # cleanup of work_dir.  _aligned_roi_mask_array applies the centering flip
+        # correction; save_nii_sitk uses dose_ref_img's spatial metadata.
+        mask_paths: Dict[str, str] = {}
+        for roi_name, src_path in src_mask_paths.items():
+            corrected_path = Path(self.output_dir) / f"{self.prefix}_{roi_name}_body_mask.nii.gz"
+            corrected_arr = self._aligned_roi_mask_array(src_path)
+            save_nii_sitk(dose_ref_img, corrected_arr.astype(np.uint8), corrected_path)
+            mask_paths[roi_name] = str(corrected_path)
+        # Keep source masks for the simulation loop (original centered paths).
+        sim_mask_paths = src_mask_paths
 
         dose_paths: Dict[str, str] = {}
         unc_paths: Dict[str, str] = {}
@@ -1080,7 +1093,7 @@ class OpenGateSimulationStage:
             # ----------------------------------------------------------
             res = self._run_roi_batches(
                 roi_name,
-                mask_paths[roi_name],
+                sim_mask_paths[roi_name],   # centered source mask for OpenGATE
                 sim_ct,
                 sim_ct_path,
                 save_labels=(idx == 0),

@@ -288,6 +288,24 @@ Some ROIs in `pipeline_roi_naming_map.json` are marked with a `parent_group` fie
 
 `parent_group` only applies where both the parent **and** the child have their own `PyTheraTwin_Pipeline` label ID and `PyTheraTwin_to_totseg` entry.
 
+### PBPK patient height and weight
+
+Two optional config fields control body-composition scaling in the PBPK model:
+
+```json
+"pbpk_tac_stage": {
+  "height_m":  null,
+  "weight_kg": null
+}
+```
+
+**Priority:**
+1. If `height_m` / `weight_kg` is a positive number, that value is used directly.
+2. If `null` or `0`, the pipeline tries to extract height/weight from the DICOM header (only possible when the CT input is a DICOM directory).
+3. If neither source provides a value, the PBPK model uses its built-in population-average default.
+
+The web UI exposes these fields on the PBPK stage card. They are also shown in the review summary on Page 4.
+
 ### PBPK model changes
 
 The `pbpk_voi` field is independent of `parent_group`. When the active PBPK model no longer provides a dedicated observable for a ROI, set `pbpk_voi` to `null` on that entry in `pipeline_roi_naming_map.json`. This demotes the ROI from simulation-eligible to anatomy-only without any other changes required.

@@ -76,6 +76,7 @@ class PyTheraTwinPipeline:
         run_postprocess: bool = False,
         startup_banner_lines: Optional[List[str]] = None,
         profile_interval_s: Optional[float] = None,
+        output_dir: Optional[str] = None,
     ) -> None:
         self.config_path: str = config_path
         self.ct_input: str = ct_input
@@ -100,6 +101,7 @@ class PyTheraTwinPipeline:
         self.ct_saved_copy_path: str = ""
         self.ct_input_identity: Dict[str, Any] = {}
         self.sub_dir_names: Dict[str, str] = {}
+        self._override_output_dir: Optional[str] = os.path.abspath(output_dir) if output_dir else None
 
         # Validate CT input before creating any output directories
         self.ct_input_type: CTInputType = validate_ct_input_path(self.ct_input)
@@ -191,9 +193,12 @@ class PyTheraTwinPipeline:
             include_input_paths=True,
         )
 
-        project_dir = os.path.join(self.current_dir_path, self.config['output_folder_title'])
-        os.makedirs(project_dir, exist_ok=True)
-        self.output_folder_path = os.path.join(project_dir, f"CT_{self.ct_index}")
+        if self._override_output_dir:
+            self.output_folder_path = self._override_output_dir
+        else:
+            project_dir = os.path.join(self.current_dir_path, self.config['output_folder_title'])
+            os.makedirs(project_dir, exist_ok=True)
+            self.output_folder_path = os.path.join(project_dir, f"CT_{self.ct_index}")
         os.makedirs(self.output_folder_path, exist_ok=True)
         self.metadata_dir_path = str(ensure_metadata_dir(self.output_folder_path))
 
@@ -525,6 +530,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        type=str,
+        help=argparse.SUPPRESS,
+    )
 
     return parser
 def main() -> int:
@@ -600,6 +611,7 @@ def main() -> int:
                 run_postprocess=args.postprocess,
                 startup_banner_lines=_banner_lines,
                 profile_interval_s=args.profile,
+                output_dir=args.output_dir,
             )
             pipeline.run()
         except Exception:

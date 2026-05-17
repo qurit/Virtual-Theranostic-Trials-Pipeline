@@ -202,10 +202,30 @@ class PbpkTacStage:
                 parameters["Rden_Kidney"] = self._sample_lognormal_from_mean_sd(30.0, 10.0)
                 parameters["lambdaRel_Kidney"] = self._sample_lognormal_from_mean_sd(2.88e-4, 0.55e-4)
 
-        self.height = None
-        self.weight = None
-        if os.path.isdir(self.ct_input_path):
-            self.height, self.weight = extract_height_weight(self.ct_input_path)
+        # Config-supplied values take priority; fall back to DICOM extraction.
+        cfg_height = self.stage_cfg.get("height_m") or None
+        cfg_weight = self.stage_cfg.get("weight_kg") or None
+        try:
+            cfg_height = float(cfg_height) if cfg_height is not None else None
+            if cfg_height is not None and cfg_height <= 0:
+                cfg_height = None
+        except (TypeError, ValueError):
+            cfg_height = None
+        try:
+            cfg_weight = float(cfg_weight) if cfg_weight is not None else None
+            if cfg_weight is not None and cfg_weight <= 0:
+                cfg_weight = None
+        except (TypeError, ValueError):
+            cfg_weight = None
+
+        self.height = cfg_height
+        self.weight = cfg_weight
+        if (self.height is None or self.weight is None) and os.path.isdir(self.ct_input_path):
+            dicom_h, dicom_w = extract_height_weight(self.ct_input_path)
+            if self.height is None:
+                self.height = dicom_h
+            if self.weight is None:
+                self.weight = dicom_w
 
         if self.height is not None:
             parameters["bodyHeight"] = float(self.height)

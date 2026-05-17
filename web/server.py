@@ -153,6 +153,8 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "model_type": "PBPK pharmacokinetic model type. Currently only 'PSMA' (Lu-177 PSMA) is supported",
     "isotope": "Radionuclide for PBPK and simulation. Currently only 'lu177' (Lutetium-177) is supported",
     "Randomization_Kidney_SG_Para": "Randomize kidney and salivary-gland PBPK parameters via lognormal sampling — simulates patient-to-patient variability",
+    "height_m": "Patient height in metres for PBPK body-composition scaling. null or 0 → extracted from DICOM if available, else PBPK model uses its built-in population average",
+    "weight_kg": "Patient weight in kilograms for PBPK body-composition scaling. null or 0 → extracted from DICOM if available, else PBPK model uses its built-in population average",
     "xyz_spacing_mm": "Target voxel spacing in mm as [sxy, sxy, sz]. X and Y must match. XY must be >= both native in-plane spacings; Z must be >= the native CT z-spacing (only coarser grids allowed). The pipeline logs the native CT spacing at runtime. Null = native CT resolution (no downsampling).",
     "Collimator": "SIMIND collimator code (e.g. 'si-me' = Siemens medium-energy parallel-hole). Must match your SIMIND install",
     "Isotope": "Isotope code for SIMIND collimator lookup (e.g. 'lu177')",
@@ -962,19 +964,28 @@ def _validate_patient_rerun(
     return conflicts
 
 
+_DEFAULT_FLAGS: Dict[str, bool] = {
+    "segmentation": False, "pbpk": False, "synthetic_lesions": False,
+    "spect": False, "dosimetry": False, "postprocess": False,
+    "logging_on": False, "profile": False,
+}
+
+
 def _validate_reruns_for_request(
     *,
     patients: List[Dict[str, Any]],
     project_dirs: Dict[str, str],
-    flags: Dict[str, bool],
+    patient_flags: Optional[Dict[str, Dict[str, bool]]] = None,
     patient_configs: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, List[Dict[str, str]]]:
     """Validate rerun compatibility for every patient in a request payload."""
     conflicts_by_patient: Dict[str, List[Dict[str, str]]] = {}
     patient_configs = patient_configs or {}
+    patient_flags = patient_flags or {}
 
     for patient in patients:
         patient_name = patient["name"]
+        flags = {**_DEFAULT_FLAGS, **(patient_flags.get(patient_name) or {})}
         output_dir = Path(project_dirs.get(patient_name, ""))
         if not output_dir.is_dir():
             conflicts_by_patient[patient_name] = [
@@ -1007,7 +1018,7 @@ def _validate_reruns_for_request(
 class ValidateRerunRequest(BaseModel):
     patients: List[Dict[str, Any]]
     project_dirs: Dict[str, str]
-    flags: Dict[str, bool]
+    patient_flags: Optional[Dict[str, Dict[str, bool]]] = None
     patient_configs: Optional[Dict[str, Dict[str, Any]]] = None
 
 
@@ -1017,7 +1028,7 @@ async def validate_rerun(req: ValidateRerunRequest) -> Dict:
     conflicts_by_patient = _validate_reruns_for_request(
         patients=req.patients,
         project_dirs=req.project_dirs,
-        flags=req.flags,
+        patient_flags=req.patient_flags,
         patient_configs=req.patient_configs,
     )
     return {
@@ -1389,7 +1400,7 @@ class RunRequest(BaseModel):
     project_name: str
     patients: List[Dict[str, Any]]        # [{name, type, path}] — original CT paths
     project_dirs: Dict[str, str]           # {patient_name: output_dir_path}
-    flags: Dict[str, bool]
+    patient_flags: Optional[Dict[str, Dict[str, bool]]] = None  # {patient_name: {flag: bool}}
     patient_configs: Optional[Dict[str, Dict[str, Any]]] = None
     mode: str = "PRODUCTION"
     profile_interval_s: float = 2.0
@@ -1411,29 +1422,48 @@ async def start_run(req: RunRequest) -> Dict:
     if not req.patients:
         raise HTTPException(400, "No patients provided.")
 
-    # Save patient configs sent by the UI (in case /api/save-patient-config wasn't called).
-    web_ui_flags: Dict[str, Any] = {
-        **{k: bool(req.flags.get(k, False)) for k in (
-            "segmentation", "pbpk", "synthetic_lesions",
-            "spect", "dosimetry", "postprocess", "logging_on", "profile",
-        )},
-        "profile_interval_s": float(req.profile_interval_s),
-        "mode": req.mode,
+    patient_flags = req.patient_flags or {}
+    flag_cli_map = {
+        "segmentation": "--segmentation",
+        "pbpk": "--pbpk",
+        "synthetic_lesions": "--synthetic_lesions",
+        "spect": "--spect",
+        "dosimetry": "--dosimetry",
+        "postprocess": "--postprocess",
     }
-    if req.patient_configs:
-        for patient in req.patients:
-            nm = patient["name"]
-            cfg = req.patient_configs.get(nm)
-            out_dir = Path(req.project_dirs.get(nm, ""))
-            if cfg and out_dir.is_dir():
-                full_cfg = inject_pipeline_paths(cfg, repo_root=REPO_ROOT, include_input_paths=False)
-                full_cfg["_web_ui_flags"] = web_ui_flags
-                (out_dir / "config.json").write_text(json.dumps(full_cfg, indent=2))
+
+    # Save patient configs and validate profile interval per patient.
+    for patient in req.patients:
+        nm = patient["name"]
+        flags = {**_DEFAULT_FLAGS, **(patient_flags.get(nm) or {})}
+        if flags.get("profile", False):
+            try:
+                validate_profile_interval_s(float(req.profile_interval_s))
+            except ValueError:
+                raise HTTPException(
+                    400,
+                    f"[{nm}] profile_interval_s must be between 0.1 and 3.0 seconds when profiling is enabled.",
+                )
+
+        web_ui_flags: Dict[str, Any] = {
+            **{k: bool(flags.get(k, False)) for k in (
+                "segmentation", "pbpk", "synthetic_lesions",
+                "spect", "dosimetry", "postprocess", "logging_on", "profile",
+            )},
+            "profile_interval_s": float(req.profile_interval_s),
+            "mode": req.mode,
+        }
+        cfg = (req.patient_configs or {}).get(nm)
+        out_dir = Path(req.project_dirs.get(nm, ""))
+        if cfg and out_dir.is_dir():
+            full_cfg = inject_pipeline_paths(cfg, repo_root=REPO_ROOT, include_input_paths=False)
+            full_cfg["_web_ui_flags"] = web_ui_flags
+            (out_dir / "config.json").write_text(json.dumps(full_cfg, indent=2))
 
     conflicts_by_patient = _validate_reruns_for_request(
         patients=req.patients,
         project_dirs=req.project_dirs,
-        flags=req.flags,
+        patient_flags=patient_flags,
         patient_configs=req.patient_configs,
     )
     if conflicts_by_patient:
@@ -1447,34 +1477,12 @@ async def start_run(req: RunRequest) -> Dict:
             + "\n".join(summary_lines),
         )
 
-    flag_map = {
-        "segmentation": "--segmentation",
-        "pbpk": "--pbpk",
-        "synthetic_lesions": "--synthetic_lesions",
-        "spect": "--spect",
-        "dosimetry": "--dosimetry",
-        "postprocess": "--postprocess",
-    }
-    flag_args: List[str] = []
-    for key, cli_flag in flag_map.items():
-        if req.flags.get(key, False):
-            flag_args.append(cli_flag)
-    if req.flags.get("profile", False):
-        try:
-            validate_profile_interval_s(float(req.profile_interval_s))
-        except ValueError:
-            raise HTTPException(
-                400,
-                "profile_interval_s must be between 0.1 and 3.0 seconds when profiling is enabled.",
-            )
-        flag_args.extend(["--profile", str(float(req.profile_interval_s))])
-
-    # Build one combined temp CT directory with all patients' CTs symlinked in
-    # index order using a numeric prefix so the pipeline's sorted discovery
-    # assigns CT_1, CT_2, … matching the pre-created output directories.
-    tmp_ct_dir = tempfile.mkdtemp(prefix="pytheratwin_ct_")
-    for i, patient in enumerate(req.patients, start=1):
+    # Build one job per patient — each gets its own temp CT dir so per-patient
+    # flags are respected (the pipeline reads flags from the CLI, not the config).
+    jobs: List[Dict] = []
+    for patient in req.patients:
         nm = patient["name"]
+        flags = {**_DEFAULT_FLAGS, **(patient_flags.get(nm) or {})}
         out_dir = Path(req.project_dirs.get(nm, ""))
         if not out_dir.is_dir():
             raise HTTPException(400, f"Output directory for {nm!r} not found: {out_dir}")
@@ -1491,19 +1499,27 @@ async def start_run(req: RunRequest) -> Dict:
                     f"and no saved copy exists in '{out_dir}'. "
                     "Please re-upload or re-scan the CT directory.",
                 )
-        link_name = f"{i:05d}_{ct_path.name}"
-        os.symlink(str(ct_path), os.path.join(tmp_ct_dir, link_name))
 
-    first_nm = req.patients[0]["name"]
-    first_out_dir = Path(req.project_dirs.get(first_nm, ""))
-    cmd = [
-        sys.executable, "-u", str(MAIN_PY),
-        "--config_file", str(first_out_dir / "config.json"),
-        "--input_ct_dir", tmp_ct_dir,
-        "--mode", req.mode,
-        "--web_ui",
-    ] + flag_args
-    jobs = [{"cmd": cmd, "patient_name": "all", "tmp_ct_dir": tmp_ct_dir}]
+        tmp_ct_dir = tempfile.mkdtemp(prefix="pytheratwin_ct_")
+        # Use "00001_" prefix so the pipeline assigns CT_1 to this patient.
+        os.symlink(str(ct_path), os.path.join(tmp_ct_dir, f"00001_{ct_path.name}"))
+
+        flag_args: List[str] = []
+        for key, cli_flag in flag_cli_map.items():
+            if flags.get(key, False):
+                flag_args.append(cli_flag)
+        if flags.get("profile", False):
+            flag_args.extend(["--profile", str(float(req.profile_interval_s))])
+
+        cmd = [
+            sys.executable, "-u", str(MAIN_PY),
+            "--config_file", str(out_dir / "config.json"),
+            "--input_ct_dir", tmp_ct_dir,
+            "--output_dir", str(out_dir),
+            "--mode", req.mode,
+            "--web_ui",
+        ] + flag_args
+        jobs.append({"cmd": cmd, "patient_name": nm, "tmp_ct_dir": tmp_ct_dir})
 
     _PENDING_FILE.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
     asyncio.create_task(_shutdown_after_delay())

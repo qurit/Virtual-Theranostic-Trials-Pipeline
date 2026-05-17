@@ -243,11 +243,40 @@ class SpectPostprocessStage:
             for actual, expected in zip(spacing, self.recon_spacing_mm)
         )
 
-    def _apply_body_mask(self, recon_img: sitk.Image) -> sitk.Image:
-        """Zero out reconstructed voxels outside the SIMIND simulation body outline."""
-        seg_arr = getattr(self.context, "roi_body_seg_arr", None)
+    def _apply_body_mask(self, recon_img: sitk.Image, amap=None) -> sitk.Image:
+        """Zero out reconstructed voxels outside the patient body outline.
+
+        Prefer the SIMIND attenuation map (amap) when available — it is already
+        in the reconstruction grid so no shape mismatch is possible.  Fall back
+        to the segmentation array from context when amap is not provided.
+        """
         recon_arr = sitk.GetArrayFromImage(recon_img)
-        mask = body_mask_from_seg_arr(seg_arr, recon_arr.shape, debug=self.debug, stage_tag="SpectPostprocessStage")
+        mask = None
+
+        if amap is not None:
+            # amap is a PyTomography tensor in (Nx,Ny,Nz) object order.
+            # _convert_counts_to_mbq_per_ml applies .T so recon_arr is (Nz,Ny,Nx).
+            # Transposing amap gives the same (Nz,Ny,Nx) layout.
+            try:
+                import torch
+                amap_np = amap.detach().cpu().numpy() if isinstance(amap, torch.Tensor) else np.asarray(amap)
+            except Exception:
+                amap_np = np.asarray(amap)
+            candidate = amap_np.T > 0
+            if candidate.shape == recon_arr.shape:
+                mask = candidate
+            elif self.debug:
+                print(
+                    f"[SpectPostprocessStage] amap.T shape {candidate.shape} != "
+                    f"recon shape {recon_arr.shape}; falling back to seg-arr masking."
+                )
+
+        if mask is None:
+            seg_arr = getattr(self.context, "roi_body_seg_arr", None)
+            mask = body_mask_from_seg_arr(
+                seg_arr, recon_arr.shape, debug=self.debug, stage_tag="SpectPostprocessStage"
+            )
+
         if mask is None:
             return recon_img
         out = sitk.GetImageFromArray(recon_arr * mask)
@@ -595,7 +624,7 @@ class SpectPostprocessStage:
 
                 recon_img = self._get_recon_img(likelihood, sensitivity, self.frame_durations_s[time_index])
                 # Zero out voxels outside the patient body outline.
-                recon_img = self._apply_body_mask(recon_img)
+                recon_img = self._apply_body_mask(recon_img, amap=amap)
                 sitk.WriteImage(recon_img, recon_output_path, imageIO="NiftiImageIO")
                 recon_paths[frame_label] = recon_output_path
 

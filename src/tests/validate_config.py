@@ -541,6 +541,24 @@ def validate_config(
             f"in the allowed list: {_allowed['isotope']}"
         )
 
+    # height_m and weight_kg are optional; if provided they must be positive numbers.
+    for hw_key in ("height_m", "weight_kg"):
+        hw_val = pbpk.get(hw_key)
+        if hw_val is not None:
+            try:
+                hw_float = float(hw_val)
+            except (TypeError, ValueError):
+                _err(
+                    f"'phase_1.pbpk_tac_stage.{hw_key}' must be a positive number or null, "
+                    f"got {hw_val!r}"
+                )
+            else:
+                if hw_float < 0:
+                    _err(
+                        f"'phase_1.pbpk_tac_stage.{hw_key}' must be >= 0 (null or 0 = use DICOM/default), "
+                        f"got {hw_float}"
+                    )
+
     # PBPK VOIs are developer-controlled in the configured ROI metadata map.
     # A legacy config may still contain pbpk_tac_stage.VOIs, but it is ignored.
 

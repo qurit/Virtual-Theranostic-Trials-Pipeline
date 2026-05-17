@@ -62,16 +62,7 @@
       //     "spine_1":{"n_lesions":1,"prob":"user_defined","radii_mm":[10.0],"user_centers_zyx":[[z,y,x]],"pbpk_label":"Tumor2"},
       //     "spine_2":{"n_lesions":1,"prob":"user_defined","radii_mm":[11.0],"user_centers_zyx":[[z,y,x]],"pbpk_label":"TumorRest"}
       //   }
-      "specs": {
-        "liver": {
-          "n_lesions": 5,
-          "prob": "gaussian",
-          "sigma_mm": 60.0,
-          "margin_mm": 1.0,
-          "seed": 0,
-          "pbpk_label": "TumorRest"
-        }
-      }
+      "specs": null
     },
 
     // ── 1.3  PBPK TAC Generation ───────────────────────────────────────────────
@@ -85,7 +76,15 @@
 
       // Draw kidney and salivary-gland PBPK parameters from lognormal distributions
       // to model inter-patient pharmacokinetic variability. false = deterministic.
-      "Randomization_Kidney_SG_Para": true
+      "Randomization_Kidney_SG_Para": true,
+
+      // Patient height in metres. null or 0 → extracted from DICOM header if available,
+      // otherwise the PBPK model uses its built-in population-average default.
+      "height_m": null,
+
+      // Patient weight in kilograms. null or 0 → extracted from DICOM header if available,
+      // otherwise the PBPK model uses its built-in population-average default.
+      "weight_kg": null
     }
   },
 

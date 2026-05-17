@@ -26,3 +26,5 @@ test_full_run_CT_0/
 .pytheratwin*
 
 dataset*
+
+paper_dataset*
