@@ -1,0 +1,95 @@
+{
+  // ---------------------------------------------------------------------------
+  // pipeline_options.json — Developer-controlled dropdown option lists
+  // ---------------------------------------------------------------------------
+  // Each array defines the set of values shown as a dropdown in the web UI.
+  // Extend these lists as your site gains additional collimator calibrations,
+  // isotope models, or reconstruction configurations.
+  //
+  // Comments are supported here because the server parses this file through
+  // json_minify before calling json.loads.
+  //
+  // Sections follow the pipeline phase structure for easy navigation.
+  // ---------------------------------------------------------------------------
+
+  // ==========================================================================
+  // PHASE 1 — Digital Twin & Ground Truth
+  // ==========================================================================
+
+  // ── phase_1.segmentation_stage ─────────────────────────────────────────────
+  // Developer-curated user-selectable PyTheraTwin ROIs.
+  //
+  // The full technical ROI definitions live in pipeline_roi_naming_map.json.
+  // This list is the user-facing subset: config validation and the web UI both
+  // derive available choices from it. Remove an entry here to hide/disable an
+  // ROI without touching the underlying label map.
+  //
+  // ROIs marked with parent_group in pipeline_roi_naming_map.json are child
+  // components of a grouped parent (e.g. "bone" covers spine, skull, ribs,
+  // humerus, scapula, clavicula, femur, hip; "muscle" covers the gluteal and
+  // iliopsoas groups; "gi_tract" covers stomach, small_bowel, duodenum, colon).
+  // Do not list a parent and any of its children simultaneously.
+  "roi_subset": [
+    "kidney", "liver", "prostate", "spleen", "heart", "salivary_glands",
+    "lungs", "brain", "adrenal_glands", "thyroid_gland", "gallbladder",
+    "gi_tract", "pancreas", "esophagus", "trachea", "urinary_bladder",
+    "kidney_cyst",
+    "bone", "spinal_cord",
+    "aorta", "pulmonary_vein", "brachiocephalic_vessels",
+    "carotid_arteries", "portal_vein", "iliac_arteries", "iliac_veins",
+    "atrial_appendage", "superior_vena_cava", "inferior_vena_cava",
+    "muscle",
+    "eyes", "eye_lenses", "optic_nerves",
+    "nasopharynx", "oropharynx", "hypopharynx", "nasal_cavity",
+    "auditory_canal", "soft_palate", "hard_palate"
+  ],
+
+  // ── phase_1.pbpk_tac_stage ─────────────────────────────────────────────────
+  // Pharmacokinetic model type (PyCNO).  Extend when new tumour-biology models
+  // are added to the PyCNO library.
+  "model_type": ["PSMA"],
+
+  // Radionuclide used for PBPK pharmacokinetic modelling.
+  // Each entry must correspond to a PyCNO-supported isotope and a compatible
+  // SIMIND / OpenGATE isotope definition on your system.
+  "isotope": ["lu177"],
+
+  // ==========================================================================
+  // PHASE 2 — Simulations
+  // ==========================================================================
+
+  // ── phase_2.simind_stage ───────────────────────────────────────────────────
+  // Collimator code passed to SIMIND.  Must exactly match the name of a
+  // collimator definition file (*.col) installed in your SIMIND directory.
+  // Common examples:
+  //   "si-me"   → Siemens Symbia medium-energy parallel-hole
+  //   "ge-megp" → GE Discovery MEGP parallel-hole
+  "collimator": ["si-me"],
+
+  // Number of SPECT angular projection views acquired in a full rotation.
+  // Minimum: 64. Fewer projections causes angular undersampling and streak
+  // artifacts in OSEM reconstruction. Rule: Subsets × Iterations ≤ NumProjections.
+  // Typical clinical range: 64–128.
+  "num_projections": [64, 72, 96, 120, 128],
+
+  // ==========================================================================
+  // PHASE 3 — Post-Processing
+  // ==========================================================================
+
+  // ── phase_3.spect_postprocess_stage ────────────────────────────────────────
+  // Iterative SPECT reconstruction algorithm.
+  // Currently only OSEM with Triple-Energy-Window (TEW) scatter correction
+  // is implemented in PyTomography.  Additional algorithms can be added when
+  // the post-processing stage is extended.
+  "reconstruction_algorithm": ["OSEM"],
+
+  // Number of ordered subsets used in each OSEM iteration.
+  // More subsets speed up convergence per iteration but may reduce stability.
+  // The product (Subsets × Iterations) governs total "equivalent iterations".
+  "num_subsets": [4, 8, 12, 16, 20, 24],
+
+  // Number of OSEM reconstruction iterations.
+  // More iterations approach a closer solution but can amplify noise when
+  // combined with high subset counts.  Typical clinical range: 2–8.
+  "num_iterations": [2, 4, 6, 8, 10, 12]
+}

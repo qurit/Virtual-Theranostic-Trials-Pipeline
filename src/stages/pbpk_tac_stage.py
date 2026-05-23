@@ -1,16 +1,14 @@
 """
-PBPK TAC Generation Stage (PyCNO PSMA model) for the TDT pipeline.
+PBPK TAC generation (PyCNO PSMA model) for the PyTheraTwin pipeline.
 
-This stage generates time-activity curves (TACs) for all segmented ROIs and saves
-them for use by downstream simulation and post-processing stages.
+Generates time-activity curves (TACs) for all segmented ROIs and writes
+them to disk for downstream simulation and post-processing stages.
 
-Core responsibilities
----------------------
-- Validate PBPK configuration inputs (VOIs, CT input path).
+- Validate PBPK configuration inputs and CT identity.
 - Optionally randomize kidney/salivary-gland parameters (lognormal sampling).
 - Optionally extract patient height/weight from a DICOM directory.
 - Run the PyCNO PSMA model to obtain TACs (time, tacs).
-- For each ROI in the downstream ROI subset, map ROI -> VOI and store TAC data.
+- Map each ROI in the downstream subset to its VOI and store TAC data.
 - Save TACs as JSON (human-readable) + npz (full-resolution arrays).
 
 Stop time behaviour
@@ -29,7 +27,6 @@ Incoming `context` is expected to provide:
     - "file_prefix" : str
     - "model_type" : str  (e.g. "PSMA")
     - "isotope" : str  (e.g. "lu177")
-    - "VOIs" : list[str]  (PyCNO observables, e.g. ["Kidney","Liver","Rest",...])
     - "Randomization_Kidney_SG_Para" : bool
 - context.downstream_roi_subset : list[str]
 
@@ -45,8 +42,6 @@ On success, this stage sets:
 - context.pbpk_vois : list[str]
 - context.pbpk_isotope : str
 - context.pbpk_stop_time_min : float
-
-Maintainer / contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
@@ -57,18 +52,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pycno
-import pydicom
 
-# ---------------------------------------------------------------------------
-# Isotope half-life lookup table (values in minutes).
-# Add new isotopes here as they become supported.
-# ---------------------------------------------------------------------------
-ISOTOPE_HALF_LIVES_MIN: Dict[str, float] = {
-    "lu177": 6.647 * 24.0 * 60.0,   # 6.647 days = 9571.68 min
-}
-
-# Number of half-lives to simulate. 10 half-lives captures >99.9% of total decays.
-PBPK_HALF_LIFE_MULTIPLIER: int = 10
+from src.io.config_paths import get_label_map_path
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_pbpk_rerun_snapshot,
+    fingerprint_optional_file,
+    stage_metadata_path,
+    write_json,
+)
+from src.utils.dicom_utils import extract_height_weight
+from src.utils.label_utils import load_isotope_config, load_pbpk_observables, roi_to_voi
 
 
 class PbpkTacStage:
@@ -80,7 +75,14 @@ class PbpkTacStage:
     """
 
     def __init__(self, context: Any) -> None:
-        context.require("subdir_paths", "config", "ct_input_path", "downstream_roi_subset")
+        context.require(
+            "subdir_paths",
+            "config",
+            "ct_input_path",
+            "downstream_roi_subset",
+            "output_folder_path",
+            "ct_input_identity",
+        )
         self.context = context
         self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"
 
@@ -93,28 +95,32 @@ class PbpkTacStage:
         os.makedirs(self.output_dir, exist_ok=True)
         self.work_dir: str = os.path.join(self.output_dir, "work_dir")
         os.makedirs(self.work_dir, exist_ok=True)
-        self.metadata_path: str = os.path.join(self.work_dir, "pbpk_tac_metadata.json")
+        self.metadata_path: str = stage_metadata_path(context.output_folder_path, "pbpk_tac_stage")
 
         self.ct_input_path: str = context.ct_input_path
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
         self.prefix: str = self.stage_cfg.get("file_prefix", self.stage_cfg.get("name", "pbpk"))
         self.model_type: str = self.stage_cfg.get("model_type", "PSMA")
-        self.vois_pbpk: List[str] = list(self.stage_cfg["VOIs"])
+        self.label_map_path: str = get_label_map_path()
+        self.vois_pbpk: List[str] = load_pbpk_observables(self.label_map_path)
         self.randomize_kidney_sg_para: bool = self.stage_cfg["Randomization_Kidney_SG_Para"]
 
-        # Isotope configuration
+        # Isotope configuration — loaded from src/data/isotope_config.json
         raw_isotope = str(self.stage_cfg.get("isotope", "lu177")).lower().strip().replace("-", "")
-        if raw_isotope not in ISOTOPE_HALF_LIVES_MIN:
+        _iso_cfg = load_isotope_config()
+        if raw_isotope not in _iso_cfg["half_life_min"]:
             raise ValueError(
                 f"Unsupported isotope '{raw_isotope}' in pbpk_tac_stage config. "
-                f"Supported: {sorted(ISOTOPE_HALF_LIVES_MIN.keys())}"
+                f"Supported: {sorted(_iso_cfg['half_life_min'])}"
             )
         self.isotope: str = raw_isotope
-        self.half_life_min: float = ISOTOPE_HALF_LIVES_MIN[self.isotope]
+        self.half_life_min: float = _iso_cfg["half_life_min"][raw_isotope]
+        self._half_life_multiplier: int = _iso_cfg["half_life_multiplier"]
 
         self.downstream_roi_subset: List[str] = list(context.downstream_roi_subset)
-        if "body" not in self.downstream_roi_subset:
-            self.downstream_roi_subset.insert(0, "body")
+        if "remaining_body" not in self.downstream_roi_subset:
+            self.downstream_roi_subset.insert(0, "remaining_body")
 
         self.height: Optional[float] = None
         self.weight: Optional[float] = None
@@ -124,9 +130,22 @@ class PbpkTacStage:
         self.tac_json_path: str = os.path.join(self.output_dir, f"{self.prefix}_tacs.json")
         self.tac_npz_path: str = os.path.join(self.output_dir, f"{self.prefix}_tacs.npz")
 
-    # -----------------------------
+    def _rerun_config_snapshot(self) -> Dict[str, Any]:
+        """Return the PBPK settings that must match for cached TACs to remain valid."""
+        return build_pbpk_rerun_snapshot(
+            self.context.config,
+            synthetic_enabled=bool(getattr(self.context, "synthetic_lesions_enabled", False)),
+        )
+
+    def _current_dependency_fingerprints(self) -> Dict[str, Any]:
+        """Return developer metadata fingerprints that affect generated TACs."""
+        return {
+            "label_map_json": fingerprint_optional_file(self.label_map_path),
+        }
+
+    # ------------------------------------------------------------------
     # helpers
-    # -----------------------------
+    # ------------------------------------------------------------------
 
     def _sample_lognormal_from_mean_sd(self, mean: float, sd: float) -> float:
         """
@@ -147,52 +166,13 @@ class PbpkTacStage:
         mu = np.log(mean) - 0.5 * sigma2
         return float(np.random.lognormal(mean=mu, sigma=np.sqrt(sigma2)))
 
-    def _extract_height_weight_from_dicom_dir(self, dicom_dir: str) -> Tuple[Optional[float], Optional[float]]:
-        """
-        Try to extract patient height (m) and weight (kg) from DICOM tags.
-
-        Tags: PatientSize (0010,1020) -> meters; PatientWeight (0010,1030) -> kg.
-        Scans up to 50 files; returns (None, None) if not found or unreadable.
-        """
-        if not os.path.isdir(dicom_dir):
-            return None, None
-
-        candidates: List[str] = []
-        for name in sorted(os.listdir(dicom_dir)):
-            path = os.path.join(dicom_dir, name)
-            if os.path.isfile(path):
-                candidates.append(path)
-            if len(candidates) >= 50:
-                break
-
-        for path in candidates:
-            try:
-                ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
-                height = getattr(ds, "PatientSize", None)
-                weight = getattr(ds, "PatientWeight", None)
-
-                height = float(height) if height not in (None, "", " ") else None
-                weight = float(weight) if weight not in (None, "", " ") else None
-
-                if height is not None and height <= 0:
-                    height = None
-                if weight is not None and weight <= 0:
-                    weight = None
-
-                if height is not None or weight is not None:
-                    return height, weight
-            except Exception:
-                continue
-
-        return None, None
-
     def _parameter_check(self) -> Dict[str, float]:
         """
         Validate PBPK config inputs and build the PyCNO parameter override dict.
 
         Returns
         -------
-        dict[str, float]  (may be empty if no overrides)
+        dict[str, float]  parameter overrides (may be empty if no overrides apply)
 
         Raises
         ------
@@ -201,7 +181,7 @@ class PbpkTacStage:
         if not os.path.exists(self.ct_input_path):
             raise ValueError(f"CT input path does not exist: {self.ct_input_path}")
         if not isinstance(self.vois_pbpk, (list, tuple)) or len(self.vois_pbpk) == 0:
-            raise ValueError("PBPK VOIs must be a non-empty list/tuple")
+            raise ValueError("PBPK observables must be a non-empty list/tuple")
 
         if not isinstance(self.randomize_kidney_sg_para, bool):
             raise ValueError("Randomization_Kidney_SG_Para must be True or False")
@@ -220,10 +200,30 @@ class PbpkTacStage:
                 parameters["Rden_Kidney"] = self._sample_lognormal_from_mean_sd(30.0, 10.0)
                 parameters["lambdaRel_Kidney"] = self._sample_lognormal_from_mean_sd(2.88e-4, 0.55e-4)
 
-        self.height = None
-        self.weight = None
-        if os.path.isdir(self.ct_input_path):
-            self.height, self.weight = self._extract_height_weight_from_dicom_dir(self.ct_input_path)
+        # Config-supplied values take priority; fall back to DICOM extraction.
+        cfg_height = self.stage_cfg.get("height_m") or None
+        cfg_weight = self.stage_cfg.get("weight_kg") or None
+        try:
+            cfg_height = float(cfg_height) if cfg_height is not None else None
+            if cfg_height is not None and cfg_height <= 0:
+                cfg_height = None
+        except (TypeError, ValueError):
+            cfg_height = None
+        try:
+            cfg_weight = float(cfg_weight) if cfg_weight is not None else None
+            if cfg_weight is not None and cfg_weight <= 0:
+                cfg_weight = None
+        except (TypeError, ValueError):
+            cfg_weight = None
+
+        self.height = cfg_height
+        self.weight = cfg_weight
+        if (self.height is None or self.weight is None) and os.path.isdir(self.ct_input_path):
+            dicom_h, dicom_w = extract_height_weight(self.ct_input_path)
+            if self.height is None:
+                self.height = dicom_h
+            if self.weight is None:
+                self.weight = dicom_w
 
         if self.height is not None:
             parameters["bodyHeight"] = float(self.height)
@@ -244,7 +244,7 @@ class PbpkTacStage:
         -------
         float  stop time in minutes
         """
-        stop = self.half_life_min * PBPK_HALF_LIFE_MULTIPLIER
+        stop = self.half_life_min * self._half_life_multiplier
 
         # Check if SPECT frame times require a longer TAC
         cfg = self.context.config
@@ -270,11 +270,11 @@ class PbpkTacStage:
 
     def _run_psma_model(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Validate parameters, run PyCNO PSMA PBPK model, and return (time, tacs).
+        Validate parameters, run the PyCNO PSMA PBPK model, and return (time, tacs).
 
         Returns
         -------
-        time : np.ndarray  shape (T,)
+        time : np.ndarray  shape (T,), time in minutes
         tacs : np.ndarray  typically shape (1, T, n_vois) from PyCNO
         """
         self.parameters = self._parameter_check()
@@ -296,24 +296,6 @@ class PbpkTacStage:
         time, tacs = model.simulate(stop=stop, steps=steps, observables=self.vois_pbpk)
         return np.asarray(time, dtype=float), np.asarray(tacs, dtype=float)
 
-    def _roi_to_voi(self, roi_name: str) -> Optional[str]:
-        """
-        Map a TDT ROI name to its PyCNO VOI observable name.
-
-        Returns None if there is no explicit mapping (caller falls back to "Rest").
-        """
-        roi_to_voi = {
-            "kidney":          "Kidney",
-            "body":            "Rest",
-            "liver":           "Liver",
-            "prostate":        "Prostate",
-            "heart":           "Heart",
-            "spleen":          "Spleen",
-            "salivary_glands": "SG",
-            "synthetic_lesion":"Tumor1",
-        }
-        return roi_to_voi.get(roi_name, None)
-
     def _extract_tac_for_voi(self, tacs: np.ndarray, voi_index: int) -> np.ndarray:
         """Extract one VOI TAC from PyCNO output (handles 2D and 3D array shapes)."""
         if tacs.ndim == 3:
@@ -328,10 +310,10 @@ class PbpkTacStage:
         tac_data: Dict[str, Dict[str, Any]],
     ) -> Tuple[str, str]:
         """
-        Save TAC data in JSON (human-readable) + npz (full-resolution arrays).
+        Save TAC data as JSON (human-readable) and npz (full-resolution arrays).
 
         JSON contains: per-ROI metadata, VOI mapping, sampled values.
-        npz contains: time array + per-ROI full TAC arrays.
+        npz contains: time array and per-ROI full TAC arrays.
 
         Returns
         -------
@@ -373,7 +355,11 @@ class PbpkTacStage:
         tac_data: Dict[str, Dict[str, Any]],
     ) -> None:
         """Save PBPK TAC stage metadata for debugging / provenance."""
-        metadata: Dict[str, Any] = {
+        outputs: Dict[str, Any] = {
+            "tac_json_path": self.tac_json_path,
+            "tac_npz_path": self.tac_npz_path,
+        }
+        extra: Dict[str, Any] = {
             "stage": "pbpk_tac_stage",
             "phase_output_dir": self.phase_output_dir,
             "output_dir": self.output_dir,
@@ -382,7 +368,7 @@ class PbpkTacStage:
             "model_type": self.model_type,
             "isotope": self.isotope,
             "half_life_min": self.half_life_min,
-            "half_life_multiplier": PBPK_HALF_LIFE_MULTIPLIER,
+            "half_life_multiplier": self._half_life_multiplier,
             "ct_input_path": self.ct_input_path,
             "vois_pbpk": list(self.vois_pbpk),
             "randomize_kidney_sg_para": bool(self.randomize_kidney_sg_para),
@@ -394,12 +380,19 @@ class PbpkTacStage:
             "tac_npz_path": self.tac_npz_path,
             "downstream_roi_subset": list(self.downstream_roi_subset),
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
+        metadata = build_stage_metadata(
+            stage_name="pbpk_tac_stage",
+            config_snapshot=self._rerun_config_snapshot(),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints=self._current_dependency_fingerprints(),
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # main
-    # -----------------------------
+    # ------------------------------------------------------------------
     def run(self) -> Any:
         """
         Execute PBPK TAC generation and save TACs for all segmented ROIs.
@@ -408,9 +401,19 @@ class PbpkTacStage:
         -------
         context : Context-like
         """
+        assert_stage_rerun_safe(
+            stage_name="pbpk_tac_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=[self.tac_json_path, self.tac_npz_path],
+            current_config_snapshot=self._rerun_config_snapshot(),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints=self._current_dependency_fingerprints(),
+            context=self.context,
+        )
+
         if os.path.exists(self.tac_json_path) and os.path.exists(self.tac_npz_path):
             if self.debug:
-                print(f"[PbpkTacStage] TAC outputs already exist, loading from disk.")
+                print("[PbpkTacStage] TAC outputs already exist, loading from disk.")
             with open(self.tac_json_path, "r", encoding="utf-8") as f:
                 json_data = json.load(f)
             npz_data = np.load(self.tac_npz_path)
@@ -447,7 +450,7 @@ class PbpkTacStage:
         tac_values: Dict[str, np.ndarray] = {}
 
         for roi_name in self.downstream_roi_subset:
-            voi_name = self._roi_to_voi(roi_name)
+            voi_name = roi_to_voi(roi_name, self.label_map_path)
 
             if voi_name is None or voi_name not in self.vois_pbpk:
                 if "Rest" in self.vois_pbpk:
