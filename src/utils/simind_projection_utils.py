@@ -16,7 +16,7 @@ from pytomography.io.shared import get_header_value
 def write_activity_map_nifti(arr_zyx: np.ndarray, spacing_cm_zyx: Sequence[float], out_path: str) -> None:
     """Save a SIMIND-grid activity map as NIfTI using SimpleITK."""
     img = sitk.GetImageFromArray(np.asarray(arr_zyx, dtype=np.float32))
-    spacing_mm = tuple(float(x) * 10.0 for x in spacing_cm_zyx[::-1])
+    spacing_mm = tuple(float(x) * 10.0 for x in spacing_cm_zyx[::-1])  # cm → mm, reversed to xyz
     img.SetSpacing(spacing_mm)
     sitk.WriteImage(img, out_path, True)
 
@@ -61,8 +61,8 @@ def write_projection_nifti(arr_zyx: np.ndarray, output_pixel_width_cm: float, ou
     """Save a PBPK-weighted projection volume as NIfTI."""
     img = sitk.GetImageFromArray(np.asarray(arr_zyx, dtype=np.float32))
     img.SetSpacing((
-        float(output_pixel_width_cm) * 10.0,
-        float(output_pixel_width_cm) * 10.0,
+        float(output_pixel_width_cm) * 10.0,  # cm → mm
+        float(output_pixel_width_cm) * 10.0,  # cm → mm
         1.0,
     ))
     sitk.WriteImage(img, out_path, True)

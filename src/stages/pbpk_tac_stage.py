@@ -1,16 +1,14 @@
 """
 PBPK TAC generation (PyCNO PSMA model) for the PyTheraTwin pipeline.
 
-This stage generates time-activity curves (TACs) for all segmented ROIs and saves
-them for use by downstream simulation and post-processing stages.
+Generates time-activity curves (TACs) for all segmented ROIs and writes
+them to disk for downstream simulation and post-processing stages.
 
-Core responsibilities
----------------------
 - Validate PBPK configuration inputs and CT identity.
 - Optionally randomize kidney/salivary-gland parameters (lognormal sampling).
 - Optionally extract patient height/weight from a DICOM directory.
 - Run the PyCNO PSMA model to obtain TACs (time, tacs).
-- For each ROI in the downstream ROI subset, map ROI -> VOI and store TAC data.
+- Map each ROI in the downstream subset to its VOI and store TAC data.
 - Save TACs as JSON (human-readable) + npz (full-resolution arrays).
 
 Stop time behaviour
@@ -174,7 +172,7 @@ class PbpkTacStage:
 
         Returns
         -------
-        dict[str, float]  (may be empty if no overrides)
+        dict[str, float]  parameter overrides (may be empty if no overrides apply)
 
         Raises
         ------
@@ -272,11 +270,11 @@ class PbpkTacStage:
 
     def _run_psma_model(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Validate parameters, run PyCNO PSMA PBPK model, and return (time, tacs).
+        Validate parameters, run the PyCNO PSMA PBPK model, and return (time, tacs).
 
         Returns
         -------
-        time : np.ndarray  shape (T,)
+        time : np.ndarray  shape (T,), time in minutes
         tacs : np.ndarray  typically shape (1, T, n_vois) from PyCNO
         """
         self.parameters = self._parameter_check()
@@ -312,10 +310,10 @@ class PbpkTacStage:
         tac_data: Dict[str, Dict[str, Any]],
     ) -> Tuple[str, str]:
         """
-        Save TAC data in JSON (human-readable) + npz (full-resolution arrays).
+        Save TAC data as JSON (human-readable) and npz (full-resolution arrays).
 
         JSON contains: per-ROI metadata, VOI mapping, sampled values.
-        npz contains: time array + per-ROI full TAC arrays.
+        npz contains: time array and per-ROI full TAC arrays.
 
         Returns
         -------

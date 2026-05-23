@@ -135,7 +135,7 @@ def _listener_pids(port: int) -> list[int]:
     """Return listener PIDs on *port* when lsof is available, else an empty list."""
     try:
         result = subprocess.run(
-            ["lsof", "-tiTCP:%d" % port, "-sTCP:LISTEN"],
+            ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
         )

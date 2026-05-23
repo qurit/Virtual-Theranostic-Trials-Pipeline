@@ -1,13 +1,13 @@
 """
 SIMIND simulation for the PyTheraTwin pipeline.
 
-This stage prepares inputs for SIMIND and runs Monte Carlo SPECT projection simulations.
+Prepares inputs for SIMIND and runs Monte Carlo SPECT projection simulations.
 
 Preprocessing:
-- Converting CT + segmentation NIfTIs into the SIMIND grid convention (z, y, x with y-flip).
-- Optionally resizing to a target in-plane dimension via isotropic zoom.
-- Building ROI masks and a label->name class map from the unified PyTheraTwin multilabel segmentation.
-- Writing binary files used by SIMIND (attenuation map, body mask, per-ROI binary source maps).
+- Convert CT + segmentation NIfTIs into the SIMIND grid convention (z, y, x with y-flip).
+- Optionally resize to a target in-plane dimension via isotropic zoom.
+- Build ROI masks and a label->name class map from the unified multilabel segmentation.
+- Write binary files for SIMIND (attenuation map, body mask, per-ROI source maps).
 
 Simulation:
 - Validate required context fields (labels, spacing, files).
@@ -88,7 +88,7 @@ from src.utils.simind_runtime_utils import (
 )
 
 
-class _SimindPreprocessor:                                                             
+class _SimindPreprocessor:
     """
     Internal helper: prepare CT + ROI masks for SIMIND simulation.
 
@@ -231,7 +231,7 @@ class _SimindPreprocessor:
         with open(meta_path, encoding="utf-8") as f:
             meta = json.load(f)
         shape = tuple(meta["shape"])
-        arr_px_spacing_cm = tuple(float(x) * 0.1 for x in meta["zooms_mm"])
+        arr_px_spacing_cm = tuple(float(x) * 0.1 for x in meta["zooms_mm"])  # mm → cm
 
         atn_path = os.path.join(self.output_dir, f"{self.prefix}_atn_av.bin")
         body_path = os.path.join(self.output_dir, f"{self.prefix}_body_seg.bin")
@@ -355,7 +355,7 @@ class _SimindPreprocessor:
             zooms_nii_mm[1] / scale_y,  # y-axis → arr index 1
             zooms_nii_mm[0] / scale_x,  # x-axis → arr index 2
         ])
-        arr_px_spacing_cm = tuple(float(x) * 0.1 for x in zooms_mm)
+        arr_px_spacing_cm = tuple(float(x) * 0.1 for x in zooms_mm)  # mm → cm
 
         # HU->mu conversion uses mean in-plane (y, x) spacing.
         pixel_size_cm = (arr_px_spacing_cm[1] + arr_px_spacing_cm[2]) / 2.0
@@ -398,7 +398,7 @@ class SimindSimulationStage:
     ----------
     context : Context-like
         Pipeline context containing config and phase-1 outputs.
-"""
+    """
 
     def __init__(self, context: Any) -> None:
         context.require(
@@ -429,20 +429,20 @@ class SimindSimulationStage:
         self.work_dir: str = os.path.join(self.stage_output_dir, "work_dir")
         os.makedirs(self.work_dir, exist_ok=True)
 
-        # Preprocessing output dir (inside stage output) 
-        self.preprocess_dir: str = os.path.join(self.stage_output_dir, "preprocess") 
-        os.makedirs(self.preprocess_dir, exist_ok=True) 
+        # Preprocessing output dir (inside stage output)
+        self.preprocess_dir: str = os.path.join(self.stage_output_dir, "preprocess")
+        os.makedirs(self.preprocess_dir, exist_ok=True)
 
-        # Header copy dir (survives PRODUCTION cleanup) 
-        self.header_dir: str = os.path.join(self.stage_output_dir, "headers") 
-        os.makedirs(self.header_dir, exist_ok=True) 
+        # Header copy dir (survives PRODUCTION cleanup)
+        self.header_dir: str = os.path.join(self.stage_output_dir, "headers")
+        os.makedirs(self.header_dir, exist_ok=True)
 
         self.metadata_path: str = stage_metadata_path(context.output_folder_path, "simind_simulation_stage")
         self.calibration_path: str = os.path.join(self.output_dir, "calib.res")
 
         self.prefix: str = self.stage_cfg["file_prefix"]
         self.mode: str = self.context.mode
-        self.debug: bool = self.mode == "DEBUG"                                        
+        self.debug: bool = self.mode == "DEBUG"
 
         # SIMIND acquisition parameters from config
         self.collimator: str = self.stage_cfg["Collimator"]
@@ -469,14 +469,14 @@ class SimindSimulationStage:
         # Preprocessing parameters — target voxel spacing in mm [x, y, z], or null for native CT
         self.xyz_spacing_mm = self.stage_cfg.get("xyz_spacing_mm")
 
-        # SIMIND ROI subset (independent from phase_1 roi_subset) 
+        # SIMIND ROI subset (independent from phase_1 roi_subset)
         using_config_roi_subset = self.stage_cfg.get("roi_subset") is not None
-        simind_roi_subset = self.stage_cfg.get("roi_subset")                           
-        if simind_roi_subset is None:                                                  
-            simind_roi_subset = getattr(context, "downstream_roi_subset", [])          
-        if isinstance(simind_roi_subset, str):                                         
-            simind_roi_subset = [simind_roi_subset]                                    
-        self.simind_roi_subset: List[str] = [str(r).strip() for r in simind_roi_subset if str(r).strip()] 
+        simind_roi_subset = self.stage_cfg.get("roi_subset")
+        if simind_roi_subset is None:
+            simind_roi_subset = getattr(context, "downstream_roi_subset", [])
+        if isinstance(simind_roi_subset, str):
+            simind_roi_subset = [simind_roi_subset]
+        self.simind_roi_subset: List[str] = [str(r).strip() for r in simind_roi_subset if str(r).strip()]
 
         lesion_specs = (
             self.context.config.get("phase_1", {})
@@ -636,8 +636,8 @@ class SimindSimulationStage:
         simind_switches_by_organ: Dict[str, str],
         organ_act_paths: Dict[str, str],
         atn_av_path: str,
-        preprocess_results: Dict[str, Any],                                            
-        summed_projection_paths: Dict[str, str],                                       
+        preprocess_results: Dict[str, Any],
+        summed_projection_paths: Dict[str, str],
     ) -> None:
         """Save stage-specific metadata for debugging / provenance."""
         outputs: Dict[str, Any] = {
@@ -657,8 +657,8 @@ class SimindSimulationStage:
             "output_dir": self.output_dir,
             "stage_output_dir": self.stage_output_dir,
             "work_dir": self.work_dir,
-            "preprocess_dir": self.preprocess_dir,                                     
-            "header_dir": self.header_dir,                                             
+            "preprocess_dir": self.preprocess_dir,
+            "header_dir": self.header_dir,
             "file_prefix": self.prefix,
             "simind_exe": self.simind_exe,
             "simind_dir": self.simind_dir,
@@ -674,7 +674,7 @@ class SimindSimulationStage:
             "output_slice_width_mm": self.stage_cfg["OutputSliceWidth"],
             "energy_window_width": self.energy_window_width,
             "num_cpu": self.num_cpu,
-            "simind_roi_subset": list(self.simind_roi_subset),                         
+            "simind_roi_subset": list(self.simind_roi_subset),
             "requested_roi_subset": ["remaining_body", *self.simind_roi_subset],
             "skipped_zero_voxel_rois": skipped_zero_voxel_rois,
             "xyz_spacing_mm": self.xyz_spacing_mm,
@@ -686,9 +686,9 @@ class SimindSimulationStage:
             "binary_roi_act_map_paths": organ_act_paths,
             "atn_av_path": atn_av_path,
             "simind_projection_paths": simind_projection_paths,
-            "summed_projection_paths": summed_projection_paths,                        
-            "arr_px_spacing_cm": list(preprocess_results["arr_px_spacing_cm"]),         
-            "arr_shape_new": list(preprocess_results["arr_shape_new"]),                 
+            "summed_projection_paths": summed_projection_paths,
+            "arr_px_spacing_cm": list(preprocess_results["arr_px_spacing_cm"]),
+            "arr_shape_new": list(preprocess_results["arr_shape_new"]),
         }
         metadata = build_stage_metadata(
             stage_name="simind_simulation_stage",
@@ -899,12 +899,12 @@ class SimindSimulationStage:
             simind_switches_by_organ[organ_name] = simind_switches
 
             if organ_totals_exist(self.work_dir, self.prefix, organ_name) and organ_headers_exist(self.work_dir, self.prefix, organ_name):
-                if self.debug: 
-                    print(f"[SimindSimulationStage] Organ '{organ_name}' projections already exist, skipping.") 
+                if self.debug:
+                    print(f"[SimindSimulationStage] Organ '{organ_name}' projections already exist, skipping.")
                 continue
 
-            if self.debug: 
-                print(f"[SimindSimulationStage] Simulating organ: {organ_name}") 
+            if self.debug:
+                print(f"[SimindSimulationStage] Simulating organ: {organ_name}")
             self._run_simind_for_organ_cores(organ_name, simind_switches)
             aggregate_core_projection_totals(
                 self.work_dir,
@@ -938,8 +938,8 @@ class SimindSimulationStage:
             simind_switches_by_organ=simind_switches_by_organ,
             organ_act_paths=organ_act_paths,
             atn_av_path=atn_av_path,
-            preprocess_results=preprocess_results,                                     
-            summed_projection_paths=summed_projection_paths,                           
+            preprocess_results=preprocess_results,
+            summed_projection_paths=summed_projection_paths,
         )
 
         self.context.spect_sim_output_dir = self.output_dir
@@ -948,13 +948,13 @@ class SimindSimulationStage:
         self.context.simind_metadata_path = self.metadata_path
         self.context.simind_calibration_path = self.calibration_path
         self.context.simind_projection_paths = simind_projection_paths
-        self.context.simind_summed_projection_paths = summed_projection_paths           
+        self.context.simind_summed_projection_paths = summed_projection_paths
         self.context.simind_num_cpu = self.num_cpu
         self.context.simind_geometry = geometry
         self.context.simind_total_num_voxels = total_num_voxels
         self.context.simind_scale_factor = scale_factor
         self.context.simind_switches_by_organ = simind_switches_by_organ
-        self.context.simind_header_dir = self.header_dir                               
+        self.context.simind_header_dir = self.header_dir
         self.context.extras["simind_simulation_stage"] = {
             "requested_roi_subset": ["remaining_body", *self.simind_roi_subset],
             "simulated_roi_names": list(simind_projection_paths.keys()),

@@ -1,20 +1,17 @@
 """
 Dosimetry post-processing for the PyTheraTwin pipeline.
 
-This stage applies PBPK time-activity curves to OpenGATE per-ROI dose maps to produce
-a single total absorbed dose map in absolute units (Gy).
+Applies PBPK time-activity curves to OpenGATE per-ROI dose maps to produce
+a total absorbed dose map in Gy.
 
-Core responsibilities
----------------------
-- Load per-ROI dose maps from OpenGATE (Gy/decay).
-- Load PBPK TACs from Phase 1.
-- Fold absent dedicated non-Rest PBPK organ TACs into remaining_body so excluded
-  organ activity is correctly accounted for in the dose weighting.
-- Integrate each ROI's TAC from t=0 to the end of the TAC (which covers 10x the
-  isotope half-life, capturing >99.9% of all decays) to get total cumulated activity.
-- Multiply each ROI's dose_per_decay by its own cumulated activity, then sum
-  across ROIs to get the total absorbed dose map in Gy.
-- Save one dose map NIfTI to the phase output directory.
+- Per-ROI dose maps from OpenGATE (Gy/decay) are loaded.
+- PBPK TACs from Phase 1 are loaded.
+- Absent non-Rest PBPK organ TACs are folded into remaining_body.
+- Each ROI's TAC is integrated from t=0 to end (10x half-life, >99.9% of decays)
+  to obtain total cumulated activity.
+- Each ROI's dose_per_decay is multiplied by its cumulated activity; results are
+  summed across ROIs to produce the total absorbed dose map in Gy.
+- One dose map NIfTI is written to the phase output directory.
 
 Dose unit conversion
 --------------------

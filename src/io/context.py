@@ -96,7 +96,7 @@ class Context:
         self.simind_metadata_path: Optional[str] = None
         self.simind_calibration_path: Optional[str] = None
         self.simind_projection_paths: Optional[Dict[str, Any]] = None   # {roi_name: {w1/w2/w3: path}}
-        self.simind_summed_projection_paths: Optional[Dict[str, str]] = None  
+        self.simind_summed_projection_paths: Optional[Dict[str, str]] = None
         self.simind_num_cpu: Optional[int] = None
         self.simind_geometry: Optional[Dict[str, Any]] = None
         self.simind_total_num_voxels: Optional[int] = None

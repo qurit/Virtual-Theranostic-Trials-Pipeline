@@ -1,23 +1,19 @@
 """
 OpenGATE dosimetry for the PyTheraTwin pipeline.
 
-This stage runs voxel-source Monte Carlo dose calculations on the phase-1 CT grid
-(using the native CT grid or an optional downsampled simulation grid) with OpenGATE.
-Each requested ROI is simulated independently as a binary voxel source, then the
-resulting dose maps are saved and summed on that same simulation grid.
+Runs voxel-source Monte Carlo dose calculations with OpenGATE on the phase-1
+CT grid (native or optionally downsampled). Each ROI is simulated independently
+as a binary voxel source; dose maps are saved and summed on the simulation grid.
 
-Core responsibilities
----------------------
 - Validate required context fields and stage configuration.
 - Load the phase-1 CT and unified PyTheraTwin ROI segmentation.
-- Optionally downsample the simulation inputs for faster Monte Carlo execution.
+- Optionally downsample simulation inputs for faster Monte Carlo execution.
 - Convert simulation inputs to OpenGATE's centered identity-direction convention.
 - Build one binary voxel-source mask per requested ROI.
 - Run adaptive OpenGATE batches per ROI using Lu-177 decay physics.
-- Skip simulation for any ROI whose final dose NIfTI output already exists on disk
-  (allows resuming a crashed run without re-simulating completed ROIs).
-- Save per-ROI dose maps, uncertainty maps, and a summed dose map
-  on the selected simulation grid.
+- Skip simulation for any ROI whose final dose NIfTI output already exists
+  on disk (allows resuming a crashed run without re-simulating completed ROIs).
+- Save per-ROI dose maps, uncertainty maps, and a summed dose map.
 - Save stage metadata and optional OpenGATE material-label / MHD outputs.
 
 Dose units

@@ -1,10 +1,8 @@
 """
 Pre-flight configuration validator for the PyTheraTwin pipeline.
 
-This module is called by ``main.py`` immediately after the config JSON is
-parsed, before any CT is touched.  All problems are collected into a single
-``ValueError`` so the user can fix everything in one pass instead of
-discovering issues one run at a time.
+Called by ``main.py`` immediately after the config JSON is parsed, before
+any CT is touched.  All problems are collected into a single ``ValueError``.
 
 Checks performed
 ----------------

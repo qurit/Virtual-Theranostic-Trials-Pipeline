@@ -9,6 +9,7 @@ and the web UI subprocess launcher.
 from __future__ import annotations
 
 import os
+import re
 import logging
 import time
 import shutil
@@ -269,25 +270,25 @@ class PyTheraTwinPipeline:
 
     def run(self) -> Context:
         """
-        Execute all pipeline stages sequentially for this CT input.
+        Run all pipeline stages sequentially for this CT input.
 
-        Phases
-        ------
-        1. Digital Twin & Ground Truth:
-            1.1  TotalSegmentator segmentation + ROI unification to the shared label space
+        Phase 1 — Digital Twin & Ground Truth:
+            1.1  TotalSegmentator segmentation + ROI unification
             1.2  Synthetic lesion generation (optional)
             1.3  PBPK TAC generation
-        2. Simulations:
-            2.1  SIMIND preprocessing + Monte Carlo projection simulation (optional, --spect)
+
+        Phase 2 — Simulations:
+            2.1  SIMIND Monte Carlo SPECT projection simulation (optional, --spect)
             2.2  OpenGATE Monte Carlo dosimetry simulation (optional, --dosimetry)
-        3. Post-Processing:
+
+        Phase 3 — Post-Processing:
             3.1  SPECT post-processing (optional, --postprocess with --spect)
             3.2  Dosimetry post-processing (optional, --postprocess with --dosimetry)
 
         Returns
         -------
         Context
-            The updated context after all stages complete.
+            Updated context after all stages complete.
         """
         logger = self.logger
         t_pipeline = time.perf_counter()
@@ -596,11 +597,20 @@ def main() -> int:
         ct_path = os.path.join(ct_inputs_dir, name)
         pipeline: Optional[PyTheraTwinPipeline] = None
 
+        # In web UI mode each job runs with one CT in a temp dir (idx is always 1).
+        # Derive the actual index from the output directory name (e.g. CT_11 → 11).
+        if args.output_dir:
+            _folder = os.path.basename(os.path.abspath(args.output_dir))
+            _m = re.match(r"^CT_(\d+)$", _folder)
+            ct_index = int(_m.group(1)) if _m else idx
+        else:
+            ct_index = idx
+
         try:
             pipeline = PyTheraTwinPipeline(
                 config_path=args.config_file,
                 ct_input=ct_path,
-                ct_index=idx,
+                ct_index=ct_index,
                 mode=args.mode,
                 web_ui=args.web_ui,
                 run_segmentation=args.segmentation,
@@ -616,8 +626,8 @@ def main() -> int:
             pipeline.run()
         except Exception:
             if pipeline is not None:
-                pipeline.logger.exception("Pipeline failed for CT_%s (%s)", idx, ct_path)
-            print(f"[ERROR] CT index {idx} failed for input: {ct_path}")
+                pipeline.logger.exception("Pipeline failed for CT_%s (%s)", ct_index, ct_path)
+            print(f"[ERROR] CT index {ct_index} failed for input: {ct_path}")
             traceback.print_exc()
             any_failed = True
 

@@ -52,13 +52,13 @@ class StageProfiler:
     """
     Lightweight per-stage CPU + RAM profiler.
 
-Usage
------
-profiler = StageProfiler(interval_s=2.0)
-profiler.start_stage("segmentation")
-... run stage ...
-stage_record = profiler.end_stage()
-profiler.save(path, pipeline_elapsed_s, config)
+    Usage
+    -----
+    profiler = StageProfiler(interval_s=2.0)
+    profiler.start_stage("segmentation")
+    ... run stage ...
+    stage_record = profiler.end_stage()
+    profiler.save(path, pipeline_elapsed_s, config)
     """
 
     DEFAULT_INTERVAL_S = 2.0
@@ -175,7 +175,7 @@ profiler.save(path, pipeline_elapsed_s, config)
 
     def _iter_process_tree(self) -> List[Any]:
         # Reuse cached Process objects so cpu_percent() history accumulates across
-        # samples. Children() returns new objects each call — always 0.0 on first use.
+        # samples. children() returns new objects each call — always 0.0 on first use.
         live_pids: Dict[int, Any] = {self._root_proc.pid: self._root_proc}
         try:
             for child in self._root_proc.children(recursive=True):

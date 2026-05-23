@@ -108,7 +108,7 @@ def ensure_ct_matches_saved_copy(
 
 
 def _format_stage_conflict(stage_name: str, reasons: List[str], metadata_path: str | Path) -> str:
-    """Format a clear user-facing rerun conflict message."""
+    """Format a rerun conflict message."""
     label = STAGE_LABELS.get(stage_name, stage_name)
     lines = [f"{label}: existing outputs are not safe to reuse."]
     lines.extend(f"- {reason}" for reason in reasons)
@@ -200,9 +200,9 @@ def assert_stage_rerun_safe(
     """
     Validate that existing cached outputs for a stage are safe to reuse.
 
-    Returns the loaded metadata dict when cached outputs exist and are safe,
-    and sets ``context.stage_skipped = True`` so the profiler can skip logging.
-    Returns ``None`` when no relevant cached outputs exist.
+    Return the loaded metadata dict when cached outputs exist and are safe,
+    and set ``context.stage_skipped = True`` so the profiler can skip logging.
+    Return ``None`` when no relevant cached outputs exist.
     """
     if not any_existing_paths(required_outputs):
         return None

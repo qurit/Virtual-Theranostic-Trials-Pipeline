@@ -1,12 +1,10 @@
 """
 Synthetic lesion generation for the PyTheraTwin pipeline.
 
-Goal
-----
-Generate synthetic spherical lesions inside user-specified organ ROIs from the
-unified label map, then write them back into that segmentation as the
-``synthetic_lesion_tumor1``, ``synthetic_lesion_tumor2``, or ``synthetic_lesion_tumorrest`` label,
-depending on the ``pbpk_label`` field per spec.
+Places synthetic spherical lesions inside user-specified organ ROIs from the
+unified label map and writes them back into that segmentation as the
+``synthetic_lesion_tumor1``, ``synthetic_lesion_tumor2``, or
+``synthetic_lesion_tumorrest`` label, determined by the ``pbpk_label`` field per spec.
 
 Key behavior
 ------------
@@ -137,9 +135,9 @@ class SyntheticLesionsStage:
         self.pytheratwin_roi_seg_path: Optional[str] = getattr(context, "pytheratwin_roi_seg_path", None)
 
         # Keep ROI subset updated so downstream TAC can include synthetic_lesion if needed
-        roi_subset = getattr(self.context, "downstream_roi_subset", None)  
-        if roi_subset is None:  
-            roi_subset = self.context.config["phase_1"]["segmentation_stage"]["roi_subset"]  
+        roi_subset = getattr(self.context, "downstream_roi_subset", None)
+        if roi_subset is None:
+            roi_subset = self.context.config["phase_1"]["segmentation_stage"]["roi_subset"]
         if isinstance(roi_subset, str):
             roi_subset = [roi_subset]
         self.roi_subset: List[str] = [str(r).strip() for r in roi_subset if str(r).strip()]
@@ -438,7 +436,7 @@ class SyntheticLesionsStage:
         bin_path = os.path.join(roi_dir, f"{roi_name}_lesions_binary.nii.gz")
         minus_path = os.path.join(roi_dir, f"{roi_name}_organ_minus_lesions.nii.gz")
 
-        save_nifti_nib(labels_path, zyx_to_xyz(roi_lesion_labels_zyx), seg_nii, dtype=np.uint16)  
+        save_nifti_nib(labels_path, zyx_to_xyz(roi_lesion_labels_zyx), seg_nii, dtype=np.uint16)
         save_nifti_nib(bin_path, zyx_to_xyz(roi_lesion_binary_zyx), seg_nii, dtype=np.uint8)
         save_nifti_nib(minus_path, zyx_to_xyz(roi_organ_minus_lesions_zyx), seg_nii, dtype=np.uint8)
 
@@ -532,7 +530,7 @@ class SyntheticLesionsStage:
         if roi_max > 0:
             offset = int(global_next_id) - 1
             m = roi_lesion_labels_zyx > 0
-            global_lesion_labels_zyx[m] = (roi_lesion_labels_zyx[m].astype(np.uint16) + offset).astype(np.uint16)  
+            global_lesion_labels_zyx[m] = (roi_lesion_labels_zyx[m].astype(np.uint16) + offset).astype(np.uint16)
             global_next_id += roi_max
 
         # Save per-ROI QC outputs into work_dir (debug artifacts, not needed for reruns)

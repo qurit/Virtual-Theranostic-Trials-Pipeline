@@ -1,8 +1,8 @@
 """
 Shared terminal and log-file reporting helpers for pipeline runs.
 
-The goal of this module is to keep ``main.py`` focused on orchestration while
-centralizing banners, debug printing, and concise post-stage summaries.
+Centralizes startup/patient banners, debug printing, and per-stage
+summaries so ``main.py`` remains focused on orchestration.
 """
 
 from __future__ import annotations

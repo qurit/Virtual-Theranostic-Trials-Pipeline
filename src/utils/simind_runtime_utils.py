@@ -25,7 +25,7 @@ def hu_to_mu(
       HU <= 0 (soft tissue/air): mu = mu_water * (1 + HU/1000)
       HU  > 0 (bone):           mu = mu_water + (HU/1000) * (mu_bone - mu_water)
     """
-    mu_water_px = mu_water * pixel_size_cm
+    mu_water_px = mu_water * pixel_size_cm   # cm⁻¹ × cm = dimensionless per-pixel attenuation
     mu_bone_px = mu_bone * pixel_size_cm
     mu_map = np.zeros_like(hu_arr, dtype=np.float32)
     soft = hu_arr <= 0
