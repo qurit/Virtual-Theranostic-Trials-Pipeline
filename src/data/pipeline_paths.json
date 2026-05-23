@@ -1,7 +1,7 @@
 {
   "input_paths": {
-    "label_map_path": "/home/jhubadmin/Theranostic-Virtual-Patient-Pipeline/src/data/pipeline_roi_naming_map.json",
-    "SIMINDDirectory": "/home/jhubadmin/simind/simind"
+    "label_map_path": "src/data/pipeline_roi_naming_map.json",
+    "SIMINDDirectory": ""
   },
   "phase_1": {
     "sub_dir_name": "digital_twin",
