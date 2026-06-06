@@ -28,3 +28,6 @@ test_full_run_CT_0/
 dataset*
 
 paper_dataset*
+
+/src/data/pipeline_paths.json
+
