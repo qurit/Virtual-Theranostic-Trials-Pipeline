@@ -1,23 +1,21 @@
 """
-SPECT Post-Processing Stage for the TDT pipeline.
+SPECT post-processing for the PyTheraTwin pipeline.
 
-This stage combines PBPK TAC weighting of SIMIND projections with OSEM+TEW
-reconstruction using PyTomography.
+Applies PBPK TAC weighting to SIMIND projections and optionally runs
+OSEM+TEW reconstruction via PyTomography.
 
-Core responsibilities (merged from pbpk_stage.py projection weighting + reconstruction_stage.py)
----------------------
-- For each ROI present in SIMIND projections, read per-organ TAC from Phase 1 PBPK.
-- Interpolate TAC values at configured frame start times.
-- Build per-frame activity maps and apply TAC-derived activity to SIMIND projections.
-- Optionally apply Poisson noise to projections.
-- Optionally reconstruct quantitative SPECT images via OSEM + TEW scatter correction.
-- Save PBPK-weighted projections and reconstructed SPECT images.
+- Per-organ TACs are read from Phase 1 PBPK for each ROI present in the projections.
+- Absent non-Rest PBPK organ TACs are folded into the remaining_body TAC.
+- TAC values are interpolated at configured frame start times.
+- Per-frame activity maps are built and applied to SIMIND projections.
+- Poisson noise is optionally added to projections.
+- Quantitative SPECT images are optionally reconstructed via OSEM + TEW.
+- PBPK-weighted projections and reconstructed SPECT images are saved.
 
-Controlled by config flags:
-- apply_tac: whether to weight projections by PBPK TACs
-- apply_poisson_noise: whether to add Poisson noise
-- apply_reconstruction: whether to run PyTomography OSEM+TEW
-- apply_frame_duration: whether to scale projections by frame duration
+Config flags:
+- apply_tac: weight projections by PBPK TACs
+- apply_poisson_noise: add Poisson noise
+- apply_reconstruction: run PyTomography OSEM+TEW
 
 Expected Context interface
 --------------------------
@@ -33,8 +31,6 @@ Incoming `context` is expected to provide:
 - context.pbpk_vois : list[str]
 - context.roi_body_seg_arr, context.mask_roi_body, context.class_seg
 - context.arr_px_spacing_cm
-
-Maintainer / contact: pyazdi@bccrc.ca
 """
 
 from __future__ import annotations
@@ -48,67 +44,97 @@ import SimpleITK as sitk
 import torch
 import pytomography
 
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_spect_rerun_snapshot,
+    fingerprint_optional_file,
+    stage_metadata_path,
+    write_json,
+)
+from src.utils.nifti_utils import voxel_volume_ml
+from src.utils.simind_projection_utils import (
+    build_frame_projection_paths,
+    load_cor_data,
+    read_header_dims_and_windows,
+    read_projection_bin,
+    read_projection_nifti,
+    read_sensitivity_from_calibration_file,
+    read_simind_header_dims,
+    write_activity_map_nifti,
+    write_projection_nifti,
+)
+from src.utils.body_mask_utils import body_mask_from_seg_arr
+from src.utils.tac_utils import get_pbpk_voi_name_for_roi
+
 from pytomography.algorithms import OSEM
 from pytomography.io.SPECT import simind
-from pytomography.io.shared import get_header_value
 from pytomography.likelihoods import PoissonLogLikelihood
 from pytomography.projectors.SPECT import SPECTSystemMatrix
 from pytomography.transforms.SPECT import SPECTAttenuationTransform, SPECTPSFTransform
 
 
-class SpectPostprocessStage:                                                           
+class SpectPostprocessStage:
     """
     SPECT post-processing: TAC weighting + Poisson noise + OSEM+TEW reconstruction.
-
-    Merges functionality from the original pbpk_stage.py (projection weighting)
-    and reconstruction_stage.py (OSEM reconstruction).
     """
 
     def __init__(self, context: Any) -> None:
+        context.require(
+            "subdir_paths",
+            "config",
+            "output_folder_path",
+            "ct_input_identity",
+        )
         self.context = context
-        self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"             
+        self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"
 
         self.phase_output_dir: str = context.subdir_paths["phase_3"]
-        self.stage_cfg: Dict[str, Any] = context.config["phase_3"]["spect_postprocess_stage"] 
+        self.stage_cfg: Dict[str, Any] = context.config["phase_3"]["spect_postprocess_stage"]
 
         self.output_dir: str = os.path.join(
             self.phase_output_dir,
-            self.stage_cfg.get("sub_dir_name", "spect_postprocess"),                   
+            self.stage_cfg.get("sub_dir_name", "spect_postprocess"),
         )
         os.makedirs(self.output_dir, exist_ok=True)
         self.work_dir: str = os.path.join(self.output_dir, "work_dir")
         os.makedirs(self.work_dir, exist_ok=True)
-        self.metadata_path: str = os.path.join(self.work_dir, "spect_postprocess_metadata.json") 
+        self.metadata_path: str = stage_metadata_path(context.output_folder_path, "spect_postprocess_stage")
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
 
-        self.prefix: str = self.stage_cfg.get("file_prefix", "spect_postprocess")      
+        self.prefix: str = self.stage_cfg.get("file_prefix", "spect_postprocess")
         self.mode: str = context.mode
 
-        # Post-processing control flags 
-        self.apply_tac: bool = bool(self.stage_cfg.get("apply_tac", True))             
-        self.apply_poisson_noise: bool = bool(self.stage_cfg.get("apply_poisson_noise", True)) 
-        self.apply_reconstruction: bool = bool(self.stage_cfg.get("apply_reconstruction", True)) 
-        self.apply_frame_duration: bool = bool(self.stage_cfg.get("apply_frame_duration", True)) 
+        # Post-processing control flags
+        self.apply_tac: bool = bool(self.stage_cfg.get("apply_tac", True))
+        self.apply_poisson_noise: bool = bool(self.stage_cfg.get("apply_poisson_noise", True))
+        self.apply_reconstruction: bool = bool(self.stage_cfg.get("apply_reconstruction", True))
+        # SIMIND projections are in counts/MBq/s; organ_sum is in MBq.
+        # Frame duration is always applied so weighted projections are counts,
+        # not count rates.
+        self.frame_duration_applied: bool = True
 
-        # Frame timing from post-process config 
-        self.frame_start: Sequence[float] = self.stage_cfg["FrameStartTimes"]          
-        self.frame_durations_s: Sequence[float] = self.stage_cfg["FrameDurations"]     
+        # Frame timing from post-process config
+        self.frame_start: Sequence[float] = self.stage_cfg["FrameStartTimes"]
+        self.frame_durations_s: Sequence[float] = self.stage_cfg["FrameDurations"]
 
-        # SIMIND config for projection reading 
-        self.simind_cfg: Dict[str, Any] = context.config["phase_2"]["simind_stage"]    
+        # SIMIND config for projection reading
+        self.simind_cfg: Dict[str, Any] = context.config["phase_2"]["simind_stage"]
         self.simind_num_projections: int = int(self.simind_cfg["NumProjections"])
         self.simind_output_img_size: int = int(self.simind_cfg["OutputImgSize"])
-        self.simind_output_pixel_width_cm: float = float(self.simind_cfg["OutputPixelWidth"])
-        self.simind_output_slice_width_cm: float = float(self.simind_cfg["OutputSliceWidth"])
+        # Config values are in mm; convert to cm for internal geometry calculations.
+        self.simind_output_pixel_width_cm: float = float(self.simind_cfg["OutputPixelWidth"]) / 10.0
+        self.simind_output_slice_width_cm: float = float(self.simind_cfg["OutputSliceWidth"]) / 10.0
         self.simind_prefix: str = str(self.simind_cfg["file_prefix"])
-        self.detector_distance: float = float(self.simind_cfg["DetectorDistance"])      
+        self.detector_distance: float = float(self.simind_cfg["DetectorDistance"])
 
-        # Header dir (survives PRODUCTION cleanup) 
-        self.header_dir: Optional[str] = getattr(context, "simind_header_dir", None)   
-        if self.header_dir is None:                                                    
-            self.header_dir = getattr(context, "simind_work_dir", None)                
+        # Header dir (survives PRODUCTION cleanup)
+        self.header_dir: Optional[str] = getattr(context, "simind_header_dir", None)
+        if self.header_dir is None:
+            self.header_dir = getattr(context, "simind_work_dir", None)
 
         self.calibration_file: str = getattr(context, "simind_calibration_path", None) or os.path.join(
-            context.subdir_paths["phase_2"], "calib.res"                               
+            context.subdir_paths["phase_2"], "calib.res"
         )
 
         self.proj_dim1: Optional[int] = None
@@ -116,124 +142,73 @@ class SpectPostprocessStage:
         self.num_proj: Optional[int] = None
 
         # Reconstruction settings
-        self.iterations: int = int(self.stage_cfg.get("Iterations", 4))                
-        self.subsets: int = int(self.stage_cfg.get("Subsets", 8))                       
-        self.recon_algorithm: str = self.stage_cfg.get("ReconstructionAlgorithm", "OSEM") 
+        self.iterations: int = int(self.stage_cfg.get("Iterations", 4))
+        self.subsets: int = int(self.stage_cfg.get("Subsets", 8))
+        self.recon_algorithm: str = self.stage_cfg.get("ReconstructionAlgorithm", "OSEM")
 
-        # (x, y, z) spacing tuple for SimpleITK images
-        self.output_tuple: Tuple[float, float, float] = (
-            self.simind_output_pixel_width_cm,
-            self.simind_output_pixel_width_cm,
-            self.simind_output_slice_width_cm,
+        # SIMIND uses cm in its config, while NIfTI spacing is conventionally mm.
+        self.recon_spacing_mm: Tuple[float, float, float] = (
+            self.simind_output_pixel_width_cm * 10.0,
+            self.simind_output_pixel_width_cm * 10.0,
+            self.simind_output_slice_width_cm * 10.0,
         )
 
-    # -----------------------------
-    # helpers — projection I/O (from pbpk_stage)
-    # -----------------------------
+    def _frame_label(self, i: int) -> str:
+        """Return a compact hour-valued string label for frame index i."""
+        return f"{float(self.frame_start[i]) / 60.0:.6f}".rstrip("0").rstrip(".")
 
-    def _voxel_volume_ml(self, arr_px_spacing_cm: Sequence[float]) -> float:           
-        """Compute voxel volume in mL from (z, y, x) spacing in cm. (cm^3 == mL)"""
-        return float(np.prod(np.asarray(arr_px_spacing_cm, dtype=float)))
+    def _rerun_config_snapshot(self) -> Dict[str, Any]:
+        """Return the SPECT post-processing settings that must match for reruns."""
+        return build_spect_rerun_snapshot(self.context.config)
 
-    def _write_activity_map_nifti(self, arr_zyx: np.ndarray, out_path: str) -> None:   
-        """Save a SIMIND-grid activity map as NIfTI using SimpleITK."""
-        img = sitk.GetImageFromArray(np.asarray(arr_zyx, dtype=np.float32))
-        spacing_mm = tuple(float(x) * 10.0 for x in self.context.arr_px_spacing_cm[::-1])
-        img.SetSpacing(spacing_mm)
-        sitk.WriteImage(img, out_path, True)
+    def _current_dependency_fingerprints(self) -> Dict[str, Any]:
+        """Return fingerprints for the upstream artifacts that feed this stage."""
+        return {
+            "simind_stage_metadata": fingerprint_optional_file(self.context.simind_metadata_path),
+            "pbpk_tac_json": fingerprint_optional_file(self.context.pbpk_tac_json_path),
+            "pbpk_tac_npz": fingerprint_optional_file(self.context.pbpk_tac_npz_path),
+        }
 
-    def _get_metadata_from_header(
-        self, photopeak_path: str, lower_path: str, upper_path: str
-    ) -> Tuple[int, int, int]:
-        """Parse SIMIND header files and return (proj_dim1, proj_dim2, num_proj)."""
-        for p in (photopeak_path, lower_path, upper_path):
-            if not os.path.exists(p):
-                raise FileNotFoundError(f"Missing SIMIND header file: {p}")
-        with open(photopeak_path, "r", encoding="utf-8") as f:
-            headerdata = np.array(f.readlines())
-        return (
-            int(get_header_value(headerdata, "matrix size [1]", int)),
-            int(get_header_value(headerdata, "matrix size [2]", int)),
-            int(get_header_value(headerdata, "total number of images", int)),
+    def _cache_marker_paths(self) -> List[str]:
+        """Return representative output files whose presence means rerun metadata must match."""
+        markers: List[str] = []
+        for window_paths in build_frame_projection_paths(self.output_dir, self.prefix, self.frame_start).values():
+            markers.extend(window_paths.values())
+        if self.apply_reconstruction:
+            for i in range(len(self.frame_start)):
+                markers.append(os.path.join(self.phase_output_dir, f"reconstructed_SPECT_{self._frame_label(i)}.nii.gz"))
+            markers.append(os.path.join(self.output_dir, "recon_atn_img.nii.gz"))
+        return markers
+
+    def _header_paths_for_roi(self, roi_name: str) -> Tuple[str, str, str]:
+        """Return lower/photopeak/upper SIMIND header paths for an ROI stem."""
+        lower_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_name}_0_tot_w1.h00")
+        photopeak_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_name}_0_tot_w2.h00")
+        upper_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_name}_0_tot_w3.h00")
+        return lower_h, photopeak_h, upper_h
+
+    def _select_header_roi(self, roi_list: Sequence[str]) -> str:
+        """Pick a simulated ROI whose copied SIMIND headers are available."""
+        for roi_name in roi_list:
+            lower_h, photopeak_h, upper_h = self._header_paths_for_roi(roi_name)
+            if all(os.path.exists(p) for p in (lower_h, photopeak_h, upper_h)):
+                return roi_name
+        raise FileNotFoundError(
+            "No complete SIMIND header triplet found in "
+            f"{self.header_dir} for ROIs: {list(roi_list)}"
         )
 
-    def _read_projection_bin(self, proj_path: str) -> np.ndarray:
-        """
-        Read a SIMIND .a00 projection binary and convert to PyTomography convention (n_proj, x, y).
-        """
-        if self.proj_dim1 is None or self.proj_dim2 is None or self.num_proj is None:
-            raise AttributeError("Projection metadata has not been initialized from SIMIND headers.")
-
-        proj_arr = np.fromfile(proj_path, dtype=np.float32)
-        expected_size = int(self.num_proj * self.proj_dim1 * self.proj_dim2)
-        if proj_arr.size != expected_size:
-            raise ValueError(
-                f"Unexpected projection file size for {proj_path}. "
-                f"Got {proj_arr.size}, expected {expected_size} "
-                f"for shape ({self.num_proj}, {self.proj_dim1}, {self.proj_dim2})."
-            )
-        proj_arr = proj_arr.reshape((self.num_proj, self.proj_dim2, self.proj_dim1))
-        return np.asarray(np.transpose(proj_arr[:, ::-1, :], (0, 2, 1)), dtype=np.float32)
-
-    def _write_projection_nifti(self, arr_zyx: np.ndarray, out_path: str) -> None:
-        """Save a PBPK-weighted projection volume as NIfTI (PyTomography convention: n_proj, x, y)."""
-        img = sitk.GetImageFromArray(np.asarray(arr_zyx, dtype=np.float32))
-        img.SetSpacing((
-            float(self.simind_output_pixel_width_cm) * 10.0,
-            float(self.simind_output_pixel_width_cm) * 10.0,
-            1.0,
-        ))
-        sitk.WriteImage(img, out_path, True)
-
-    # -----------------------------
-    # helpers — reconstruction (from reconstruction_stage)
-    # -----------------------------
-
-    def _get_sensitivity_from_calibration_file(self, calibration_file: str) -> float:
-        """
-        Read sensitivity (counts/s/MBq) from SIMIND `calib.res`.
-
-        SIMIND writes sensitivity on a fixed line (index 70, 0-based).
-        """
-        with open(calibration_file, "r") as f:
-            lines = f.readlines()
-        return float(lines[70].strip().split(":")[-1].strip().split()[0])
-
-    def _get_metadata_from_header_full(
-        self, photopeak_path: str, lower_path: str, upper_path: str
-    ) -> Tuple[int, int, int, float, float, float]:                                    
-        """
-        Parse SIMIND header files and return projection dimensions + energy window widths.
-
-        Returns
-        -------
-        (proj_dim1, proj_dim2, num_proj, ww_peak, ww_lower, ww_upper)
-        """
-        with open(photopeak_path, "r") as f:
-            headerdata = np.array(f.readlines())
-
-        proj_dim1 = get_header_value(headerdata, "matrix size [1]", int)
-        proj_dim2 = get_header_value(headerdata, "matrix size [2]", int)
-        num_proj = get_header_value(headerdata, "total number of images", int)
-
-        ww_peak, ww_lower, ww_upper = [
-            simind.get_energy_window_width(p) for p in (photopeak_path, lower_path, upper_path)
-        ]
-        return proj_dim1, proj_dim2, num_proj, ww_peak, ww_lower, ww_upper
-
-    def _get_cor_data(self, cor_path: str) -> np.ndarray:
-        """Load COR file and sanitize to 1D if needed (writes back to disk in place)."""
-        cor_data = np.loadtxt(cor_path).astype(float)
-        if cor_data.ndim == 2:
-            cor_data = cor_data[:, 0]
-            np.savetxt(cor_path, cor_data)
-        return cor_data
-
-    def _read_projection_nifti(self, projection_path: str) -> np.ndarray:
-        """Read a PBPK projection NIfTI and return as float32 array."""
-        if not os.path.exists(projection_path):
-            raise FileNotFoundError(f"Missing projection file: {projection_path}")
-        return sitk.GetArrayFromImage(sitk.ReadImage(projection_path)).astype(np.float32)
+    def _load_metadata_extra(self) -> Dict[str, Any]:
+        """Load previously saved metadata extras when this stage is skipped."""
+        if not os.path.exists(self.metadata_path):
+            return {}
+        try:
+            with open(self.metadata_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            extra = meta.get("extra", {})
+            return extra if isinstance(extra, dict) else {}
+        except Exception:
+            return {}
 
     def _convert_counts_to_mbq_per_ml(
         self,
@@ -254,6 +229,57 @@ class SpectPostprocessStage:
             / self.simind_output_slice_width_cm
         )
 
+    def _image_has_expected_spacing(self, image_path: str) -> bool:
+        """Return True when an existing NIfTI already has the current recon spacing."""
+        try:
+            spacing = sitk.ReadImage(image_path).GetSpacing()
+        except Exception:
+            return False
+        return all(
+            abs(float(actual) - float(expected)) < 1e-6
+            for actual, expected in zip(spacing, self.recon_spacing_mm)
+        )
+
+    def _apply_body_mask(self, recon_img: sitk.Image, amap=None) -> sitk.Image:
+        """Zero out reconstructed voxels outside the patient body outline.
+
+        Prefer the SIMIND attenuation map (amap) when available — it is already
+        in the reconstruction grid so no shape mismatch is possible.  Fall back
+        to the segmentation array from context when amap is not provided.
+        """
+        recon_arr = sitk.GetArrayFromImage(recon_img)
+        mask = None
+
+        if amap is not None:
+            # amap is a PyTomography tensor in (Nx,Ny,Nz) object order.
+            # _convert_counts_to_mbq_per_ml applies .T so recon_arr is (Nz,Ny,Nx).
+            # Transposing amap gives the same (Nz,Ny,Nx) layout.
+            try:
+                import torch
+                amap_np = amap.detach().cpu().numpy() if isinstance(amap, torch.Tensor) else np.asarray(amap)
+            except Exception:
+                amap_np = np.asarray(amap)
+            candidate = amap_np.T > 0
+            if candidate.shape == recon_arr.shape:
+                mask = candidate
+            elif self.debug:
+                print(
+                    f"[SpectPostprocessStage] amap.T shape {candidate.shape} != "
+                    f"recon shape {recon_arr.shape}; falling back to seg-arr masking."
+                )
+
+        if mask is None:
+            seg_arr = getattr(self.context, "roi_body_seg_arr", None)
+            mask = body_mask_from_seg_arr(
+                seg_arr, recon_arr.shape, debug=self.debug, stage_tag="SpectPostprocessStage"
+            )
+
+        if mask is None:
+            return recon_img
+        out = sitk.GetImageFromArray(recon_arr * mask)
+        out.CopyInformation(recon_img)
+        return out
+
     def _get_recon_img(
         self,
         likelihood: PoissonLogLikelihood,
@@ -270,83 +296,70 @@ class SpectPostprocessStage:
         recon_arr = self._convert_counts_to_mbq_per_ml(reconstructed_image, sensitivity, frame_duration)
 
         recon_img = sitk.GetImageFromArray(recon_arr)
-        recon_img.SetSpacing(self.output_tuple)
+        recon_img.SetSpacing(self.recon_spacing_mm)
         return recon_img
 
     def _write_recon_atn_img(self, amap: torch.Tensor) -> Tuple[sitk.Image, str]:
         """Write the attenuation map (from SIMIND .hct header) as a NIfTI in recon grid."""
-        recon_atn_path = os.path.join(self.output_dir, "recon_atn_img.nii.gz")         
-        if os.path.exists(recon_atn_path):
+        recon_atn_path = os.path.join(self.output_dir, "recon_atn_img.nii.gz")
+        if os.path.exists(recon_atn_path) and self._image_has_expected_spacing(recon_atn_path):
             return sitk.ReadImage(recon_atn_path), recon_atn_path
 
         recon_atn_img = sitk.GetImageFromArray(amap.cpu().T)
-        recon_atn_img.SetSpacing(self.output_tuple)
+        recon_atn_img.SetSpacing(self.recon_spacing_mm)
         sitk.WriteImage(recon_atn_img, recon_atn_path, imageIO="NiftiImageIO")
         return recon_atn_img, recon_atn_path
 
-    # -----------------------------
-    # helpers — TAC application (from pbpk_stage)
-    # -----------------------------
-
-    def _roi_to_voi(self, roi_name: str) -> Optional[str]:                             
-        """Map a TDT ROI name to its PyCNO VOI observable name."""
-        roi_to_voi = {
-            "kidney":          "Kidney",
-            "body":            "Rest",
-            "liver":           "Liver",
-            "prostate":        "Prostate",
-            "heart":           "Heart",
-            "spleen":          "Spleen",
-            "salivary_glands": "SG",
-            "synthetic_lesion":"Tumor1",
-        }
-        return roi_to_voi.get(roi_name, None)
-
-    def _build_pbpk_projection_paths(self) -> Dict[str, Dict[str, str]]:
-        """Build the expected output paths for PBPK-weighted frame projections."""
-        projection_paths: Dict[str, Dict[str, str]] = {}
-        for frame in self.frame_start:
-            # Label in hours (max 6 decimal places, trailing zeros stripped)
-            frame_label = f"{float(frame)/60.0:.6f}".rstrip("0").rstrip(".")
-            projection_paths[frame_label] = {
-                "w1": os.path.join(self.output_dir, f"{self.prefix}_{frame_label}_tot_w1.nii.gz"), 
-                "w2": os.path.join(self.output_dir, f"{self.prefix}_{frame_label}_tot_w2.nii.gz"), 
-                "w3": os.path.join(self.output_dir, f"{self.prefix}_{frame_label}_tot_w3.nii.gz"), 
-            }
-        return projection_paths
-
-    def _save_stage_metadata(                                                          
+    def _save_stage_metadata(
         self,
         pbpk_projection_paths: Dict[str, Dict[str, str]],
         recon_paths: Dict[str, str],
+        folded_remaining_body_rois: Optional[List[str]] = None,
+        rest_owned_skipped_rois: Optional[List[str]] = None,
     ) -> None:
         """Save post-processing stage metadata for debugging / provenance."""
-        metadata: Dict[str, Any] = {
-            "stage": "spect_postprocess_stage",                                        
+        outputs: Dict[str, Any] = {
+            "pbpk_projection_paths": pbpk_projection_paths,
+            "reconstructed_spect_paths": recon_paths,
+        }
+        extra: Dict[str, Any] = {
+            "stage": "spect_postprocess_stage",
             "phase_output_dir": self.phase_output_dir,
             "output_dir": self.output_dir,
             "work_dir": self.work_dir,
             "file_prefix": self.prefix,
-            "apply_tac": self.apply_tac,                                               
-            "apply_poisson_noise": self.apply_poisson_noise,                           
-            "apply_reconstruction": self.apply_reconstruction,                         
-            "apply_frame_duration": self.apply_frame_duration,                         
+            "apply_tac": self.apply_tac,
+            "apply_poisson_noise": self.apply_poisson_noise,
+            "apply_reconstruction": self.apply_reconstruction,
+            "frame_duration_applied": self.frame_duration_applied,
             "frame_start_times_min": np.asarray(self.frame_start, dtype=float).tolist(),
             "frame_durations_s": np.asarray(self.frame_durations_s, dtype=float).tolist(),
-            "iterations": self.iterations,                                             
-            "subsets": self.subsets,                                                    
-            "reconstruction_algorithm": self.recon_algorithm,                          
-            "pbpk_projection_paths": pbpk_projection_paths,                            
-            "reconstructed_spect_paths": recon_paths,                                  
-            "header_dir": self.header_dir,                                             
-            "calibration_file": self.calibration_file,                                 
+            "reconstruction_spacing_xyz_mm": list(self.recon_spacing_mm),
+            "iterations": self.iterations,
+            "subsets": self.subsets,
+            "reconstruction_algorithm": self.recon_algorithm,
+            "pbpk_projection_paths": pbpk_projection_paths,
+            "reconstructed_spect_paths": recon_paths,
+            "header_dir": self.header_dir,
+            "calibration_file": self.calibration_file,
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
+        if folded_remaining_body_rois is not None:
+            extra["remaining_body_folded_rois"] = list(folded_remaining_body_rois)
+        if rest_owned_skipped_rois is not None:
+            extra["rest_owned_skipped_rois"] = list(rest_owned_skipped_rois)
+        metadata = build_stage_metadata(
+            stage_name="spect_postprocess_stage",
+            config_snapshot=self._rerun_config_snapshot(),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints=self._current_dependency_fingerprints(),
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # main
-    # -----------------------------
+    # ------------------------------------------------------------------
     def run(self) -> Any:
         """
         Execute SPECT post-processing: TAC weighting + optional reconstruction.
@@ -355,96 +368,152 @@ class SpectPostprocessStage:
         -------
         context : Context-like
         """
-        self.context.require(                                                          
+        assert_stage_rerun_safe(
+            stage_name="spect_postprocess_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=self._cache_marker_paths(),
+            current_config_snapshot=self._rerun_config_snapshot(),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints=self._current_dependency_fingerprints(),
+            context=self.context,
+        )
+        if self.context.stage_skipped:
+            metadata_extra = self._load_metadata_extra()
+            self.context.reconstruction_output_dir = self.phase_output_dir
+            self.context.pbpk_projection_paths = build_frame_projection_paths(
+                self.output_dir, self.prefix, self.frame_start
+            )
+            self.context.pbpk_frame_start_times_min = np.asarray(self.frame_start, dtype=float)
+            self.context.pbpk_frame_durations_s = np.asarray(self.frame_durations_s, dtype=float)
+            self.context.extras["spect_postprocess_stage"] = {
+                "folded_remaining_body_rois": metadata_extra.get("remaining_body_folded_rois", []),
+                "rest_owned_skipped_rois": metadata_extra.get("rest_owned_skipped_rois", []),
+                "metadata_path": self.metadata_path,
+            }
+            return self.context
+
+        self.context.require(
             "class_seg",
             "arr_px_spacing_cm",
             "simind_projection_paths",
-            "simind_header_dir",                                                       
-            "pbpk_tac_time",                                                           
-            "pbpk_tac_values",                                                         
-            "mask_roi_body",                                                           
-            "roi_body_seg_arr",                                                        
+            "simind_header_dir",
+            "pbpk_tac_time",
+            "pbpk_tac_values",
+            "mask_roi_body",
+            "roi_body_seg_arr",
         )
 
-        # Remove "background" label if present (not a real ROI).  
+        # Remove "background" label if present (not a real ROI).
         class_seg = {k: v for k, v in self.context.class_seg.items() if k != "background"}
-        voxel_vol_ml = self._voxel_volume_ml(self.context.arr_px_spacing_cm)
+        voxel_vol_ml = voxel_volume_ml(self.context.arr_px_spacing_cm)
 
         roi_list = list(self.context.simind_projection_paths.keys())
         if not roi_list:
             raise ValueError("No phase-2 SIMIND projection paths found in context.")
 
-        # Locate SIMIND headers from header_dir 
-        photopeak_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0_tot_w2.h00") 
-        lower_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0_tot_w1.h00") 
-        upper_h = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0_tot_w3.h00") 
-        self.proj_dim1, self.proj_dim2, self.num_proj = self._get_metadata_from_header(
+        # Locate SIMIND headers from header_dir.
+        header_roi = self._select_header_roi(roi_list)
+        lower_h, photopeak_h, upper_h = self._header_paths_for_roi(header_roi)
+        self.proj_dim1, self.proj_dim2, self.num_proj = read_simind_header_dims(
             photopeak_h, lower_h, upper_h
         )
 
-        # Get TAC data from Phase 1 
-        tac_time = self.context.pbpk_tac_time                                         
-        tac_values = self.context.pbpk_tac_values                                     
+        # Get TAC data from Phase 1
+        tac_time = self.context.pbpk_tac_time
+        # Work on a local copy so we can safely patch remaining_body without
+        # mutating context for other stages.
+        tac_values: Dict[str, np.ndarray] = dict(self.context.pbpk_tac_values)
+
+        # Aggregate excluded dedicated-organ TACs into remaining_body.
+        # SIMIND's roi_subset may be smaller than Phase 1's roi_subset.  Any ROI
+        # with a dedicated non-Rest PBPK VOI that is NOT present in this simulation's
+        # class_seg is geometrically absorbed into SIMIND's remaining_body mask.
+        # ROIs mapped to Rest are already represented by remaining_body itself.
+        simulation_rois: set = set(class_seg.keys()) - {"remaining_body"}
+        folded_remaining_body_rois: List[str] = []
+        rest_owned_skipped_rois: List[str] = []
+        if "remaining_body" in tac_values:
+            effective_rb = tac_values["remaining_body"].copy().astype(np.float64)
+            for _rn, _rt in self.context.pbpk_tac_values.items():
+                if _rn != "remaining_body" and _rn not in simulation_rois:
+                    voi_name = get_pbpk_voi_name_for_roi(self.context, _rn)
+                    if isinstance(voi_name, str) and voi_name.strip().lower() == "rest":
+                        rest_owned_skipped_rois.append(_rn)
+                        continue
+                    effective_rb += np.asarray(_rt, dtype=np.float64)
+                    folded_remaining_body_rois.append(_rn)
+            tac_values["remaining_body"] = effective_rb.astype(np.float32)
+        if self.debug and (folded_remaining_body_rois or rest_owned_skipped_rois):
+            print(
+                "[SpectPostprocessStage] Remaining-body TAC folding summary: "
+                f"folded={len(folded_remaining_body_rois)} ROI(s) | "
+                f"skipped_rest_owned={len(rest_owned_skipped_rois)} ROI(s). "
+                f"Details: {self.metadata_path}"
+            )
 
         n_frames = len(self.frame_start)
-        roi_body_seg_arr = self.context.roi_body_seg_arr                               
-        mask_roi_body = self.context.mask_roi_body                                     
+        roi_body_seg_arr = self.context.roi_body_seg_arr
+        mask_roi_body = self.context.mask_roi_body
 
-        activity_map = np.zeros((n_frames, *roi_body_seg_arr.shape), dtype=np.float32) 
+        activity_map = np.zeros((n_frames, *roi_body_seg_arr.shape), dtype=np.float32)
         activity_organ_sum: Dict[str, np.ndarray] = {}
         organ_paths: List[str] = []
-        pbpk_projection_paths = self._build_pbpk_projection_paths()
+        pbpk_projection_paths = build_frame_projection_paths(self.output_dir, self.prefix, self.frame_start)
         frame_projection_sums: Dict[str, Dict[str, Optional[np.ndarray]]] = {
             label: {"w1": None, "w2": None, "w3": None} for label in pbpk_projection_paths
         }
 
         for roi_name, label_value in class_seg.items():
-            # Get TAC for this ROI 
-            if roi_name not in tac_values:                                             
-                if self.debug:                                                         
-                    print(f"[SpectPostprocessStage] No TAC for ROI '{roi_name}', skipping.") 
-                continue                                                               
+            # Get TAC for this ROI
+            if roi_name not in tac_values:
+                if self.debug:
+                    print(f"[SpectPostprocessStage] No TAC for ROI '{roi_name}', skipping.")
+                continue
 
-            tac_voi = tac_values[roi_name]                                             
-            tac_interp = np.interp(np.asarray(self.frame_start, dtype=float), tac_time, tac_voi) 
+            tac_voi = tac_values[roi_name]
+            tac_interp = np.interp(np.asarray(self.frame_start, dtype=float), tac_time, tac_voi)
 
-            mask = mask_roi_body[int(label_value)]                                     
-            n_vox = int(np.sum(mask))                                                  
-            if n_vox == 0:                                                             
-                continue                                                               
+            mask = mask_roi_body[int(label_value)]
+            n_vox = int(np.sum(mask))
+            if n_vox == 0:
+                continue
 
-            # Build per-frame activity map for this ROI 
-            activity_map_organ = np.zeros((n_frames, *roi_body_seg_arr.shape), dtype=np.float32) 
-            activity_map_organ[:, mask] = tac_interp[:, None] / (n_vox * voxel_vol_ml) 
-            activity_map[:, mask] = activity_map_organ[:, mask]                        
+            # Build per-frame activity map for this ROI
+            activity_map_organ = np.zeros((n_frames, *roi_body_seg_arr.shape), dtype=np.float32)
+            activity_map_organ[:, mask] = tac_interp[:, None] / (n_vox * voxel_vol_ml)
+            activity_map[:, mask] = activity_map_organ[:, mask]
 
-            organ_sum = np.sum(activity_map_organ, axis=(1, 2, 3)) * voxel_vol_ml     
-            activity_organ_sum[roi_name] = organ_sum                                   
+            organ_sum = np.sum(activity_map_organ, axis=(1, 2, 3)) * voxel_vol_ml
+            activity_organ_sum[roi_name] = organ_sum
 
-            # Save first-frame activity map for provenance 
-            organ_map_path = os.path.join(self.work_dir, f"{self.prefix}_{roi_name}_act_av.nii.gz") 
-            self._write_activity_map_nifti(activity_map_organ[0], organ_map_path)      
-            organ_paths.append(organ_map_path)                                         
+            # Save first-frame activity map for provenance
+            organ_map_path = os.path.join(self.work_dir, f"{self.prefix}_{roi_name}_act_av.nii.gz")
+            write_activity_map_nifti(activity_map_organ[0], self.context.arr_px_spacing_cm, organ_map_path)
+            organ_paths.append(organ_map_path)
 
             if roi_name not in self.context.simind_projection_paths:
                 raise KeyError(f"Missing phase-2 SIMIND projections for ROI: {roi_name}")
 
             roi_projection_paths = self.context.simind_projection_paths[roi_name]
             for i in range(n_frames):
-                frame_label = f"{float(self.frame_start[i])/60.0:.6f}".rstrip("0").rstrip(".")
+                frame_label = self._frame_label(i)
                 # frame_scale: counts = (counts/MBq/s) * MBq * s
-                frame_scale = float(organ_sum[i])                                      
-                if self.apply_frame_duration:                                          
-                    frame_scale *= float(self.frame_durations_s[i])                    
+                frame_scale = float(organ_sum[i])
+                frame_scale *= float(self.frame_durations_s[i])
                 for window_key in ("w1", "w2", "w3"):
                     proj_path = roi_projection_paths[window_key]
                     if not os.path.exists(proj_path):
                         raise FileNotFoundError(f"SIMIND projection not found: {proj_path}")
-                    proj_arr = self._read_projection_bin(proj_path)
-                    if self.apply_tac:                                                 
-                        weighted = np.asarray(proj_arr * frame_scale, dtype=np.float32) 
-                    else:                                                              
-                        weighted = proj_arr.copy()                                     
+                    proj_arr = read_projection_bin(
+                        proj_path,
+                        proj_dim1=self.proj_dim1,
+                        proj_dim2=self.proj_dim2,
+                        num_proj=self.num_proj,
+                    )
+                    if self.apply_tac:
+                        weighted = np.asarray(proj_arr * frame_scale, dtype=np.float32)
+                    else:
+                        weighted = proj_arr.copy()
                     if frame_projection_sums[frame_label][window_key] is None:
                         frame_projection_sums[frame_label][window_key] = weighted
                     else:
@@ -459,14 +528,18 @@ class SpectPostprocessStage:
                     raise ValueError(
                         f"No PBPK-weighted projection generated for {frame_label} {window_key}"
                     )
-                self._write_projection_nifti(proj_arr, pbpk_projection_paths[frame_label][window_key])
+                write_projection_nifti(
+                    proj_arr,
+                    self.simind_output_pixel_width_cm,
+                    pbpk_projection_paths[frame_label][window_key],
+                )
 
         recon_paths: Dict[str, str] = {}
 
-        if self.apply_reconstruction:                                                  
+        if self.apply_reconstruction:
             if not os.path.exists(self.calibration_file):
                 raise FileNotFoundError(f"Calibration file not found: {self.calibration_file}")
-            sensitivity = self._get_sensitivity_from_calibration_file(self.calibration_file)
+            sensitivity = read_sensitivity_from_calibration_file(self.calibration_file)
 
             for p in (photopeak_h, lower_h, upper_h):
                 if not os.path.exists(p):
@@ -474,19 +547,19 @@ class SpectPostprocessStage:
 
             cor_path: Optional[str] = None
             if self.detector_distance < 0:
-                cor_path = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0.cor") 
+                cor_path = os.path.join(self.header_dir, f"{self.simind_prefix}_{header_roi}_0.cor")
                 if not os.path.exists(cor_path):
                     raise FileNotFoundError(f"Missing COR file: {cor_path}")
-                _ = self._get_cor_data(cor_path)
+                _ = load_cor_data(cor_path)
                 object_meta, proj_meta = simind.get_metadata(photopeak_h, cor_path)
             else:
-                object_meta, proj_meta = simind.get_metadata(photopeak_h) 
+                object_meta, proj_meta = simind.get_metadata(photopeak_h)
 
-            _, _, _, ww_peak, ww_lower, ww_upper = self._get_metadata_from_header_full( 
+            _, _, _, ww_peak, ww_lower, ww_upper = read_header_dims_and_windows(
                 photopeak_h, lower_h, upper_h
             )
 
-            path_amap = os.path.join(self.header_dir, f"{self.simind_prefix}_{roi_list[0]}_0.hct") 
+            path_amap = os.path.join(self.header_dir, f"{self.simind_prefix}_{header_roi}_0.hct")
             if not os.path.exists(path_amap):
                 raise FileNotFoundError(f"Missing attenuation map header (.hct): {path_amap}")
 
@@ -503,13 +576,13 @@ class SpectPostprocessStage:
                 proj_meta=proj_meta,
             )
 
-            for time_index, time_val in enumerate(self.frame_start):                   
-                frame_label = f"{float(time_val)/60.0:.6f}".rstrip("0").rstrip(".")    
+            for time_index, time_val in enumerate(self.frame_start):
+                frame_label = self._frame_label(time_index)
                 recon_output_path = os.path.join(
                     self.phase_output_dir, f"reconstructed_SPECT_{frame_label}.nii.gz"
                 )
 
-                if os.path.exists(recon_output_path):
+                if os.path.exists(recon_output_path) and self._image_has_expected_spacing(recon_output_path):
                     recon_paths[frame_label] = recon_output_path
                     continue
 
@@ -517,24 +590,24 @@ class SpectPostprocessStage:
                     raise KeyError(f"Missing PBPK projection paths for frame: {frame_label}")
 
                 lower = torch.tensor(
-                    self._read_projection_nifti(pbpk_projection_paths[frame_label]["w1"]).copy()
+                    read_projection_nifti(pbpk_projection_paths[frame_label]["w1"]).copy()
                 ).to(pytomography.device)
                 photopeak = torch.tensor(
-                    self._read_projection_nifti(pbpk_projection_paths[frame_label]["w2"]).copy()
+                    read_projection_nifti(pbpk_projection_paths[frame_label]["w2"]).copy()
                 ).to(pytomography.device)
                 upper = torch.tensor(
-                    self._read_projection_nifti(pbpk_projection_paths[frame_label]["w3"]).copy()
+                    read_projection_nifti(pbpk_projection_paths[frame_label]["w3"]).copy()
                 ).to(pytomography.device)
 
                 # Add Poisson noise to produce one stochastic realization per frame.
-                if self.apply_poisson_noise:                                           
-                    photopeak_realization = torch.poisson(photopeak)                    
-                    lower_realization = torch.poisson(lower)                            
-                    upper_realization = torch.poisson(upper)                            
-                else:                                                                  
-                    photopeak_realization = photopeak                                   
-                    lower_realization = lower                                           
-                    upper_realization = upper                                           
+                if self.apply_poisson_noise:
+                    photopeak_realization = torch.poisson(photopeak)
+                    lower_realization = torch.poisson(lower)
+                    upper_realization = torch.poisson(upper)
+                else:
+                    photopeak_realization = photopeak
+                    lower_realization = lower
+                    upper_realization = upper
 
                 scatter_estimate_tew = simind.compute_EW_scatter(
                     lower_realization, upper_realization, ww_lower, ww_upper, ww_peak
@@ -546,7 +619,9 @@ class SpectPostprocessStage:
                     additive_term=scatter_estimate_tew,
                 )
 
-                recon_img = self._get_recon_img(likelihood, sensitivity, self.frame_durations_s[time_index]) 
+                recon_img = self._get_recon_img(likelihood, sensitivity, self.frame_durations_s[time_index])
+                # Zero out voxels outside the patient body outline.
+                recon_img = self._apply_body_mask(recon_img, amap=amap)
                 sitk.WriteImage(recon_img, recon_output_path, imageIO="NiftiImageIO")
                 recon_paths[frame_label] = recon_output_path
 
@@ -555,6 +630,8 @@ class SpectPostprocessStage:
         self._save_stage_metadata(
             pbpk_projection_paths=pbpk_projection_paths,
             recon_paths=recon_paths,
+            folded_remaining_body_rois=folded_remaining_body_rois,
+            rest_owned_skipped_rois=rest_owned_skipped_rois,
         )
 
         self.context.activity_map_sum = activity_map_sum
@@ -564,5 +641,10 @@ class SpectPostprocessStage:
         self.context.pbpk_frame_durations_s = np.asarray(self.frame_durations_s, dtype=float)
         self.context.pbpk_projection_paths = pbpk_projection_paths
         self.context.reconstruction_output_dir = self.phase_output_dir
+        self.context.extras["spect_postprocess_stage"] = {
+            "folded_remaining_body_rois": folded_remaining_body_rois,
+            "rest_owned_skipped_rois": rest_owned_skipped_rois,
+            "metadata_path": self.metadata_path,
+        }
 
         return self.context

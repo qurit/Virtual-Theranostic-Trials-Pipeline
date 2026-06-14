@@ -1,4 +1,4 @@
-name: tdt_env
+name: pytheratwin
 channels:
   - conda-forge
   - defaults
@@ -12,3 +12,4 @@ dependencies:
       - totalsegmentator==2.12.0
       - pycno @ git+https://github.com/qurit/PyCNO.git@main
       - opengate
+      - psutil

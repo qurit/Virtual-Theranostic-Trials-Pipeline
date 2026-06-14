@@ -1,12 +1,9 @@
 """
-TotalSegmentator-based segmentation + ROI unification stage for the TDT pipeline.
+TotalSegmentator-based segmentation and ROI unification for the PyTheraTwin pipeline.
 
-This stage:
-- Standardizes the CT input into a NIfTI file in the phase output directory.
-- Runs TotalSegmentator for the required task(s) based on a user-facing ROI list.
-- Writes multilabel output masks (NIfTI) for each task and stores paths + plan in `context`.
-- Combines the TotalSegmentator outputs (body, total, head_glands_cavities)
-  into a single multilabel NIfTI volume in the TDT pipeline label space.
+Standardizes the CT input to NIfTI, runs the required TotalSegmentator tasks
+for the requested ROI set, and unifies the resulting masks into a single
+multilabel volume in the shared PyTheraTwin label space.
 
 Expected Context interface
 --------------------------
@@ -15,7 +12,7 @@ Incoming `context` is expected to provide:
 - context.config["phase_1"]["segmentation_stage"]["roi_subset"] : list[str]
 - context.config["phase_1"]["segmentation_stage"]["file_prefix"] : str
 - context.config["phase_1"]["segmentation_stage"]["unification_prefix"] : str
-- context.config["phase_1"]["segmentation_stage"]["label_map_path"] : str
+- label map loaded from ``src/data/pipeline_paths.json`` input_paths.label_map_path
 - context.subdir_paths["phase_1"] : str
 
 On success, this stage sets:
@@ -24,9 +21,7 @@ On success, this stage sets:
 - context.total_ml_path : Optional[str]  (None if not required by requested ROIs)
 - context.head_glands_cavities_ml_path : Optional[str]  (None if not required)
 - context.totseg_plan : dict  (which tasks ran, which roi_subsets were passed to TotalSegmentator)
-- context.tdt_roi_seg_path : str  (path to unified multilabel NIfTI handoff)
-
-Maintainer / contact: pyazdi@bccrc.ca
+- context.pytheratwin_roi_seg_path : str  (path to unified multilabel NIfTI handoff)
 """
 
 from __future__ import annotations
@@ -37,12 +32,23 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TypedDic
 
 import dicom2nifti
 import torch
-import numpy as np                                                                     
-import nibabel as nib                                                                  
+import numpy as np
+import nibabel as nib
 import SimpleITK as sitk
 from torch.cuda.amp import GradScaler as _GradScaler
 from totalsegmentator.python_api import totalsegmentator
-from json_minify import json_minify                                                    
+from json_minify import json_minify
+
+from src.io.config_paths import get_label_map_path
+from src.io.rerun_guard import (
+    assert_stage_rerun_safe,
+    build_stage_metadata,
+    build_segmentation_rerun_snapshot,
+    fingerprint_optional_file,
+    stage_metadata_path,
+    write_json,
+)
+from src.utils.nifti_utils import load_int_seg
 
 # ---------------------------------------------------------------------------
 # Compatibility: some TotalSegmentator/torch combinations expect `torch.GradScaler`.
@@ -50,34 +56,19 @@ from json_minify import json_minify
 torch.GradScaler = _GradScaler
 
 
-# User-facing ROI names supported by this pipeline stage.
-TDT_ALLOWED_ROIS = {
-    "body",
-    "kidney",
-    "liver",
-    "prostate",
-    "spleen",
-    "heart",
-    "salivary_glands",
-}
-
-# Maps each TDT ROI name to the TotalSegmentator (task, roi_subset) it requires.
-TDT_TO_TOTSEG = {
-    "kidney":         ("total", ["kidney_left", "kidney_right"]),
-    "liver":          ("total", ["liver"]),
-    "prostate":       ("total", ["prostate"]),
-    "spleen":         ("total", ["spleen"]),
-    "heart":          ("total", ["heart"]),
-    "salivary_glands":("head_glands_cavities", [
-        "parotid_gland_left",
-        "parotid_gland_right",
-        "submandibular_gland_left",
-        "submandibular_gland_right",
-    ]),
-    "body":           ("body", []),
-}
-
 CTInputType = Literal["nii", "dicom"]
+
+
+def _nifti_gz_intact(path: str) -> bool:
+    """Return True if a .nii.gz file can be fully decompressed without error."""
+    import gzip
+    try:
+        with gzip.open(path, "rb") as f:
+            while f.read(1 << 20):
+                pass
+        return True
+    except (EOFError, OSError):
+        return False
 
 
 class TotSegPlan(TypedDict):
@@ -87,16 +78,16 @@ class TotSegPlan(TypedDict):
     run_head_glands_cavities: bool
     total_roi_subset: List[str]   # TotalSegmentator ROI names for the total task
     head_roi_subset: List[str]    # TotalSegmentator ROI names for head_glands_cavities task
-    tdt_roi_subset: List[str]     # User-facing TDT ROI names (passed in from config)
+    pytheratwin_roi_subset: List[str]     # User-facing PyTheraTwin ROI names (passed in from config)
 
 
-class SegmentationStage:                                                               
+class SegmentationStage:
     """
-    TDT Stage: TotalSegmentator segmentation + ROI unification.
+    PyTheraTwin segmentation stage: TotalSegmentator + ROI unification.
 
     Always runs the `body` task (used downstream as a patient mask for all ROI operations).
     The `total` and `head_glands_cavities` tasks run only if needed by the requested ROIs.
-    After segmentation, combines outputs into a single multilabel volume in TDT label space.
+    After segmentation, combines outputs into a single multilabel volume in PyTheraTwin label space.
 
     Parameters
     ----------
@@ -105,11 +96,12 @@ class SegmentationStage:
     """
 
     def __init__(self, context: Any) -> None:
-        context.require("ct_input_path", "config", "subdir_paths")
+        context.require("ct_input_path", "config", "subdir_paths", "output_folder_path", "ct_input_identity")
         self.context = context
-        self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"             
+        self.debug: bool = getattr(context, "mode", "").upper() == "DEBUG"
 
         self.ct_input_path: str = context.ct_input_path
+        self.ct_input_identity: Dict[str, Any] = context.ct_input_identity
         self.roi_subset: Union[str, Sequence[str]] = context.config["phase_1"]["segmentation_stage"]["roi_subset"]
         self.ml: bool = True  # always use multilabel output
 
@@ -120,41 +112,88 @@ class SegmentationStage:
         os.makedirs(self.work_dir, exist_ok=True)
 
         self.prefix: str = context.config["phase_1"]["segmentation_stage"]["file_prefix"]
-        self.unification_prefix: str = context.config["phase_1"]["segmentation_stage"]["unification_prefix"] 
+        self.unification_prefix: str = context.config["phase_1"]["segmentation_stage"]["unification_prefix"]
 
         self.ct_nii_path: Optional[str] = None
         self.body_ml_path: Optional[str] = None
         self.head_glands_cavities_ml_path: Optional[str] = None
         self.total_ml_path: Optional[str] = None
-        self.metadata_path: str = os.path.join(self.work_dir, f"{self.prefix}_metadata.json")
+        self.metadata_path: str = stage_metadata_path(context.output_folder_path, "segmentation_stage")
+        self.unification_overlap_counts: List[Dict[str, Any]] = []
 
-        # Phase handoff: overwritten by every run so downstream stages always have a clean path. 
-        self.final_output_path: str = os.path.join(self.phase_output_dir, "digital_twin.nii.gz") 
-        self.stage_output_path: str = os.path.join(self.output_dir, f"{self.unification_prefix}.nii.gz") 
-        self.unification_metadata_path: str = os.path.join(self.work_dir, f"{self.unification_prefix}_metadata.json") 
+        # Phase handoff: overwritten by every run so downstream stages always have a clean path.
+        self.final_output_path: str = os.path.join(self.phase_output_dir, "digital_twin.nii.gz")
+        self.stage_output_path: str = os.path.join(self.output_dir, f"{self.unification_prefix}.nii.gz")
+        self.unification_metadata_path: str = os.path.join(self.output_dir, f"{self.unification_prefix}_metadata.json")
 
-        # Load label map for ROI unification 
-        self.ts_map_path: str = context.config["phase_1"]["segmentation_stage"]["label_map_path"] 
-        if not os.path.exists(self.ts_map_path): 
-            raise FileNotFoundError(f"Class map json not found: {self.ts_map_path}") 
+        # Load label map for ROI unification
+        self.ts_map_path: str = get_label_map_path()
+        if not os.path.exists(self.ts_map_path):
+            raise FileNotFoundError(f"Class map json not found: {self.ts_map_path}")
 
-        with open(self.ts_map_path, encoding="utf-8") as f: 
-            ts_map_json: Dict[str, Dict[str, str]] = json.loads(json_minify(f.read())) 
+        with open(self.ts_map_path, encoding="utf-8") as f:
+            ts_map_json: Dict[str, Dict[str, str]] = json.loads(json_minify(f.read()))
 
-        # Convert all JSON maps from {str(id): name} to {name: int(id)} for lookup. 
-        self.total_name2id: Dict[str, int] = { 
-            name: int(lab) for lab, name in ts_map_json["total"].items() 
-        } 
-        self.head_name2id: Dict[str, int] = { 
-            name: int(lab) for lab, name in ts_map_json["head_glands_cavities"].items() 
-        } 
-        self.tdt_name2id: Dict[str, int] = { 
-            name: int(lab) for lab, name in ts_map_json["TDT_Pipeline"].items() 
-        } 
+        # Convert all JSON maps from {str(id): name} to {name: int(id)} for lookup.
+        self.total_name2id: Dict[str, int] = {
+            name: int(lab) for lab, name in ts_map_json["total"].items()
+        }
+        self.head_name2id: Dict[str, int] = {
+            name: int(lab) for lab, name in ts_map_json["head_glands_cavities"].items()
+        }
+        self.pytheratwin_name2id: Dict[str, int] = {
+            name: int(lab) for lab, name in ts_map_json["PyTheraTwin_Pipeline"].items()
+        }
+        self.pytheratwin_id2name: Dict[int, str] = {
+            lab: name for name, lab in self.pytheratwin_name2id.items()
+        }
+        # PyTheraTwin_allowed_rois and PyTheraTwin_to_totseg live in pipeline_roi_naming_map.json — loaded
+        # here so the stage has no hardcoded ROI or TotalSegmentator coupling.
+        self.pytheratwin_allowed_rois: set = set(ts_map_json["PyTheraTwin_allowed_rois"])
+        self.pytheratwin_to_totseg: Dict[str, Any] = ts_map_json["PyTheraTwin_to_totseg"]
 
-    # -----------------------------
+    def _rerun_config_snapshot(self, plan: TotSegPlan) -> Dict[str, Any]:
+        """Return the config subset that must match for cached outputs to remain valid."""
+        return build_segmentation_rerun_snapshot(self.context.config)
+
+    def _current_upstream_fingerprints(self) -> Dict[str, Any]:
+        """Return fingerprints for small upstream inputs that affect segmentation outputs."""
+        return {
+            "label_map_json": fingerprint_optional_file(self.ts_map_path),
+        }
+
+    # ------------------------------------------------------------------
     # helpers — segmentation
-    # -----------------------------
+    # ------------------------------------------------------------------
+
+    def _roi_paint_priority(
+        self,
+        entry: Dict[str, Any],
+        requested_index: int,
+    ) -> Tuple[int, int, int]:
+        """
+        Return the deterministic paint priority for ROI unification.
+
+        TotalSegmentator tasks are independent label spaces, so tiny voxel
+        overlaps can occur between broad ``total`` labels (for example skull)
+        and more specific head-cavity labels.  Painting broad labels first and
+        specific head labels later keeps "select all" usable while preserving a
+        single-label output volume.
+        """
+        task_priority = {
+            "body": 0,
+            "total": 10,
+            "head_glands_cavities": 20,
+            "synthetic": 30,
+        }.get(str(entry.get("task", "")), 10)
+        category_priority = {
+            "organs": 10,
+            "vessels": 20,
+            "muscles": 30,
+            "bones": 40,
+            "head": 50,
+        }.get(str(entry.get("ui_category", "")), 0)
+        return (task_priority, category_priority, requested_index)
 
     def _standardize_ct_to_nifti(self) -> None:
         """
@@ -168,7 +207,9 @@ class SegmentationStage:
         """
         self.ct_nii_path = os.path.join(self.phase_output_dir, "ct.nii.gz")
         if os.path.exists(self.ct_nii_path):
-            return
+            if _nifti_gz_intact(self.ct_nii_path):
+                return
+            os.remove(self.ct_nii_path)
 
         if os.path.isdir(self.ct_input_path):
             dicom2nifti.dicom_series_to_nifti(
@@ -206,13 +247,13 @@ class SegmentationStage:
 
         if not rois:
             raise ValueError(
-                f"roi_subset must contain at least one ROI from: {sorted(TDT_ALLOWED_ROIS)}"
+                f"roi_subset must contain at least one ROI from: {sorted(self.pytheratwin_allowed_rois)}"
             )
 
-        invalid = [r for r in rois if r not in TDT_ALLOWED_ROIS]
+        invalid = [r for r in rois if r not in self.pytheratwin_allowed_rois]
         if invalid:
             raise ValueError(
-                f"Invalid ROI(s): {invalid}. Allowed: {sorted(TDT_ALLOWED_ROIS)}"
+                f"Invalid ROI(s): {invalid}. Allowed: {sorted(self.pytheratwin_allowed_rois)}"
             )
 
         total_rois: List[str] = []
@@ -221,7 +262,8 @@ class SegmentationStage:
         seen_head: set = set()
 
         for r in rois:
-            task, expanded = TDT_TO_TOTSEG[r]
+            entry = self.pytheratwin_to_totseg[r]
+            task, expanded = entry["task"], entry["totseg_rois"]
             if task == "total":
                 for x in expanded:
                     if x not in seen_total:
@@ -239,7 +281,7 @@ class SegmentationStage:
             run_head_glands_cavities=bool(head_rois),
             total_roi_subset=total_rois,
             head_roi_subset=head_rois,
-            tdt_roi_subset=rois,
+            pytheratwin_roi_subset=rois,
         )
 
     def _files_exist(self) -> Tuple[bool, bool, bool]:
@@ -265,16 +307,12 @@ class SegmentationStage:
             os.path.exists(self.total_ml_path),
         )
 
-    # -----------------------------
-    # helpers — unification (merged from TdtRoiUnifyStage)
-    # -----------------------------
+    # ------------------------------------------------------------------
+    # helpers — ROI unification
+    # ------------------------------------------------------------------
 
-    @staticmethod                                                                      
-    def _load_int_seg(path: str) -> np.ndarray:                                        
-        """Load a NIfTI segmentation and return it as int16 (sufficient for label IDs).""" 
-        return nib.load(path).get_fdata().astype(np.int16)                             
 
-    def _assert_unification_inputs_exist(self, plan: TotSegPlan) -> None:              
+    def _assert_unification_inputs_exist(self, plan: TotSegPlan) -> None:
         """
         Validate that all required input files exist based on the plan.
 
@@ -282,26 +320,29 @@ class SegmentationStage:
         ------
         FileNotFoundError
         """
-        if self.ct_nii_path is None or not os.path.exists(self.ct_nii_path):           
-            raise FileNotFoundError(f"CT not found: {self.ct_nii_path}")               
-        if self.body_ml_path is None or not os.path.exists(self.body_ml_path):         
-            raise FileNotFoundError(f"Body seg not found: {self.body_ml_path}")        
-        if plan.get("run_total", False):                                               
-            if self.total_ml_path is None or not os.path.exists(self.total_ml_path):   
-                raise FileNotFoundError(f"Total seg not found: {self.total_ml_path}")  
-        if plan.get("run_head_glands_cavities", False):                                
-            if self.head_glands_cavities_ml_path is None or not os.path.exists(self.head_glands_cavities_ml_path): 
-                raise FileNotFoundError(f"Head seg not found: {self.head_glands_cavities_ml_path}") 
+        if self.ct_nii_path is None or not os.path.exists(self.ct_nii_path):
+            raise FileNotFoundError(f"CT not found: {self.ct_nii_path}")
+        if self.body_ml_path is None or not os.path.exists(self.body_ml_path):
+            raise FileNotFoundError(f"Body seg not found: {self.body_ml_path}")
+        if plan.get("run_total", False):
+            if self.total_ml_path is None or not os.path.exists(self.total_ml_path):
+                raise FileNotFoundError(f"Total seg not found: {self.total_ml_path}")
+        if plan.get("run_head_glands_cavities", False):
+            if self.head_glands_cavities_ml_path is None or not os.path.exists(self.head_glands_cavities_ml_path):
+                raise FileNotFoundError(f"Head seg not found: {self.head_glands_cavities_ml_path}")
 
-    def _create_roi_unified(                                                           
+    def _create_roi_unified(
         self,
         body_seg: np.ndarray,
         total_seg: Optional[np.ndarray],
         head_seg: Optional[np.ndarray],
-        plan: TotSegPlan,                                                              
+        plan: TotSegPlan,
     ) -> np.ndarray:
         """
-        Build the unified TDT multilabel volume by painting ROIs in priority order.
+        Build the unified PyTheraTwin multilabel volume by painting ROIs in priority order.
+
+        Fully data-driven: reads totseg_rois lists from pipeline_roi_naming_map.json
+        via self.pytheratwin_to_totseg — no hardcoded per-organ logic.
 
         Parameters
         ----------
@@ -312,92 +353,144 @@ class SegmentationStage:
 
         Returns
         -------
-        np.ndarray  (uint8, TDT label IDs)
+        np.ndarray  (uint8, PyTheraTwin label IDs)
         """
         roi_unified = np.zeros(body_seg.shape, dtype=np.uint8)
-        roi_unified[body_seg > 0] = self.tdt_name2id["body"]
+        roi_unified[body_seg > 0] = self.pytheratwin_name2id["remaining_body"]
 
-        requested = set(plan["tdt_roi_subset"])                                        
+        if total_seg is not None and total_seg.shape != body_seg.shape:
+            raise ValueError(
+                f"Shape mismatch body vs total: {body_seg.shape} vs {total_seg.shape}"
+            )
+        if head_seg is not None and head_seg.shape != body_seg.shape:
+            raise ValueError(
+                f"Shape mismatch body vs head: {body_seg.shape} vs {head_seg.shape}"
+            )
 
-        if total_seg is not None:
-            if total_seg.shape != body_seg.shape:
-                raise ValueError(
-                    f"Shape mismatch body vs total: {body_seg.shape} vs {total_seg.shape}"
+        paint_queue: List[Tuple[Tuple[int, int, int], str, int, Dict[str, Any]]] = []
+        for requested_index, pytheratwin_roi in enumerate(plan["pytheratwin_roi_subset"]):
+            entry = self.pytheratwin_to_totseg.get(pytheratwin_roi)
+            if not entry:
+                continue
+            pytheratwin_label = self.pytheratwin_name2id.get(pytheratwin_roi)
+            if pytheratwin_label is None:
+                continue
+            paint_queue.append(
+                (
+                    self._roi_paint_priority(entry, requested_index),
+                    pytheratwin_roi,
+                    pytheratwin_label,
+                    entry,
                 )
-            if "kidney" in requested:
-                kL = self.total_name2id["kidney_left"]
-                kR = self.total_name2id["kidney_right"]
-                roi_unified[(total_seg == kL) | (total_seg == kR)] = self.tdt_name2id["kidney"]
-            if "liver" in requested:
-                roi_unified[total_seg == self.total_name2id["liver"]] = self.tdt_name2id["liver"]
-            if "prostate" in requested:
-                roi_unified[total_seg == self.total_name2id["prostate"]] = self.tdt_name2id["prostate"]
-            if "spleen" in requested:
-                roi_unified[total_seg == self.total_name2id["spleen"]] = self.tdt_name2id["spleen"]
-            if "heart" in requested:
-                roi_unified[total_seg == self.total_name2id["heart"]] = self.tdt_name2id["heart"]
+            )
 
-        if head_seg is not None and "salivary_glands" in requested:
-            if head_seg.shape != body_seg.shape:
-                raise ValueError(
-                    f"Shape mismatch body vs head: {body_seg.shape} vs {head_seg.shape}"
-                )
-            pL = self.head_name2id["parotid_gland_left"]
-            pR = self.head_name2id["parotid_gland_right"]
-            sL = self.head_name2id["submandibular_gland_left"]
-            sR = self.head_name2id["submandibular_gland_right"]
-            roi_unified[np.isin(head_seg, [pL, pR, sL, sR])] = self.tdt_name2id["salivary_glands"]
+        self.unification_overlap_counts = []
+        assigned_voxels = roi_unified > self.pytheratwin_name2id["remaining_body"]
+        for _, pytheratwin_roi, pytheratwin_label, entry in sorted(
+            paint_queue,
+            key=lambda item: item[0],
+        ):
+            task = entry["task"]
+            totseg_rois = entry["totseg_rois"]
+
+            new_mask = np.zeros(body_seg.shape, dtype=bool)
+            if task == "total" and total_seg is not None:
+                ids = [self.total_name2id[r] for r in totseg_rois if r in self.total_name2id]
+                if ids:
+                    new_mask = np.isin(total_seg, ids)
+            elif task == "head_glands_cavities" and head_seg is not None:
+                ids = [self.head_name2id[r] for r in totseg_rois if r in self.head_name2id]
+                if ids:
+                    new_mask = np.isin(head_seg, ids)
+
+            overlap = new_mask & assigned_voxels
+            if overlap.any():
+                existing_labels, counts = np.unique(roi_unified[overlap], return_counts=True)
+                overwritten = {
+                    self.pytheratwin_id2name.get(int(label), str(int(label))): int(count)
+                    for label, count in zip(existing_labels, counts)
+                }
+                record = {
+                    "roi": pytheratwin_roi,
+                    "voxels": int(overlap.sum()),
+                    "overwritten_labels": overwritten,
+                }
+                self.unification_overlap_counts.append(record)
+                if self.debug:
+                    print(
+                        "[SegmentationStage] Resolved ROI overlap by priority: "
+                        f"{pytheratwin_roi} overwrote {overwritten} "
+                        f"({record['voxels']} voxels)."
+                    )
+            roi_unified[new_mask] = pytheratwin_label
+            assigned_voxels |= new_mask
 
         return roi_unified
 
-    def _run_unification(self, plan: TotSegPlan) -> None:                              
+    def _run_unification(self, plan: TotSegPlan) -> None:
         """
         Run ROI unification and write the unified segmentation NIfTI.
 
-        Combines TotalSegmentator outputs into a single multilabel TDT volume.
+        Combines TotalSegmentator outputs into a single multilabel PyTheraTwin volume.
         Skips if the final output already exists.
         """
-        # Skip if unified output already exists 
-        if os.path.exists(self.final_output_path) and os.path.exists(self.stage_output_path): 
-            if self.debug: 
-                print(f"[SegmentationStage] Unified output already exists, skipping unification.") 
-            return 
+        # Skip if unified output already exists
+        if os.path.exists(self.final_output_path) and os.path.exists(self.stage_output_path):
+            if self.debug:
+                print("[SegmentationStage] Unified output already exists, skipping unification.")
+            return
 
-        self._assert_unification_inputs_exist(plan)                                    
+        self._assert_unification_inputs_exist(plan)
 
-        ct_nii = nib.load(self.ct_nii_path)                                            
+        ct_nii = nib.load(self.ct_nii_path)
 
-        body_seg = self._load_int_seg(self.body_ml_path)                               
-        total_seg = self._load_int_seg(self.total_ml_path) if plan.get("run_total", False) else None 
-        head_seg = (                                                                   
-            self._load_int_seg(self.head_glands_cavities_ml_path) if plan.get("run_head_glands_cavities", False) else None 
-        )                                                                              
+        body_seg = load_int_seg(self.body_ml_path)
+        total_seg = load_int_seg(self.total_ml_path) if plan.get("run_total", False) else None
+        head_seg = (
+            load_int_seg(self.head_glands_cavities_ml_path) if plan.get("run_head_glands_cavities", False) else None
+        )
 
-        roi_unified = self._create_roi_unified(body_seg, total_seg, head_seg, plan)    
+        roi_unified = self._create_roi_unified(body_seg, total_seg, head_seg, plan)
 
-        out_img = nib.Nifti1Image(roi_unified.astype(np.uint8), ct_nii.affine, ct_nii.header) 
-        out_img.set_data_dtype(np.uint8)                                               
-        nib.save(out_img, self.stage_output_path)                                      
-        nib.save(out_img, self.final_output_path)                                      
+        out_img = nib.Nifti1Image(roi_unified.astype(np.uint8), ct_nii.affine, ct_nii.header)
+        out_img.set_data_dtype(np.uint8)
+        nib.save(out_img, self.stage_output_path)
+        nib.save(out_img, self.final_output_path)
 
-        # Save unification metadata 
-        unification_metadata: Dict[str, Any] = {                                       
-            "stage": "unification (merged into segmentation_stage)",                   
-            "ct_nii_path": self.ct_nii_path,                                           
-            "body_ml_path": self.body_ml_path,                                         
-            "total_ml_path": self.total_ml_path if plan.get("run_total", False) else None, 
-            "head_ml_path": self.head_glands_cavities_ml_path if plan.get("run_head_glands_cavities", False) else None, 
-            "label_map_path": self.ts_map_path,                                        
-            "stage_output_path": self.stage_output_path,                               
-            "final_output_path": self.final_output_path,                               
-            "plan": dict(plan),                                                        
-        }                                                                              
-        with open(self.unification_metadata_path, "w", encoding="utf-8") as f:         
-            json.dump(unification_metadata, f, indent=4)                               
+        # Save unification metadata
+        unification_metadata: Dict[str, Any] = {
+            "stage": "unification (merged into segmentation_stage)",
+            "ct_nii_path": self.ct_nii_path,
+            "body_ml_path": self.body_ml_path,
+            "total_ml_path": self.total_ml_path if plan.get("run_total", False) else None,
+            "head_ml_path": self.head_glands_cavities_ml_path if plan.get("run_head_glands_cavities", False) else None,
+            "label_map_path": self.ts_map_path,
+            "stage_output_path": self.stage_output_path,
+            "final_output_path": self.final_output_path,
+            "plan": dict(plan),
+            "overlap_resolution": {
+                "policy": (
+                    "Paint broad TotalSegmentator total-task ROIs first, then paint "
+                    "head_glands_cavities ROIs over any shared voxels."
+                ),
+                "overlaps": list(self.unification_overlap_counts),
+            },
+        }
+        with open(self.unification_metadata_path, "w", encoding="utf-8") as f:
+            json.dump(unification_metadata, f, indent=4)
 
     def _save_stage_metadata(self, plan: TotSegPlan) -> None:
         """Save stage-specific metadata for debugging / provenance."""
-        metadata: Dict[str, Any] = {
+        outputs: Dict[str, Any] = {
+            "body_ml_path": self.body_ml_path,
+            "total_ml_path": self.total_ml_path if plan["run_total"] else None,
+            "head_glands_cavities_ml_path": (
+                self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None
+            ),
+            "stage_output_path": self.stage_output_path,
+            "final_output_path": self.final_output_path,
+        }
+        extra: Dict[str, Any] = {
             "stage": "segmentation_stage",
             "ct_input_path": self.ct_input_path,
             "ct_nii_path": self.ct_nii_path,
@@ -411,16 +504,23 @@ class SegmentationStage:
             "head_glands_cavities_ml_path": (
                 self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None
             ),
-            "label_map_path": self.ts_map_path,                                        
-            "final_output_path": self.final_output_path,                               
-            "stage_output_path": self.stage_output_path,                               
+            "label_map_path": self.ts_map_path,
+            "final_output_path": self.final_output_path,
+            "stage_output_path": self.stage_output_path,
         }
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=4)
+        metadata = build_stage_metadata(
+            stage_name="segmentation_stage",
+            config_snapshot=self._rerun_config_snapshot(plan),
+            ct_identity=self.ct_input_identity,
+            upstream_fingerprints=self._current_upstream_fingerprints(),
+            outputs=outputs,
+            extra=extra,
+        )
+        write_json(self.metadata_path, metadata)
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # main
-    # -----------------------------
+    # ------------------------------------------------------------------
     def run(self) -> Any:
         """
         Run the TotalSegmentator stage + ROI unification.
@@ -431,14 +531,43 @@ class SegmentationStage:
             The updated context object (same instance as `self.context`).
         """
         self._standardize_ct_to_nifti()
-        assert self.ct_nii_path is not None
+        if self.ct_nii_path is None:
+            raise RuntimeError("CT standardisation failed: ct_nii_path is None after _standardize_ct_to_nifti()")
 
         plan = self._pre_totalsegmentation_checks()
         body_ml_done, head_glands_cavities_ml_done, total_ml_done = self._files_exist()
 
+        assert_stage_rerun_safe(
+            stage_name="segmentation_stage",
+            metadata_path=self.metadata_path,
+            required_outputs=[
+                self.body_ml_path,
+                self.total_ml_path if plan["run_total"] else None,
+                self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None,
+                self.stage_output_path,
+                self.final_output_path,
+            ],
+            current_config_snapshot=self._rerun_config_snapshot(plan),
+            current_ct_identity=self.ct_input_identity,
+            current_upstream_fingerprints=self._current_upstream_fingerprints(),
+            context=self.context,
+        )
+        if self.context.stage_skipped:
+            self.context.ct_nii_path = self.ct_nii_path
+            self.context.body_ml_path = self.body_ml_path
+            self.context.total_ml_path = self.total_ml_path if plan["run_total"] else None
+            self.context.head_glands_cavities_ml_path = (
+                self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None
+            )
+            self.context.totseg_plan = plan
+            self.context.pytheratwin_roi_seg_path = self.final_output_path
+            return self.context
+
+        device = "gpu" if torch.cuda.is_available() else "cpu"
+
         if plan["run_body"] and not body_ml_done:
             print("Running TotalSegmentator for task: BODY...")
-            totalsegmentator(self.ct_nii_path, self.body_ml_path, ml=self.ml, task="body")
+            totalsegmentator(self.ct_nii_path, self.body_ml_path, ml=self.ml, task="body", device=device)
 
         if plan["run_total"] and not total_ml_done:
             print("Running TotalSegmentator for task: TOTAL...")
@@ -448,6 +577,7 @@ class SegmentationStage:
                 ml=self.ml,
                 task="total",
                 roi_subset=plan["total_roi_subset"],
+                device=device,
             )
 
         if plan["run_head_glands_cavities"] and not head_glands_cavities_ml_done:
@@ -457,6 +587,7 @@ class SegmentationStage:
                 self.head_glands_cavities_ml_path,
                 ml=self.ml,
                 task="head_glands_cavities",
+                device=device,
             )
 
         # Final existence checks (only for what was requested).
@@ -468,8 +599,7 @@ class SegmentationStage:
         if plan["run_head_glands_cavities"] and not head_done:
             raise FileNotFoundError(f"Head glands seg not found: {self.head_glands_cavities_ml_path}")
 
-        # Run ROI unification (merged from TdtRoiUnifyStage) 
-        self._run_unification(plan)                                                    
+        self._run_unification(plan)
 
         self._save_stage_metadata(plan)
 
@@ -480,12 +610,12 @@ class SegmentationStage:
             self.head_glands_cavities_ml_path if plan["run_head_glands_cavities"] else None
         )
         self.context.totseg_plan = plan
-        self.context.tdt_roi_seg_path = self.final_output_path                         
+        self.context.pytheratwin_roi_seg_path = self.final_output_path
         self.context.extras["segmentation_stage"] = {
             "output_dir": self.output_dir,
             "work_dir": self.work_dir,
             "metadata_path": self.metadata_path,
-            "unification_metadata_path": self.unification_metadata_path,               
+            "unification_metadata_path": self.unification_metadata_path,
         }
 
         return self.context
