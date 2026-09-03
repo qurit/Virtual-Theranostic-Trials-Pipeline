@@ -285,15 +285,21 @@ class PbpkTacStage:
 
         model = pycno.Model(
             model_name=self.model_type,
-            hotamount=10,
-            coldamount=100,
             parameters=self.parameters,
         )
+
+        dose = pycno.Dose(
+            times = [0],
+            targets = {
+                'Vein.Hot': [10],
+                'Vein.Cold': [100]
+            })
 
         stop = self._compute_stop_time()
         self._stop_time = stop
         steps = int(np.ceil(stop)) if stop > 0 else 1
-        time, tacs = model.simulate(stop=stop, steps=steps, observables=self.vois_pbpk)
+        results = model.simulate(dose=dose, stop=stop, steps=steps, output_compartments=self.vois_pbpk)
+        time, tacs = results.time, results.tacs
         return np.asarray(time, dtype=float), np.asarray(tacs, dtype=float)
 
     def _extract_tac_for_voi(self, tacs: np.ndarray, voi_index: int) -> np.ndarray:
